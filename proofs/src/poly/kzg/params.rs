@@ -117,6 +117,11 @@ impl<E: Engine + Debug> ParamsKZG<E> {
         }
     }
 
+    /// Returns the powers of tau in G1 of these KZG params.
+    pub fn g(&self) -> &[E::G1] {
+        &self.g
+    }
+
     /// Returns the committed lagrange polynomials of these KZG params.
     pub fn g_lagrange(&self) -> &[E::G1] {
         &self.g_lagrange

@@ -161,6 +161,13 @@ where
 #[allow(unsafe_code)]
 /// Wrapper over the MSM function to use the blstrs underlying function
 pub fn msm_specific<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C::Curve]) -> C::Curve {
+    // The accelerator sees the caller's slices: for a commitment, a prefix of
+    // the parameters' bases.
+    #[cfg(feature = "gpu")]
+    if let Some(r) = crate::gpu::msm::<C, C::Scalar, C::Curve>(coeffs, bases) {
+        return r;
+    }
+
     // We remove zeros (keep only non-zero coefficients)
     let (coeffs, bases): (Vec<C::Scalar>, Vec<C::Curve>) = coeffs
         .iter()

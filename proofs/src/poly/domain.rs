@@ -238,7 +238,7 @@ impl<F: WithSmallOrderMulGroup<3>> EvaluationDomain<F> {
     pub fn coeff_to_lagrange(&self, mut a: Polynomial<F, Coeff>) -> Polynomial<F, LagrangeCoeff> {
         assert_eq!(a.values.len(), 1 << self.k);
 
-        best_fft(&mut a.values, self.omega, self.k);
+        Self::fft(&mut a.values, self.omega, self.k);
 
         Polynomial {
             values: a.values,
@@ -256,7 +256,7 @@ impl<F: WithSmallOrderMulGroup<3>> EvaluationDomain<F> {
 
         self.distribute_powers_zeta(&mut a.values, true);
         a.values.resize(self.extended_len(), F::ZERO);
-        best_fft(&mut a.values, self.extended_omega, self.extended_k);
+        Self::fft(&mut a.values, self.extended_omega, self.extended_k);
 
         Polynomial {
             values: a.values,
@@ -308,7 +308,7 @@ impl<F: WithSmallOrderMulGroup<3>> EvaluationDomain<F> {
         a.values.truncate(self.n as usize);
         self.distribute_powers_zeta(&mut a.values, false);
 
-        best_fft(&mut a.values, self.omega, self.k);
+        Self::fft(&mut a.values, self.omega, self.k);
 
         Polynomial {
             values: a.values,
@@ -364,7 +364,19 @@ impl<F: WithSmallOrderMulGroup<3>> EvaluationDomain<F> {
         });
     }
 
+    fn fft(a: &mut [F], omega: F, log_n: u32) {
+        #[cfg(feature = "gpu")]
+        if crate::gpu::fft(a, omega, log_n) {
+            return;
+        }
+        best_fft(a, omega, log_n);
+    }
+
     fn ifft(a: &mut [F], omega_inv: F, log_n: u32, divisor: F) {
+        #[cfg(feature = "gpu")]
+        if crate::gpu::ifft(a, omega_inv, log_n, divisor) {
+            return;
+        }
         best_fft(a, omega_inv, log_n);
         parallelize(a, |a, _| {
             for a in a {
