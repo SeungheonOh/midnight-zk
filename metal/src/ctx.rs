@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The Metal device context (macOS only).
+//! The Metal device context (macOS and iOS only).
 //!
 //! One process-wide context, made lazily at the first use ([`context`]): the
 //! system default `MTLDevice`, one command queue, the shader library (the
@@ -197,6 +197,7 @@ fn probe_device() -> Option<&'static Probe> {
                 recommended_max_working_set: device.recommendedMaxWorkingSetSize(),
                 max_buffer_length: device.maxBufferLength() as u64,
                 max_threads_per_threadgroup: tg.width as u64,
+                max_threadgroup_memory_length: device.maxThreadgroupMemoryLength() as u64,
                 apple_family,
                 metal3: device.supportsFamily(MTLGPUFamily::Metal3),
                 msl_version: MSL_VERSION,
@@ -223,7 +224,7 @@ pub struct Ctx {
     library_source: String,
     pipelines: Mutex<HashMap<String, Pipeline>>,
     /// The queue's residency set (see [`Resident`]); `None` where Metal has
-    /// none (before macOS 15).
+    /// none (before macOS 15 and iOS 18).
     resident: Option<Mutex<Resident>>,
 }
 
@@ -315,7 +316,7 @@ fn make_context() -> Result<Ctx, String> {
     let device = probe.device.clone();
     let queue = device.newCommandQueue().ok_or("newCommandQueue returned nil")?;
     let (library, library_source) = load_library(&device)?;
-    // the residency set of the large buffers (macOS 15+)
+    // the residency set of the large buffers (macOS 15+, iOS 18+)
     let resident = if device.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:)) {
         let desc = MTLResidencySetDescriptor::new();
         device.newResidencySetWithDescriptor_error(&desc).ok().map(|set| {
@@ -1218,6 +1219,7 @@ impl<'a> Command<'a> {
     /// memory; returns the pipeline.
     fn bind(&self, kernel: &str, args: &[Arg<'a>], tg_mem: &[usize]) -> Result<Pipeline, Error> {
         let p = self.ctx.pipeline(kernel)?;
+        check_threadgroup_memory(&self.ctx.device, kernel, &p, tg_mem)?;
         self.enc.setComputePipelineState(&p);
         for (i, a) in args.iter().enumerate() {
             match *a {
@@ -1257,8 +1259,8 @@ impl<'a> Command<'a> {
             }
         }
         for (i, len) in tg_mem.iter().enumerate() {
-            // SAFETY: the length is checked by Metal against the device limit
-            // when the pipeline is dispatched.
+            // SAFETY: the total is within the device limit
+            // (`check_threadgroup_memory`).
             unsafe { self.enc.setThreadgroupMemoryLength_atIndex(*len, i) };
         }
         Ok(p)
@@ -1329,6 +1331,28 @@ fn check_group(kernel: &str, p: &Pipeline, group: usize) -> Result<(), Error> {
     if group == 0 || group > max {
         return Err(Error::Device(format!(
             "`{kernel}`: threadgroup of {group} threads (pipeline max {max})"
+        )));
+    }
+    Ok(())
+}
+
+/// The threadgroup memory of a dispatch of `kernel`, `tg_mem` with the
+/// pipeline's static threadgroup memory, must be within the device's
+/// `maxThreadgroupMemoryLength` (32 KiB on an M4 Max, a property of each
+/// device): above it the dispatch is not encoded and the call declines
+/// (`device-error`) instead of running a kernel whose threadgroup arrays the
+/// GPU does not hold.
+fn check_threadgroup_memory(
+    device: &Device,
+    kernel: &str,
+    p: &Pipeline,
+    tg_mem: &[usize],
+) -> Result<(), Error> {
+    let need = tg_mem.iter().sum::<usize>() + p.staticThreadgroupMemoryLength();
+    let max = device.maxThreadgroupMemoryLength();
+    if need > max {
+        return Err(Error::Device(format!(
+            "`{kernel}`: {need} bytes of threadgroup memory (device max {max})"
         )));
     }
     Ok(())

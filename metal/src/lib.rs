@@ -40,10 +40,10 @@
 //! assert!(midnight_metal::end_request()); // or end_request_report(true)
 //! ```
 //!
-//! On macOS the crate depends on midnight-curves for the CPU share of a G1
-//! MSM, which runs the stock `msm_pippenger` (see the `msm` module, "The CPU
-//! share"). On other targets the crate builds without device code and every
-//! entry point declines `no-device`.
+//! On macOS and iOS the crate depends on midnight-curves for the CPU share of
+//! a G1 MSM, which runs the stock `msm_pippenger` (see the `msm` module, "The
+//! CPU share"). On other targets the crate builds without device code and
+//! every entry point declines `no-device`.
 //!
 //! ## The hook contract
 //!
@@ -238,7 +238,8 @@
 //!
 //! Transforms up to `2^`[`MAX_LOG_N`], MSMs up to `2^`[`MAX_MSM_LOG`] terms,
 //! each buffer at most `maxBufferLength` ([`MetalInfo`]). The shaders use the
-//! Metal Shading Language 3.2 (macOS 15+, every Apple Silicon Mac runs it).
+//! Metal Shading Language 3.2 (macOS 15+, every Apple Silicon Mac runs it;
+//! iOS 18+).
 //!
 //! ## Source layout
 //!
@@ -267,7 +268,10 @@
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
 // Other targets keep the host-side code they do not call.
-#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
+#![cfg_attr(
+    not(any(target_os = "macos", target_os = "ios")),
+    allow(dead_code, unused_imports)
+)]
 
 use std::{
     ffi::c_void,
@@ -280,50 +284,62 @@ use std::{
 mod account;
 pub mod field;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod ctx;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod msm;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod ntt;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod quotient;
 
 /// The MSM's test entry, which reports the path and the plan an MSM took
 /// (public facts only), and the count of the one-shot path's per-call G1
 /// checks (feature `test-support`; not a stable interface, not for secret
 /// scalars).
-#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    any(test, feature = "test-support")
+))]
 #[doc(hidden)]
 pub use msm::{MsmStages, msm_g1_stages, one_shot_g1_checks};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use msm::{SrsHandle, msm_counts, register_srs, srs_handles, srs_stale};
 /// Host-to-host wrappers of the NTT device building blocks (feature
 /// `test-support`; not a stable interface).
-#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    any(test, feature = "test-support")
+))]
 #[doc(hidden)]
 pub use ntt::test_support as ntt_test_support;
 /// The stage timings of the last quotient served (feature `test-support`).
-#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    any(test, feature = "test-support")
+))]
 #[doc(hidden)]
 pub use quotient::QuotientStages;
 /// The quotient job layout, for this crate's integration tests (not a stable
 /// interface).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[doc(hidden)]
 pub use quotient::abi as quotient_abi;
 /// The quotient's test and measurement entry points (feature
 /// `test-support`).
-#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    any(test, feature = "test-support")
+))]
 #[doc(hidden)]
 pub use quotient::test_support as quotient_test_support;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use quotient::{
     KeyHandle, evict_key_copies, keep_resident, key_stale, keys_registered, need_bytes,
     quotient_counts, register_key, set_keep_resident, threads as quotient_threads,
 };
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "ios")))]
 mod tests;
 
 use account::{Class, Reason};
@@ -376,6 +392,10 @@ pub struct MetalInfo {
     pub max_buffer_length: u64,
     /// `maxThreadsPerThreadgroup.width`.
     pub max_threads_per_threadgroup: u64,
+    /// `maxThreadgroupMemoryLength`: the threadgroup memory of one
+    /// threadgroup in bytes. A dispatch that needs more declines
+    /// (`device-error`).
+    pub max_threadgroup_memory_length: u64,
     /// The highest `MTLGPUFamilyAppleN` supported (0: none).
     pub apple_family: u32,
     /// Supports `MTLGPUFamilyMetal3`.
@@ -384,9 +404,9 @@ pub struct MetalInfo {
     pub msl_version: &'static str,
 }
 
-/// Whether the Metal code is compiled in (a macOS target).
+/// Whether the Metal code is compiled in (a macOS or iOS target).
 pub const fn metal_built() -> bool {
-    cfg!(target_os = "macos")
+    cfg!(any(target_os = "macos", target_os = "ios"))
 }
 
 /// Whether `MIDNIGHT_METAL=off` (read once).
@@ -402,11 +422,11 @@ pub fn present() -> Option<&'static MetalInfo> {
     if disabled() {
         return None;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         ctx::probe()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     None
 }
 
@@ -416,11 +436,11 @@ pub fn device() -> bool {
     if present().is_none() {
         return false;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         ctx::context().is_ok()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     false
 }
 
@@ -428,11 +448,11 @@ pub fn device() -> bool {
 /// or `source ...` (compiled from the embedded source at first use, with the
 /// reason). `None` before the context is made or when it failed.
 pub fn library_source() -> Option<&'static str> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         ctx::context().ok().map(|c| c.library_source())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     None
 }
 
@@ -456,11 +476,11 @@ pub fn mem_info() -> Option<(usize, usize)> {
     if !device() {
         return None;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         ctx::mem_info()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     None
 }
 
@@ -714,11 +734,11 @@ pub fn msm_sized(len: usize, bases: &[G1AffineLimbs]) -> bool {
 
 /// [`msm_sized`] of a length that passed [`length_admission`].
 fn sized_by_bases(len: usize, bases: &[G1AffineLimbs]) -> bool {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         sized_by_lookup(&msm::lookup(bases, len), len, &thresholds())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         let _ = bases;
         one_shot_admission(len, &thresholds()).is_ok()
@@ -727,7 +747,7 @@ fn sized_by_bases(len: usize, bases: &[G1AffineLimbs]) -> bool {
 
 /// [`msm_sized`] of a length that passed [`length_admission`], from the
 /// lookup of its bases.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn sized_by_lookup(lookup: &msm::Lookup, len: usize, t: &Thresholds) -> bool {
     match lookup {
         msm::Lookup::Table(_) => true,
@@ -795,7 +815,7 @@ fn msm_g1_body(
         account::decline(Class::Msm, Reason::NoDevice);
         return None;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         let t = thresholds();
         let n = scalars.len();
@@ -838,7 +858,7 @@ fn msm_g1_body(
         test_switch::hook_panic(Class::Msm);
         r
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     None
 }
 
@@ -884,11 +904,11 @@ fn fft_body(a: &mut [Scalar], omega: Scalar, log_n: u32) -> bool {
     if !transform_admission(Class::Fft, a, &omega, log_n, None) {
         return false;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         ntt::fft(a, omega, log_n)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     false
 }
 
@@ -904,11 +924,11 @@ fn ifft_body(a: &mut [Scalar], omega_inv: Scalar, log_n: u32, divisor: Scalar) -
     if !transform_admission(Class::Ifft, a, &omega_inv, log_n, Some(&divisor)) {
         return false;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         ntt::ifft(a, omega_inv, log_n, divisor)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     false
 }
 
@@ -938,14 +958,14 @@ unsafe fn quotient_body(job: *const c_void, out: &mut [Scalar]) -> bool {
     if !device() {
         return account::decline(Class::Quotient, Reason::NoDevice);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         // the test panic comes before the backend: `out` is not written yet
         test_switch::hook_panic(Class::Quotient);
         // SAFETY: the caller's contract.
         unsafe { quotient::quotient(job, out) }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         let _ = out;
         false
@@ -964,14 +984,14 @@ unsafe fn quotient_body(job: *const c_void, out: &mut [Scalar]) -> bool {
 /// nothing: the scratch is reused by the next call and zeroed by
 /// [`end_request`].
 struct HookScope {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     open: bool,
 }
 
 impl HookScope {
     fn enter() -> Self {
         HookScope {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             open: ctx::request_open(),
         }
     }
@@ -979,7 +999,7 @@ impl HookScope {
 
 impl Drop for HookScope {
     fn drop(&mut self) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if !self.open || !ctx::request_open() {
             ctx::wipe_unbracketed();
         }
@@ -1095,7 +1115,7 @@ pub fn hook_panics() -> u64 {
 /// a request every hook call zeroes them before it returns (see "Requests
 /// and wiping" in the crate text).
 pub fn begin_request() {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         ctx::begin_request();
         quotient::begin_request();
@@ -1149,13 +1169,13 @@ pub struct WipeStats {
 /// pool and is never kept as scratch. On other targets, or before the
 /// context exists, there is no region.
 pub fn end_request_report(check: bool) -> Result<WipeStats, WipeStats> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         let r = ctx::end_request_report(check);
         quotient::end_request();
         r
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     Ok(WipeStats {
         checked: check,
         ..WipeStats::default()
@@ -1173,22 +1193,22 @@ pub fn end_request() -> bool {
 /// crate text), after the zeroing still running in the background has
 /// ended. Returns the bytes released.
 pub fn release_pool() -> u64 {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         ctx::release_pool()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     0
 }
 
 /// Bytes of the idle, zeroed buffers in the pool (kept for the next
 /// request; part of [`device_bytes`]).
 pub fn pool_bytes() -> u64 {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         ctx::pool_bytes()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     0
 }
 
@@ -1196,11 +1216,11 @@ pub fn pool_bytes() -> u64 {
 /// the idle buffers of the pool included ([`pool_bytes`]); the peak is since
 /// process start or the last [`begin_request`].
 pub fn device_bytes() -> (u64, u64) {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         ctx::device_bytes()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     (0, 0)
 }
 
@@ -1212,10 +1232,10 @@ pub fn device_bytes() -> (u64, u64) {
 /// earlier requests left resident, as the peak of the CUDA crate's
 /// `device_bytes` does. Lock-free.
 pub fn request_peak_bytes() -> u64 {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         ctx::request_peak_bytes()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     0
 }

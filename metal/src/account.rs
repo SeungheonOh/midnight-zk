@@ -97,7 +97,7 @@ impl Reason {
     }
 
     /// The decline reason of a device-context error.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub(crate) fn of(e: &crate::ctx::Error) -> Self {
         match e {
             crate::ctx::Error::NoDevice(_) => Reason::NoDevice,

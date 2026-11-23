@@ -150,6 +150,15 @@ impl SrsHandle {
         })
     }
 
+    /// Whether every registered point is in G1 (on the curve and in the
+    /// prime-order subgroup), as the check at registration found; `false`
+    /// also when the table was dropped as stale. Lets a registrant that read
+    /// its points without a check rely on this one instead of checking them
+    /// twice.
+    pub fn in_g1(&self) -> bool {
+        pinned(self.key, self.id).is_some_and(|t| t.first_bad >= t.len)
+    }
+
     /// Whether `bases` is the registered slice with the registered content
     /// (every point compared).
     pub fn verify(&self, bases: &[G1AffineLimbs]) -> bool {

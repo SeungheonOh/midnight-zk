@@ -16,13 +16,15 @@
 //! On a macOS target every `shaders/*.metal` file (headers in
 //! `shaders/include`) is compiled with `xcrun metal` to AIR and linked with
 //! `xcrun metallib` into one `.metallib`, which the crate embeds and loads at
-//! first use; the cfg `midnight_metal_metallib` is set. Without the Metal
-//! toolchain, or after a failed compile, the crate embeds the shader source
-//! instead (all files as one translation unit, the `#include "..."` headers
-//! expanded once each) and compiles it at first use with
-//! `newLibraryWithSource`. The expanded source is always embedded, so a
-//! metallib the running system refuses also falls back to it. A cargo warning
-//! says which path was taken. Other targets build the stub (no shaders).
+//! first use; the cfg `midnight_metal_metallib` is set. An iOS target does
+//! the same with the SDK of its platform ([`Sdk`]): `iphoneos` for a device,
+//! `iphonesimulator` for the simulator. Without the Metal toolchain, or after
+//! a failed compile, the crate embeds the shader source instead (all files as
+//! one translation unit, the `#include "..."` headers expanded once each) and
+//! compiles it at first use with `newLibraryWithSource`. The expanded source is
+//! always embedded, so a metallib the running system refuses also falls back to
+//! it. A cargo warning says which path was taken. Other targets build the stub
+//! (no shaders).
 //!
 //! The test and diagnostic kernels ([`TEST_SHADERS`]) are part of the library
 //! only with the feature `test-support`.
@@ -43,6 +45,8 @@ use std::{
 const MSL_VERSION: &str = "3.2";
 /// The oldest macOS that runs MSL [`MSL_VERSION`].
 const MACOS_MIN: &str = "15.0";
+/// The oldest iOS that runs MSL [`MSL_VERSION`] (and has `MTLResidencySet`).
+const IOS_MIN: &str = "18.0";
 /// Shader files of test and diagnostic kernels, compiled only with the
 /// feature `test-support`.
 const TEST_SHADERS: [&str; 3] = ["diag.metal", "field_test.metal", "msm_test.metal"];
@@ -60,9 +64,9 @@ fn main() {
     ] {
         println!("cargo:rerun-if-env-changed={v}");
     }
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+    let Some(sdk) = Sdk::of_target() else {
         return;
-    }
+    };
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     println!("cargo:rustc-env=MIDNIGHT_METAL_MSL_VERSION={MSL_VERSION}");
 
@@ -99,34 +103,85 @@ fn main() {
     if env::var("MIDNIGHT_METAL_SHADER_SOURCE").as_deref() == Ok("1") {
         return fallback("MIDNIGHT_METAL_SHADER_SOURCE=1".into());
     }
-    match metallib(&files, &include, &out) {
+    match metallib(sdk, &files, &include, &out) {
         Ok(()) => {
             println!("cargo:rustc-cfg=midnight_metal_metallib");
             println!(
                 "cargo:warning=midnight-metal: compiled {} shader file(s) to a metallib with \
-                 xcrun metal (MSL {MSL_VERSION}, macOS {MACOS_MIN}+)",
-                files.len()
+                 xcrun metal (MSL {MSL_VERSION}, {}+)",
+                files.len(),
+                sdk.os_min()
             );
         }
         Err(why) => fallback(why),
     }
 }
 
+/// The SDK whose Metal toolchain compiles the shaders for the target.
+#[derive(Clone, Copy)]
+enum Sdk {
+    MacOs,
+    IPhoneOs,
+    IPhoneSimulator,
+}
+
+impl Sdk {
+    /// The SDK of the target; `None`: a target without Metal (the stub).
+    fn of_target() -> Option<Sdk> {
+        match env::var("CARGO_CFG_TARGET_OS").as_deref() {
+            Ok("macos") => Some(Sdk::MacOs),
+            Ok("ios") if env::var("TARGET").is_ok_and(|t| t.ends_with("-sim")) => {
+                Some(Sdk::IPhoneSimulator)
+            }
+            Ok("ios") => Some(Sdk::IPhoneOs),
+            _ => None,
+        }
+    }
+
+    /// The name `xcrun -sdk` takes.
+    fn name(self) -> &'static str {
+        match self {
+            Sdk::MacOs => "macosx",
+            Sdk::IPhoneOs => "iphoneos",
+            Sdk::IPhoneSimulator => "iphonesimulator",
+        }
+    }
+
+    /// The minimum OS version flag of `xcrun metal`.
+    fn min_flag(self) -> String {
+        match self {
+            Sdk::MacOs => format!("-mmacosx-version-min={MACOS_MIN}"),
+            Sdk::IPhoneOs => format!("-mios-version-min={IOS_MIN}"),
+            Sdk::IPhoneSimulator => format!("-mios-simulator-version-min={IOS_MIN}"),
+        }
+    }
+
+    /// The oldest OS of the metallib, for the build message.
+    fn os_min(self) -> String {
+        match self {
+            Sdk::MacOs => format!("macOS {MACOS_MIN}"),
+            Sdk::IPhoneOs => format!("iOS {IOS_MIN}"),
+            Sdk::IPhoneSimulator => format!("iOS Simulator {IOS_MIN}"),
+        }
+    }
+}
+
 /// Compiles each file to AIR and links them into `midnight_metal.metallib`.
-fn metallib(files: &[PathBuf], include: &Path, out: &Path) -> Result<(), String> {
-    let probe = Command::new("xcrun").args(["-sdk", "macosx", "-f", "metal"]).output();
+fn metallib(sdk: Sdk, files: &[PathBuf], include: &Path, out: &Path) -> Result<(), String> {
+    let probe = Command::new("xcrun").args(["-sdk", sdk.name(), "-f", "metal"]).output();
     if !probe.as_ref().is_ok_and(|o| o.status.success()) {
-        return Err(
-            "the Metal toolchain was not found (`xcrun -sdk macosx -f metal` failed)".into(),
-        );
+        return Err(format!(
+            "the Metal toolchain was not found (`xcrun -sdk {} -f metal` failed)",
+            sdk.name()
+        ));
     }
     let mut airs = Vec::new();
     for f in files {
         let air = out.join(f.with_extension("air").file_name().unwrap());
         let o = Command::new("xcrun")
-            .args(["-sdk", "macosx", "metal"])
+            .args(["-sdk", sdk.name(), "metal"])
             .arg(format!("-std=metal{MSL_VERSION}"))
-            .arg(format!("-mmacosx-version-min={MACOS_MIN}"))
+            .arg(sdk.min_flag())
             .arg("-I")
             .arg(include)
             .arg("-c")
@@ -146,7 +201,7 @@ fn metallib(files: &[PathBuf], include: &Path, out: &Path) -> Result<(), String>
     }
     let lib = out.join("midnight_metal.metallib");
     let o = Command::new("xcrun")
-        .args(["-sdk", "macosx", "metallib"])
+        .args(["-sdk", sdk.name(), "metallib"])
         .args(&airs)
         .arg("-o")
         .arg(&lib)
