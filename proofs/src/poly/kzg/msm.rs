@@ -109,6 +109,13 @@ where
 #[allow(unsafe_code)]
 /// Wrapper over the MSM function to use the blstrs underlying function
 pub fn msm_specific<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C::Curve]) -> C::Curve {
+    // The accelerator sees the caller's slices: for a commitment, a prefix of
+    // the parameters' bases.
+    #[cfg(feature = "gpu")]
+    if let Some(r) = crate::gpu::msm::<C, C::Scalar, C::Curve>(coeffs, bases) {
+        return r;
+    }
+
     // We empirically checked that for MSMs larger than 2**18, the blstrs
     // implementation regresses.
     if coeffs.len() <= (2 << 18) && TypeId::of::<C>() == TypeId::of::<midnight_curves::G1Affine>() {

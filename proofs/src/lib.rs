@@ -8,6 +8,9 @@
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
 
+#[cfg(feature = "gpu")]
+pub mod gpu;
+
 pub mod circuit;
 pub mod plonk;
 pub mod poly;
