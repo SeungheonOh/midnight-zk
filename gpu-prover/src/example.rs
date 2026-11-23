@@ -22,6 +22,9 @@
 //! A service for another circuit implements [`ServedRelation`] for its own
 //! relation type and calls [`crate::daemon::main`] and
 //! [`crate::client::main`] with it.
+//!
+//! [`PoseidonChain`] is a relation for benchmarks: the chain of Poseidon
+//! hashes of the device tests, of any length.
 
 use ff::{Field, PrimeField};
 use midnight_circuits::{
@@ -97,6 +100,72 @@ impl ServedRelation for PoseidonPreimage {
         }
         let h = <PoseidonChip<F> as HashCPU<F, F>>::hash(&w);
         Ok((h, w))
+    }
+}
+
+/// A chain of `rounds` Poseidon hashes of three inputs, each hash taking the
+/// previous one and the last two inputs; the last hash is public. The
+/// relation of the device tests (`tests/metal.rs`, 600 rounds at `k = 16`)
+/// with the length as a parameter, so that a benchmark fills a circuit of any
+/// size with Poseidon rows. Not served by the binaries.
+#[derive(Clone, Copy, Debug)]
+pub struct PoseidonChain {
+    /// The number of hashes (at least 1).
+    pub rounds: usize,
+}
+
+impl PoseidonChain {
+    /// The public input of the witness `w`: the last hash of the chain.
+    pub fn instance(&self, w: &[F; 3]) -> F {
+        let mut h = <PoseidonChip<F> as HashCPU<F, F>>::hash(w);
+        for _ in 1..self.rounds {
+            h = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[h, w[1], w[2]]);
+        }
+        h
+    }
+}
+
+impl Relation for PoseidonChain {
+    type Instance = F;
+    type Witness = [F; 3];
+    type Error = Error;
+
+    fn format_instance(instance: &Self::Instance) -> Result<Vec<F>, Error> {
+        Ok(vec![*instance])
+    }
+
+    fn circuit(
+        &self,
+        std_lib: &ZkStdLib,
+        layouter: &mut impl Layouter<F>,
+        _instance: Value<Self::Instance>,
+        witness: Value<Self::Witness>,
+    ) -> Result<(), Error> {
+        let w = std_lib.assign_many(layouter, &witness.transpose_array())?;
+        let mut h = std_lib.poseidon(layouter, &w)?;
+        for _ in 1..self.rounds {
+            h = std_lib.poseidon(layouter, &[h, w[1].clone(), w[2].clone()])?;
+        }
+        std_lib.constrain_as_public_input(layouter, &h)
+    }
+
+    fn used_chips(&self) -> ZkStdLibArch {
+        ZkStdLibArch {
+            poseidon: true,
+            ..ZkStdLibArch::default()
+        }
+    }
+
+    fn write_relation<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        writer.write_all(&(self.rounds as u64).to_le_bytes())
+    }
+
+    fn read_relation<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let mut b = [0u8; 8];
+        reader.read_exact(&mut b)?;
+        Ok(PoseidonChain {
+            rounds: u64::from_le_bytes(b) as usize,
+        })
     }
 }
 
