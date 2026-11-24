@@ -81,6 +81,35 @@ pub const DEFAULT_WORKGROUP: u32 = 256;
 /// The largest staging buffer of one read-back step.
 const READ_CHUNK: usize = 32 << 20;
 
+/// `1`: time every command of the main command buffers with timestamps
+/// ([`kernel_profile`]). A measurement switch: the extra timestamps cost GPU
+/// time.
+pub const PROFILE_ENV: &str = "MIDNIGHT_VULKAN_PROFILE";
+
+/// The most timed commands of one command buffer.
+const PROFILE_MARKS: u32 = 4096;
+
+/// Whether [`PROFILE_ENV`] is `1` (read once).
+fn profiling() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var(PROFILE_ENV).as_deref() == Ok("1"))
+}
+
+/// GPU time by command: `(calls, nanoseconds)`.
+static PROFILE: Mutex<std::collections::BTreeMap<&'static str, (u64, f64)>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// With [`PROFILE_ENV`]: per kernel (copies and fills as `(copy)`,
+/// `(fill)`), the commands run and their GPU time in nanoseconds since the
+/// last call, which clears them. A command's time runs from the end of the
+/// one before it.
+pub fn kernel_profile() -> Vec<(&'static str, u64, u64)> {
+    let mut p = PROFILE.lock().unwrap_or_else(|e| e.into_inner());
+    let out = p.iter().map(|(k, (n, t))| (*k, *n, *t as u64)).collect();
+    p.clear();
+    out
+}
+
 /// An embedded kernel: its SPIR-V for both arithmetic variants.
 pub(crate) struct Shader {
     pub(crate) name: &'static str,
@@ -391,7 +420,7 @@ impl Submit {
         if timestamps {
             let q = vk::QueryPoolCreateInfo::default()
                 .query_type(vk::QueryType::TIMESTAMP)
-                .query_count(2);
+                .query_count(2 + if profiling() { PROFILE_MARKS } else { 0 });
             self.query = s.check("vkCreateQueryPool", unsafe {
                 d.create_query_pool(&q, None)
             })?;
@@ -1225,7 +1254,8 @@ impl Context {
                 d.begin_command_buffer(submit.cmd, &begin),
             )?;
             if submit.query != vk::QueryPool::null() {
-                d.cmd_reset_query_pool(submit.cmd, submit.query, 0, 2);
+                let n = 2 + if profiling() { PROFILE_MARKS } else { 0 };
+                d.cmd_reset_query_pool(submit.cmd, submit.query, 0, n);
                 d.cmd_write_timestamp(
                     submit.cmd,
                     vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -1238,6 +1268,7 @@ impl Context {
             ctx: self,
             submit,
             recorded: false,
+            marks: Vec::new(),
             keep: Vec::new(),
         })
     }
@@ -1541,6 +1572,8 @@ pub struct Commands<'a> {
     ctx: &'a Context,
     submit: MutexGuard<'a, Submit>,
     recorded: bool,
+    /// With [`PROFILE_ENV`]: the command of each timestamp after the first.
+    marks: Vec<&'static str>,
     /// The pipelines recorded through [`Commands::dispatch_shared`].
     keep: Vec<Arc<Pipeline>>,
 }
@@ -1654,7 +1687,29 @@ impl<'a> Commands<'a> {
             d.cmd_dispatch(cmd, gx, gy, 1);
         }
         self.recorded = true;
+        self.mark(pipeline.name);
         Ok(())
+    }
+
+    /// With [`PROFILE_ENV`], a timestamp after the command just recorded.
+    fn mark(&mut self, what: &'static str) {
+        let query = self.submit.query;
+        if query == vk::QueryPool::null() || !profiling() || self.marks.len() >= PROFILE_MARKS as usize
+        {
+            return;
+        }
+        let at = 2 + self.marks.len() as u32;
+        // SAFETY: the command buffer is recording; the query exists (the pool
+        // holds `2 + PROFILE_MARKS` with profiling) and was reset at `begin`.
+        unsafe {
+            self.ctx.shared.device.cmd_write_timestamp(
+                self.submit.cmd,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                query,
+                at,
+            )
+        };
+        self.marks.push(what);
     }
 
     /// Makes the writes of every command recorded so far visible to the
@@ -1722,6 +1777,7 @@ impl<'a> Commands<'a> {
                 .cmd_copy_buffer(self.submit.cmd, src.buffer, dst.buffer, &region)
         };
         self.recorded = true;
+        self.mark("(copy)");
         Ok(())
     }
 
@@ -1759,6 +1815,7 @@ impl<'a> Commands<'a> {
             )
         };
         self.recorded = true;
+        self.mark("(fill)");
         Ok(())
     }
 
@@ -1808,7 +1865,7 @@ impl<'a> Commands<'a> {
             if query == vk::QueryPool::null() {
                 return Ok(wall);
             }
-            let mut ticks = [0u64; 2];
+            let mut ticks = vec![0u64; 2 + self.marks.len()];
             s.check(
                 "vkGetQueryPoolResults",
                 d.get_query_pool_results(
@@ -1824,9 +1881,20 @@ impl<'a> Commands<'a> {
             } else {
                 (1u64 << bits) - 1
             };
-            let delta = ticks[1].wrapping_sub(ticks[0]) & mask;
-            let ns = delta as f64 * self.ctx.info.timestamp_period as f64;
-            Ok(Duration::from_nanos(ns as u64))
+            let period = self.ctx.info.timestamp_period as f64;
+            let ns = |a: u64, b: u64| (b.wrapping_sub(a) & mask) as f64 * period;
+            if !self.marks.is_empty() {
+                let mut p = PROFILE.lock().unwrap_or_else(|e| e.into_inner());
+                let mut prev = ticks[0];
+                for (i, what) in self.marks.iter().enumerate() {
+                    let t = ticks[2 + i];
+                    let e = p.entry(what).or_insert((0, 0.0));
+                    e.0 += 1;
+                    e.1 += ns(prev, t);
+                    prev = t;
+                }
+            }
+            Ok(Duration::from_nanos(ns(ticks[0], ticks[1]) as u64))
         }
     }
 }

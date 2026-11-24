@@ -273,6 +273,12 @@ pub mod device {
             ms(h.run_nanos),
             ms(h.run_gpu_nanos),
         );
+        let k = vulkan::device::kernel_profile();
+        if !k.is_empty() {
+            let list: Vec<String> =
+                k.iter().map(|(n, c, t)| format!("{n} {c}x {:.1}", ms(*t))).collect();
+            eprintln!("kernels_ms {}", list.join(", "));
+        }
         // the pipelines are made in the first (cold) proof
         static LISTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut p = vulkan::pipeline_times();
