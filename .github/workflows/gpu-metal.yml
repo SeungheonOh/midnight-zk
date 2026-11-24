@@ -6,6 +6,8 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "metal/**"
+      - "accel/**"
+      - "vulkan/**"
       - "gpu-prover/**"
       - "proofs/**"
       - "circuits/**"

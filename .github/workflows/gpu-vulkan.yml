@@ -1,0 +1,93 @@
+name: GPU prover on Vulkan
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "vulkan/**"
+      - "accel/**"
+      - "gpu-prover/**"
+      - "proofs/**"
+      - "circuits/**"
+      - "curves/**"
+      - "bench/gpu-prover/rc1/**"
+      - "bench/gpu-prover/Cargo.toml"
+      - "bench/gpu-prover/build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/gpu-vulkan.yml"
+  merge_group:
+  push:
+    branches:
+      - main
+      - next
+
+permissions:
+  contents: read
+
+jobs:
+  vulkan:
+    name: Vulkan backend (lavapipe)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      RUST_TEST_THREADS: 1
+      # the build fails instead of embedding no SPIR-V
+      MIDNIGHT_VULKAN_REQUIRE_SPIRV: "1"
+      # test only: the runner has no GPU, so take Mesa's CPU implementation
+      MIDNIGHT_VULKAN_ALLOW_CPU: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install the shader tools, the Vulkan loader and lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            glslang-tools spirv-tools libvulkan1 mesa-vulkan-drivers vulkan-tools
+
+      - name: Install rust-toolchain.toml
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: gpu-vulkan
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Vulkan device
+        run: vulkaninfo --summary
+
+      - name: Build midnight-vulkan and the daemon with the Vulkan binding
+        run: cargo build --locked --release -p midnight-vulkan -p midnight-gpu-prover --features midnight-gpu-prover/vulkan
+
+      - name: Clippy on the Vulkan crates
+        run: cargo clippy --locked -p midnight-accel -p midnight-vulkan -p midnight-gpu-prover --all-targets --features midnight-gpu-prover/vulkan -- -D warnings
+
+      - name: Build the rc.1 bench with the Vulkan hooks
+        run: cargo build --locked --release -p midnight-gpu-prover-bench --features rc1-bench-vulkan
+
+      - name: midnight-accel tests
+        run: cargo test --locked --release -p midnight-accel
+
+      - name: midnight-vulkan tests
+        run: cargo test --locked --release -p midnight-vulkan
+
+      - name: midnight-vulkan tests on the discrete path
+        env:
+          MIDNIGHT_VULKAN_DISCRETE: "1"
+        run: cargo test --locked --release -p midnight-vulkan
+
+      - name: midnight-vulkan tests in 32-bit arithmetic
+        env:
+          MIDNIGHT_VULKAN_ARITH: "32"
+        run: cargo test --locked --release -p midnight-vulkan
+
+      - name: midnight-gpu-prover Vulkan tests
+        env:
+          MIDNIGHT_VULKAN_REQUIRE_DEVICE: "1"
+        run: cargo test --locked --release -p midnight-gpu-prover --features vulkan,test-seed --test vulkan
