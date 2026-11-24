@@ -28,6 +28,9 @@ pub mod msm;
 pub mod ntt;
 #[doc(hidden)]
 pub mod quotient;
+#[cfg(feature = "testkit")]
+#[doc(hidden)]
+pub mod testkit;
 
 mod hooks;
 

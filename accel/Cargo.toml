@@ -18,14 +18,29 @@ default = []
 # Test only: the test switches and test entry points, for the tests of the
 # backend crates.
 test-support = []
+# The tests every backend runs (`backend_tests!`), for the tests of the
+# backend crates.
+testkit = [
+    "test-support",
+    "dep:ff",
+    "dep:group",
+    "dep:midnight-circuits",
+    "dep:midnight-proofs",
+    "dep:rand_chacha",
+    "dep:rand_core",
+]
 
 [dependencies]
 blst = "0.3.15"
 midnight-curves = { path = "../curves" }
 rayon = { workspace = true }
+ff = { workspace = true, optional = true }
+group = { workspace = true, optional = true }
+midnight-circuits = { path = "../circuits", features = ["testing"], optional = true }
+midnight-proofs = { path = "../proofs", features = ["gpu-test", "circuit-params"], optional = true }
+rand_chacha = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
 
 [dev-dependencies]
 ff = { workspace = true }
 group = { workspace = true }
-rand_chacha = { workspace = true }
-rand_core = { workspace = true }

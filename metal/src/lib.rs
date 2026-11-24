@@ -95,9 +95,6 @@ mod stub;
 use stub::Metal;
 mod tuning;
 
-#[cfg(all(test, target_os = "macos"))]
-mod tests;
-
 /// MSM path and plan of one call (feature `test-support`).
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]

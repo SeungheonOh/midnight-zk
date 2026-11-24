@@ -24,12 +24,14 @@ use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
 use rayon::prelude::*;
 
+use crate::Backend;
+
 /// Serializes the tests that change process-wide thresholds, switches or
 /// counters.
-pub fn serial() -> MutexGuard<'static, ()> {
+pub fn serial<B: Backend>() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    assert!(midnight_metal::device(), "no usable Metal device");
+    assert!(crate::device::<B>(), "no usable {} device", B::NAME);
     g
 }
 
@@ -44,8 +46,8 @@ pub fn random_scalars(n: usize, seed: u64) -> Vec<Fq> {
         .collect()
 }
 
-pub fn declines(class: &str, reason: &str) -> u64 {
-    midnight_metal::declines()
+pub fn declines<B: Backend>(class: &str, reason: &str) -> u64 {
+    crate::declines::<B>()
         .into_iter()
         .filter(|d| d.0 == class && d.1 == reason)
         .map(|d| d.2)
@@ -54,13 +56,13 @@ pub fn declines(class: &str, reason: &str) -> u64 {
 
 /// Installs the device hooks once per process, with `quotient` as the
 /// quotient hook.
-pub fn install_hooks(quotient: QuotientFn) {
+pub fn install_hooks<B: Backend>(quotient: QuotientFn) {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         assert!(install(GpuHooks {
-            msm_g1: Some(midnight_metal::msm_g1),
-            fft: Some(midnight_metal::fft),
-            ifft: Some(midnight_metal::ifft),
+            msm_g1: Some(crate::msm_g1::<B>),
+            fft: Some(crate::fft::<B>),
+            ifft: Some(crate::ifft::<B>),
             quotient: Some(quotient),
         }))
     });

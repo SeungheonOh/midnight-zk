@@ -113,7 +113,7 @@ impl Backend for Metal {
 
     fn run<'a, R>(
         &'a self,
-        _: impl FnOnce(&mut Metal) -> Result<R, Error>,
+        _: impl FnOnce(&mut Self::Cmd<'a>) -> Result<R, Error>,
     ) -> Result<(R, u64), Error> {
         match *self {}
     }

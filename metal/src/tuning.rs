@@ -96,6 +96,16 @@ mod tests {
     }
 
     #[test]
+    fn default_thresholds() {
+        let d = TUNING.thresholds;
+        assert_eq!(
+            (d.fft, d.ifft, d.msm_table, d.msm_one_shot, d.quotient),
+            (15, 15, 13, None, 14)
+        );
+        assert_eq!(crate::DEFAULT_THRESHOLDS, d);
+    }
+
+    #[test]
     fn plan_follows_measured_table() {
         // (log2 n, wbits, nwins, chunks after the command-buffer bound)
         for (k, wbits, nwins, batch) in [
