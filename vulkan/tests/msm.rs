@@ -16,7 +16,7 @@
 mod common;
 
 use blst::blst_fp;
-use common::{Xyzz, affine, fmul, fp, fsqr, xyzz_point};
+use common::{Xyzz, affine, cuda_mask_vector, fmul, fp, fsqr, xyzz_point};
 use group::{Curve, Group, prime::PrimeCurveAffine};
 use midnight_curves::{G1Affine, G1Projective};
 use midnight_vulkan::{
@@ -111,21 +111,6 @@ fn g1_kernels_match_blst() {
             }
         }
     }
-}
-
-/// The CUDA crate's mask vector (gpu/src/msm.rs `mask_vector`) from
-/// element `i0` on: the splitmix64 stream advanced by `4 i0` outputs.
-fn cuda_mask_vector(i0: u64, n: usize) -> Vec<[u64; 4]> {
-    const GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
-    let mut x: u64 = 0x2545_f491_4f6c_dd1du64.wrapping_add((4 * i0).wrapping_mul(GAMMA));
-    let mut next = || {
-        x = x.wrapping_add(GAMMA);
-        let mut z = x;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    };
-    (0..n).map(|_| [next(), next(), next(), next() >> 3]).collect()
 }
 
 /// The mask from `i0` on, `n` elements.

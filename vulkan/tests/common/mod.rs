@@ -93,3 +93,24 @@ pub fn xyzz_point(r: &Xyzz) -> G1Projective {
 pub fn scalars(a: &[Fq]) -> Vec<[u64; 4]> {
     a.iter().map(scalar).collect()
 }
+
+/// The CUDA crate's mask vector (gpu/src/msm.rs `mask_vector`) from
+/// element `i0` on: the splitmix64 stream advanced by `4 i0` outputs.
+pub fn cuda_mask_vector(i0: u64, n: usize) -> Vec<[u64; 4]> {
+    const GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut x: u64 = 0x2545_f491_4f6c_dd1du64.wrapping_add((4 * i0).wrapping_mul(GAMMA));
+    let mut next = || {
+        x = x.wrapping_add(GAMMA);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    (0..n).map(|_| [next(), next(), next(), next() >> 3]).collect()
+}
+
+/// The scalar of reduced Montgomery limbs.
+pub fn fq(a: &[u64; 4]) -> Fq {
+    // SAFETY: as `scalar`; `a` is reduced.
+    unsafe { std::mem::transmute_copy(a) }
+}

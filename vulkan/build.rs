@@ -58,105 +58,79 @@ struct Kernel {
 }
 
 const KERNELS: &[Kernel] = &[
-    Kernel {
-        name: "ntt_pass",
-        source: "ntt.comp",
-        defines: &["NTT_PASS"],
-        keep: &[],
-        test: false,
-    },
-    Kernel {
-        name: "ntt_scale",
-        source: "ntt.comp",
-        defines: &["NTT_SCALE"],
-        keep: &[],
-        test: false,
-    },
-    Kernel {
-        name: "ntt_scale_copy",
-        source: "ntt.comp",
-        defines: &["NTT_SCALE_COPY"],
-        keep: &[],
-        test: false,
-    },
-    Kernel {
-        name: "ntt_distribute_zeta",
-        source: "ntt.comp",
-        defines: &["NTT_DISTRIBUTE_ZETA"],
-        keep: &[],
-        test: false,
-    },
-    Kernel {
-        name: "ntt_mul_periodic",
-        source: "ntt.comp",
-        defines: &["NTT_MUL_PERIODIC"],
-        keep: &[],
-        test: false,
-    },
-    Kernel {
-        name: "diag_iota",
-        source: "diag_iota.comp",
-        defines: &[],
-        keep: &[],
-        test: true,
-    },
-    Kernel {
-        name: "field_test_fr",
-        source: "field_test.comp",
-        defines: &["FIELD_FR"],
-        keep: &[],
-        test: true,
-    },
-    Kernel {
-        name: "field_test_fp",
-        source: "field_test.comp",
-        defines: &["FIELD_FP"],
-        keep: &[],
-        test: true,
-    },
-    Kernel {
-        name: "msm_test_g1",
-        source: "msm_test_g1.comp",
-        defines: &[],
-        keep: &["g1_mul"],
-        test: true,
-    },
-    Kernel {
-        name: "msm_test_mask",
-        source: "msm_test_mask.comp",
-        defines: &[],
-        keep: &[],
-        test: true,
-    },
-    Kernel {
-        name: "bench_fr_mul",
-        source: "bench.comp",
-        defines: &["BENCH_FR_MUL"],
-        keep: &[],
-        test: true,
-    },
-    Kernel {
-        name: "bench_fp_mul",
-        source: "bench.comp",
-        defines: &["BENCH_FP_MUL"],
-        keep: &[],
-        test: true,
-    },
-    Kernel {
-        name: "bench_g1_madd",
-        source: "bench.comp",
-        defines: &["BENCH_G1_MADD"],
-        keep: &["g1_mul"],
-        test: true,
-    },
-    Kernel {
-        name: "bench_g1_madd_inline",
-        source: "bench.comp",
-        defines: &["BENCH_G1_MADD"],
-        keep: &[],
-        test: true,
-    },
+    kernel("ntt_pass", "ntt.comp", &["NTT_PASS"], &[]),
+    kernel("ntt_scale", "ntt.comp", &["NTT_SCALE"], &[]),
+    kernel("ntt_scale_copy", "ntt.comp", &["NTT_SCALE_COPY"], &[]),
+    kernel(
+        "ntt_distribute_zeta",
+        "ntt.comp",
+        &["NTT_DISTRIBUTE_ZETA"],
+        &[],
+    ),
+    kernel("ntt_mul_periodic", "ntt.comp", &["NTT_MUL_PERIODIC"], &[]),
+    kernel("msm_digits", "msm.comp", &["MSM_DIGITS"], &[]),
+    kernel("msm_sort_count", "msm.comp", &["MSM_SORT_COUNT"], &[]),
+    kernel("msm_sort_scan", "msm.comp", &["MSM_SORT_SCAN"], &[]),
+    kernel("msm_sort_scatter", "msm.comp", &["MSM_SORT_SCATTER"], &[]),
+    kernel("msm_sort_lower", "msm.comp", &["MSM_SORT_LOWER"], &[]),
+    kernel("msm_ones", "msm.comp", &["MSM_ONES"], &["g1_mul"]),
+    kernel("msm_bucket_guard", "msm.comp", &["MSM_BUCKET_GUARD"], &[]),
+    kernel(
+        "msm_accumulate",
+        "msm.comp",
+        &["MSM_ACCUMULATE"],
+        &["g1_mul"],
+    ),
+    kernel("msm_integrate", "msm.comp", &["MSM_INTEGRATE"], &["g1_mul"]),
+    test("diag_iota", "diag_iota.comp", &[], &[]),
+    test("field_test_fr", "field_test.comp", &["FIELD_FR"], &[]),
+    test("field_test_fp", "field_test.comp", &["FIELD_FP"], &[]),
+    test("msm_test_g1", "msm_test_g1.comp", &[], &["g1_mul"]),
+    test("msm_test_mask", "msm_test_mask.comp", &[], &[]),
+    test("bench_fr_mul", "bench.comp", &["BENCH_FR_MUL"], &[]),
+    test("bench_fp_mul", "bench.comp", &["BENCH_FP_MUL"], &[]),
+    test(
+        "bench_g1_madd",
+        "bench.comp",
+        &["BENCH_G1_MADD"],
+        &["g1_mul"],
+    ),
+    test(
+        "bench_g1_madd_inline",
+        "bench.comp",
+        &["BENCH_G1_MADD"],
+        &[],
+    ),
 ];
+
+/// A production kernel.
+const fn kernel(
+    name: &'static str,
+    source: &'static str,
+    defines: &'static [&'static str],
+    keep: &'static [&'static str],
+) -> Kernel {
+    Kernel {
+        name,
+        source,
+        defines,
+        keep,
+        test: false,
+    }
+}
+
+/// A test or measurement kernel (feature `test-support`).
+const fn test(
+    name: &'static str,
+    source: &'static str,
+    defines: &'static [&'static str],
+    keep: &'static [&'static str],
+) -> Kernel {
+    Kernel {
+        test: true,
+        ..kernel(name, source, defines, keep)
+    }
+}
 
 /// The arithmetic variants: (file suffix, `MONT_INT64`).
 const VARIANTS: [(&str, u32); 2] = [("int64", 1), ("int32", 0)];
