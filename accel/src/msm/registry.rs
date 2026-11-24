@@ -21,8 +21,9 @@
 
 use std::{
     collections::HashMap,
+    marker::PhantomData,
     sync::{
-        Arc, Mutex, MutexGuard, RwLock,
+        Arc, Mutex, MutexGuard, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering::Relaxed},
     },
 };
@@ -32,18 +33,18 @@ use super::{
     par::{lock, read, write},
 };
 use crate::{
-    G1AffineLimbs, G1JacobianLimbs,
+    Backend, G1AffineLimbs, G1JacobianLimbs,
     ctx::{Buffer, Ctx, Error},
 };
 
 /// Where a table's points are: the host copy until the first MSM, then the
 /// device buffer.
-pub(super) enum Store {
+pub(super) enum Store<B: Backend> {
     Host(Vec<G1AffineLimbs>),
-    Device(Buffer),
+    Device(Buffer<B>),
 }
 
-impl Store {
+impl<B: Backend> Store<B> {
     /// The first `len` points (fewer if the store holds fewer).
     fn points(&self, len: usize) -> &[G1AffineLimbs] {
         let all = match self {
@@ -58,17 +59,17 @@ impl Store {
 pub(super) type MaskCache = Mutex<HashMap<usize, G1JacobianLimbs>>;
 
 /// A registered table. Its points never change after registration.
-pub(super) struct Table {
+pub(crate) struct Table<B: Backend> {
     id: u64,
     len: usize,
     /// The first index whose point is not in G1, or `len`. An MSM on a longer
     /// prefix declines.
     pub(super) first_bad: usize,
-    pub(super) store: RwLock<Store>,
+    pub(super) store: RwLock<Store<B>>,
     pub(super) masks: MaskCache,
 }
 
-impl Table {
+impl<B: Backend> Table<B> {
     /// Whether the table still holds the caller's points (every point
     /// compared).
     fn serves(&self, bases: &[G1AffineLimbs]) -> bool {
@@ -82,13 +83,13 @@ impl Table {
 
     /// Uploads the host copy to a device buffer, once (the caller holds the
     /// device lock).
-    pub(super) fn upload(&self, ctx: &Ctx) -> Result<(), Error> {
+    pub(super) fn upload(&self, ctx: &Ctx<B>) -> Result<(), Error> {
         if matches!(*read(&self.store), Store::Host(_)) {
             let mut w = write(&self.store);
             if let Store::Host(h) = &*w {
                 let b = ctx.upload(h)?;
                 *w = Store::Device(b);
-                UPLOADS.fetch_add(1, Relaxed);
+                B::host().msm.uploads.fetch_add(1, Relaxed);
             }
         }
         Ok(())
@@ -96,40 +97,74 @@ impl Table {
 }
 
 /// The registry: tables keyed by (address, length) of the registered slice.
-type Registry = HashMap<(usize, usize), Arc<Table>>;
+type Registry<B> = HashMap<(usize, usize), Arc<Table<B>>>;
 
-static TABLES: Mutex<Option<Registry>> = Mutex::new(None);
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-/// Tables dropped at an MSM because the caller's slice no longer matched.
-static STALE: AtomicU64 = AtomicU64::new(0);
-/// Table uploads.
-static UPLOADS: AtomicU64 = AtomicU64::new(0);
-/// MSMs served from a registered table.
-pub(super) static TABLES_SERVED: AtomicU64 = AtomicU64::new(0);
-/// One-shot MSMs (past their G1 check).
-pub(super) static ONE_SHOT: AtomicU64 = AtomicU64::new(0);
-/// Per-call G1 checks of the one-shot path started.
-#[cfg(any(test, feature = "test-support"))]
-pub(super) static G1_CHECKS: AtomicU64 = AtomicU64::new(0);
+/// The MSM state of one backend: the registry and the counters.
+pub(crate) struct MsmState<B: Backend> {
+    tables: Mutex<Option<Registry<B>>>,
+    next_id: AtomicU64,
+    /// Tables dropped at an MSM because the caller's slice no longer matched.
+    stale: AtomicU64,
+    /// Table uploads.
+    uploads: AtomicU64,
+    /// MSMs served from a registered table.
+    pub(crate) tables_served: AtomicU64,
+    /// One-shot MSMs (past their G1 check).
+    pub(crate) one_shot: AtomicU64,
+    /// Per-call G1 checks of the one-shot path started.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) g1_checks: AtomicU64,
+    /// Whether every MSM pipeline has the SIMD width the kernels assume.
+    pub(crate) simd_ok: OnceLock<bool>,
+    /// The thread pool of the CPU share.
+    pub(crate) cpu_pool: OnceLock<Option<rayon::ThreadPool>>,
+}
 
-fn tables() -> MutexGuard<'static, Option<Registry>> {
-    lock(&TABLES)
+impl<B: Backend> MsmState<B> {
+    /// No table, every counter zero.
+    pub(crate) const fn new() -> Self {
+        MsmState {
+            tables: Mutex::new(None),
+            next_id: AtomicU64::new(1),
+            stale: AtomicU64::new(0),
+            uploads: AtomicU64::new(0),
+            tables_served: AtomicU64::new(0),
+            one_shot: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            g1_checks: AtomicU64::new(0),
+            simd_ok: OnceLock::new(),
+            cpu_pool: OnceLock::new(),
+        }
+    }
+}
+
+fn tables<B: Backend>() -> MutexGuard<'static, Option<Registry<B>>> {
+    lock(&B::host().msm.tables)
 }
 
 /// The live table registered under `key` with `id`, pinned.
-fn pinned(key: (usize, usize), id: u64) -> Option<Arc<Table>> {
-    tables().as_ref().and_then(|t| t.get(&key)).filter(|e| e.id == id).cloned()
+fn pinned<B: Backend>(key: (usize, usize), id: u64) -> Option<Arc<Table<B>>> {
+    tables::<B>().as_ref().and_then(|t| t.get(&key)).filter(|e| e.id == id).cloned()
 }
 
 /// The registration of an SRS base slice. While it lives, the registrant
 /// keeps the slice alive and unchanged. Dropping it frees the table.
-#[derive(Debug)]
-pub struct SrsHandle {
+pub struct SrsHandle<B: Backend> {
     id: u64,
     key: (usize, usize),
+    _backend: PhantomData<fn() -> B>,
 }
 
-impl SrsHandle {
+impl<B: Backend> std::fmt::Debug for SrsHandle<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SrsHandle")
+            .field("id", &self.id)
+            .field("key", &self.key)
+            .finish()
+    }
+}
+
+impl<B: Backend> SrsHandle<B> {
     /// Number of registered points.
     pub fn len(&self) -> usize {
         self.key.1
@@ -143,7 +178,7 @@ impl SrsHandle {
     /// Bytes this table holds in device memory: its points once uploaded,
     /// else 0.
     pub fn device_bytes(&self) -> u64 {
-        pinned(self.key, self.id).map_or(0, |t| match &*read(&t.store) {
+        pinned::<B>(self.key, self.id).map_or(0, |t| match &*read(&t.store) {
             Store::Device(b) => b.len_bytes() as u64,
             Store::Host(_) => 0,
         })
@@ -152,14 +187,14 @@ impl SrsHandle {
     /// Whether `bases` is the registered slice with the registered content.
     pub fn verify(&self, bases: &[G1AffineLimbs]) -> bool {
         (bases.as_ptr() as usize, bases.len()) == self.key
-            && pinned(self.key, self.id).is_some_and(|t| t.serves(bases))
+            && pinned::<B>(self.key, self.id).is_some_and(|t| t.serves(bases))
     }
 }
 
-impl Drop for SrsHandle {
+impl<B: Backend> Drop for SrsHandle<B> {
     fn drop(&mut self) {
         let removed = {
-            let mut t = tables();
+            let mut t = tables::<B>();
             match t.as_mut() {
                 Some(m) if m.get(&self.key).is_some_and(|e| e.id == self.id) => m.remove(&self.key),
                 _ => None,
@@ -177,9 +212,9 @@ impl Drop for SrsHandle {
 ///
 /// Every point is checked to be in G1 once here. A table with a point outside
 /// G1 is still registered, and MSMs on a prefix that includes it decline.
-pub fn register_srs(bases: &[G1AffineLimbs]) -> SrsHandle {
+pub fn register_srs<B: Backend>(bases: &[G1AffineLimbs]) -> SrsHandle<B> {
     let key = (bases.as_ptr() as usize, bases.len());
-    let id = NEXT_ID.fetch_add(1, Relaxed);
+    let id = B::host().msm.next_id.fetch_add(1, Relaxed);
     let t = Arc::new(Table {
         id,
         len: bases.len(),
@@ -187,29 +222,34 @@ pub fn register_srs(bases: &[G1AffineLimbs]) -> SrsHandle {
         store: RwLock::new(Store::Host(bases.to_vec())),
         masks: Mutex::new(HashMap::new()),
     });
-    let old = tables().get_or_insert_with(HashMap::new).insert(key, t);
+    let old = tables::<B>().get_or_insert_with(HashMap::new).insert(key, t);
     // outside the registry lock, as in `SrsHandle::drop`
     drop(old);
-    SrsHandle { id, key }
+    SrsHandle {
+        id,
+        key,
+        _backend: PhantomData,
+    }
 }
 
 /// Live registered tables.
-pub fn srs_handles() -> usize {
-    tables().as_ref().map_or(0, |t| t.len())
+pub fn srs_handles<B: Backend>() -> usize {
+    tables::<B>().as_ref().map_or(0, |t| t.len())
 }
 
 /// Tables dropped at an MSM because the caller's slice no longer matched.
-pub fn srs_stale() -> u64 {
-    STALE.load(Relaxed)
+pub fn srs_stale<B: Backend>() -> u64 {
+    B::host().msm.stale.load(Relaxed)
 }
 
 /// (MSMs served from a registered table, one-shot MSMs, table uploads) since
 /// process start.
-pub fn msm_counts() -> (u64, u64, u64) {
+pub fn msm_counts<B: Backend>() -> (u64, u64, u64) {
+    let m = &B::host().msm;
     (
-        TABLES_SERVED.load(Relaxed),
-        ONE_SHOT.load(Relaxed),
-        UPLOADS.load(Relaxed),
+        m.tables_served.load(Relaxed),
+        m.one_shot.load(Relaxed),
+        m.uploads.load(Relaxed),
     )
 }
 
@@ -217,13 +257,13 @@ pub fn msm_counts() -> (u64, u64, u64) {
 /// a stable interface).
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-support"))]
-pub fn one_shot_g1_checks() -> u64 {
-    G1_CHECKS.load(Relaxed)
+pub fn one_shot_g1_checks<B: Backend>() -> u64 {
+    B::host().msm.g1_checks.load(Relaxed)
 }
 
 /// The key of the table that serves `m` scalars on the slice `key`: the exact
 /// entry, else the shortest longer entry at the same address.
-fn table_for(t: &Registry, key: (usize, usize), m: usize) -> Option<(usize, usize)> {
+fn table_for<B: Backend>(t: &Registry<B>, key: (usize, usize), m: usize) -> Option<(usize, usize)> {
     if m > key.1 {
         return None;
     }
@@ -236,11 +276,14 @@ fn table_for(t: &Registry, key: (usize, usize), m: usize) -> Option<(usize, usiz
 /// The table that serves an MSM of `n` scalars on `bases`, pinned, after every
 /// point was compared. A mismatching table is dropped (with its cached mask
 /// MSMs) unless it was replaced meanwhile, and the next candidate is tried.
-pub(super) fn serving_table(bases: &[G1AffineLimbs], n: usize) -> Option<Arc<Table>> {
+pub(super) fn serving_table<B: Backend>(
+    bases: &[G1AffineLimbs],
+    n: usize,
+) -> Option<Arc<Table<B>>> {
     let key = (bases.as_ptr() as usize, bases.len());
     loop {
         let (tk, t) = {
-            let g = tables();
+            let g = tables::<B>();
             let t = g.as_ref()?;
             let tk = table_for(t, key, n)?;
             (tk, t.get(&tk)?.clone())
@@ -249,14 +292,14 @@ pub(super) fn serving_table(bases: &[G1AffineLimbs], n: usize) -> Option<Arc<Tab
             return Some(t);
         }
         let removed = {
-            let mut g = tables();
+            let mut g = tables::<B>();
             match g.as_mut() {
                 Some(m) if m.get(&tk).is_some_and(|e| Arc::ptr_eq(e, &t)) => m.remove(&tk),
                 _ => None,
             }
         };
         if removed.is_some() {
-            STALE.fetch_add(1, Relaxed);
+            B::host().msm.stale.fetch_add(1, Relaxed);
         }
         drop(removed);
         drop(t);

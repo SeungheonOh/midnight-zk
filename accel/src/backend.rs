@@ -23,6 +23,7 @@
 use std::ptr::NonNull;
 
 use crate::{
+    Thresholds,
     ctx::{Arg, Error, ReadBack},
     host::HostState,
 };
@@ -42,6 +43,56 @@ pub struct DeviceInfo {
     pub max_threads_per_group: u64,
 }
 
+/// The constants a backend measured on its devices: break-evens against the
+/// stock CPU code, the MSM window plan and CPU share, and the sizes of
+/// command buffers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tuning {
+    /// The default threshold of each class.
+    pub thresholds: Thresholds,
+    /// `(log2 n, window bits, chunks)` of the MSM by size, one entry per log2,
+    /// ascending. Sizes outside take the nearest end entry; other lengths the
+    /// entry of their size class.
+    pub msm_windows: &'static [(u32, u32, usize)],
+    /// `(log2 n, table path, one-shot path)`: the device share of the MSM in
+    /// 64ths of the points (64: device only), one entry per log2, ascending.
+    /// Below the first entry: device only; above: the last entry.
+    pub msm_shares: &'static [(u32, usize, usize)],
+    /// The most window digits of one MSM chunk (one command buffer).
+    pub msm_chunk_adds: usize,
+    /// Upper-sort groups per window (a power of two).
+    pub msm_sort_groups: u32,
+    /// Groups of `msm_ones`.
+    pub msm_ones_groups: usize,
+    /// The most points one bucket of a chunk may hold (the digit-1 bucket of
+    /// window 0 excepted). One GPU thread sums a bucket serially, so its
+    /// length bounds the command buffer's time; `msm_chunk_adds` assumes
+    /// balanced buckets.
+    ///
+    /// With the mask, honest scalars spread evenly over the buckets and stay
+    /// far below this limit. Scalars chosen as `s_i = c - r_i` send a whole
+    /// window to one bucket, which can run into the GPU watchdog. Above the
+    /// limit the chunk skips accumulation and the call declines
+    /// `device-error`. That decline reveals one bit about the masked scalars,
+    /// which honest scalars set with negligible probability; it is reported
+    /// only as a generic `device-error`.
+    pub msm_hot_bucket_limit: u32,
+    /// Table path, default thresholds: an MSM of `n` scalars needs
+    /// `msm_sparse_fixed + n / msm_sparse_div` non-zero scalars.
+    pub msm_sparse_div: usize,
+    /// See [`Tuning::msm_sparse_div`].
+    pub msm_sparse_fixed: usize,
+    /// Field multiplications of the NTT per command buffer (a pass is never
+    /// split).
+    pub ntt_run_budget: u64,
+    /// The GPU time one command buffer of the quotient numerator aims at.
+    pub quotient_target_nanos: u64,
+    /// The default threads of one numerator dispatch (a multiple of 256).
+    pub quotient_threads: u32,
+    /// The pool keeps at most the device's memory budget over this.
+    pub pool_divisor: u64,
+}
+
 /// A GPU backend: one process-wide device context and its host state.
 pub trait Backend: Sized + Send + Sync + 'static {
     /// The backend's short name: thread names and messages
@@ -54,6 +105,9 @@ pub trait Backend: Sized + Send + Sync + 'static {
     type Raw: RawBuffer;
     /// The encoder of one command buffer ([`Backend::run`]).
     type Cmd<'a>: Encoder<'a, Self>;
+    /// The backend's measured constants. A constant rather than a method of
+    /// the context: the thresholds are read before the device is.
+    const TUNING: Tuning;
 
     /// The host state of this backend: one static per backend.
     fn host() -> &'static HostState<Self>;

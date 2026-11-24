@@ -18,6 +18,8 @@ use std::{
     sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
+use crate::Backend;
+
 /// The threads of a host pass over the points or the scalars.
 pub fn host_threads() -> usize {
     std::thread::available_parallelism().map_or(4, |t| t.get()).min(16)
@@ -26,16 +28,18 @@ pub fn host_threads() -> usize {
 /// The thread pool of the CPU share of an MSM: its own threads, so that the
 /// share never waits for a worker of the caller's pool (the prover calls MSMs
 /// from rayon workers, which may all be blocked on the device lock).
-pub fn cpu_pool() -> Option<&'static rayon::ThreadPool> {
-    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
-    POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(std::thread::available_parallelism().map_or(4, |t| t.get()))
-            .thread_name(|i| format!("midnight-metal-msm-cpu-{i}"))
-            .build()
-            .ok()
-    })
-    .as_ref()
+pub fn cpu_pool<B: Backend>() -> Option<&'static rayon::ThreadPool> {
+    B::host()
+        .msm
+        .cpu_pool
+        .get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(std::thread::available_parallelism().map_or(4, |t| t.get()))
+                .thread_name(|i| format!("midnight-{}-msm-cpu-{i}", B::NAME))
+                .build()
+                .ok()
+        })
+        .as_ref()
 }
 
 /// `f` with a panic caught: `None` when it panicked.

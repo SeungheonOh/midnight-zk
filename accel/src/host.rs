@@ -24,13 +24,17 @@
 //! ```
 
 use std::sync::{
-    Condvar, Mutex,
-    atomic::{AtomicBool, AtomicU64},
+    Condvar, Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicU32, AtomicU64},
 };
 
 use crate::{
+    account::Account,
     backend::Backend,
     ctx::{Lendable, POOL_LIMIT_UNREAD, Pool, Releases, State},
+    msm::MsmState,
+    ntt,
+    quotient::{KeyState, QuotientState},
 };
 
 /// Every piece of process-wide state the shared code keeps for backend `B`.
@@ -61,9 +65,26 @@ pub struct HostState<B: Backend> {
     pub(crate) scratch_any: AtomicBool,
     /// The idle buffers of `ctx::take_request_buffer`.
     pub(crate) lendable: Mutex<Lendable<B>>,
-    /// The test switches.
+    /// The test switches of the buffers.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) switches: crate::ctx::Switches,
+    /// The decline and service counters.
+    pub(crate) account: Account,
+    /// Whether `{ENV_PREFIX}=off`, read once.
+    pub(crate) off: OnceLock<bool>,
+    /// The explicit threshold, or a marker.
+    pub(crate) min_k: AtomicU32,
+    /// The registered SRS tables and the MSM counters.
+    pub(crate) msm: MsmState<B>,
+    /// The NTT twiddle tables, made at the first transform.
+    pub(crate) ntt_tables: Mutex<Option<&'static ntt::Tables<B>>>,
+    /// The quotient counters and settings.
+    pub(crate) quotient: QuotientState,
+    /// The registered proving-key polynomials and their device copies.
+    pub(crate) keys: KeyState<B>,
+    /// The test switches of the hook entries.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) hooks: crate::hooks::HookSwitches,
 }
 
 impl<B: Backend> HostState<B> {
@@ -86,6 +107,15 @@ impl<B: Backend> HostState<B> {
             lendable: Mutex::new(Lendable::new()),
             #[cfg(any(test, feature = "test-support"))]
             switches: crate::ctx::Switches::new(),
+            account: Account::new(),
+            off: OnceLock::new(),
+            min_k: crate::hooks::min_k_unread(),
+            msm: MsmState::new(),
+            ntt_tables: Mutex::new(None),
+            quotient: QuotientState::new(),
+            keys: KeyState::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            hooks: crate::hooks::HookSwitches::new(),
         }
     }
 }

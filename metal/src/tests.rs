@@ -244,20 +244,10 @@ fn errors_are_values() {
     let out = c.alloc(64).unwrap();
     let n = 1u32;
     let e = c
-        .run(|cmd| {
-            cmd.dispatch_with(
-                "diag_iota",
-                1,
-                1 << 20,
-                &[Arg::Buffer(&out)],
-                &n,
-                &[],
-            )
-        })
+        .run(|cmd| cmd.dispatch_with("diag_iota", 1, 1 << 20, &[Arg::Buffer(&out)], &n, &[]))
         .unwrap_err();
     assert_eq!(e.reason(), "device-error");
-    c.run(|cmd| cmd.dispatch("diag_iota", 1, &[Arg::Buffer(&out)], &n))
-        .unwrap();
+    c.run(|cmd| cmd.dispatch("diag_iota", 1, &[Arg::Buffer(&out)], &n)).unwrap();
 }
 
 /// The tests that change the thresholds, hold buffers across a session or
@@ -825,7 +815,7 @@ fn ntt_pass_takes_the_planned_threadgroups() {
     require_device();
     let max = ctx::context().unwrap().max_group("ntt_pass").unwrap();
     for log_n in 1..=crate::MAX_LOG_N {
-        for t in crate::ntt::pass_group_threads(log_n) {
+        for t in midnight_accel::ntt::pass_group_threads(log_n) {
             assert!(
                 t >= 1 && t <= max,
                 "2^{log_n}: {t} threads, pipeline max {max}"

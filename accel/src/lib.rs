@@ -29,8 +29,21 @@ pub mod ntt;
 #[doc(hidden)]
 pub mod quotient;
 
-pub use backend::{Backend, DeviceInfo, Encoder, RawBuffer};
+mod hooks;
+
+pub use backend::{Backend, DeviceInfo, Encoder, RawBuffer, Tuning};
+pub(crate) use hooks::test_switch;
+pub use hooks::*;
 pub use host::HostState;
+#[cfg(any(test, feature = "test-support"))]
+pub use msm::{MsmStages, msm_g1_stages, one_shot_g1_checks};
+pub use msm::{SrsHandle, msm_counts, register_srs, srs_handles, srs_stale};
+#[cfg(any(test, feature = "test-support"))]
+pub use quotient::QuotientStages;
+pub use quotient::{
+    KeyHandle, evict_key_copies, keep_resident, key_stale, keys_registered, need_bytes,
+    quotient_counts, register_key, set_keep_resident, threads as quotient_threads,
+};
 
 /// A scalar: `blst_fr`, four little-endian limbs, Montgomery form, reduced
 /// modulo [`field::FR_MODULUS`].
@@ -101,17 +114,6 @@ impl Thresholds {
         ]
     }
 }
-
-/// Per-class break-evens against the stock CPU code, measured on Apple
-/// silicon. The one-shot MSM never breaks even because of its G1 check.
-pub const DEFAULT_THRESHOLDS: Thresholds = Thresholds {
-    fft: 15,
-    ifft: 15,
-    msm_table: 13,
-    msm_one_shot: None,
-    quotient: 14,
-    explicit: false,
-};
 
 /// Calls served in one class since the counters were last reset.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

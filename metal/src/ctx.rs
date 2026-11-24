@@ -47,8 +47,8 @@ use std::{
 
 #[cfg(midnight_metal_metallib)]
 use dispatch2::DispatchData;
-use midnight_accel::{Backend, DeviceInfo, Encoder, HostState, RawBuffer, ctx as acc};
 pub use midnight_accel::ctx::{Error, Pod, ReadBack, bytes_of};
+use midnight_accel::{Backend, DeviceInfo, Encoder, HostState, RawBuffer, Tuning, ctx as acc};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSObjectProtocol, NSString};
 use objc2_metal::{
@@ -163,9 +163,10 @@ pub fn release_later(bufs: Vec<Buffer>) {
     acc::release_later(bufs)
 }
 
-/// Whether a [`release_later`] call has not completed yet.
-#[cfg(test)]
-pub(crate) fn releases_pending() -> bool {
+/// Whether a [`release_later`] call has not completed yet. Test support.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn releases_pending() -> bool {
     acc::releases_pending::<Metal>()
 }
 
@@ -180,9 +181,6 @@ pub fn settle_releases() {
 pub fn take_request_buffer(key: &'static str, bytes: usize) -> Result<RequestBuffer, Error> {
     acc::take_request_buffer::<Metal>(key, bytes)
 }
-
-/// Copies `src` into `dst` on several threads when long.
-pub(crate) use midnight_accel::ctx::par_copy;
 
 /// Makes every later [`end_request_report`]`(true)` plant a non-zero byte in
 /// its first region after zeroing, so the read-back fails. Test support.
@@ -246,11 +244,6 @@ pub fn end_request_report(check: bool) -> Result<crate::WipeStats, crate::WipeSt
 /// [`end_request_report`] without the read-back. `true` when done.
 pub fn end_request() -> bool {
     acc::end_request::<Metal>()
-}
-
-/// The wipe of a hook call made outside a request.
-pub(crate) fn wipe_unbracketed() {
-    acc::wipe_unbracketed::<Metal>()
 }
 
 /// `(free, total)`: `total` is `recommendedMaxWorkingSetSize`, `free` is that
@@ -693,6 +686,7 @@ impl Backend for Metal {
     const ENV_PREFIX: &'static str = "MIDNIGHT_METAL";
     type Raw = MetalBuffer;
     type Cmd<'a> = MetalCommand<'a>;
+    const TUNING: Tuning = crate::tuning::TUNING;
 
     fn host() -> &'static HostState<Self> {
         &HOST

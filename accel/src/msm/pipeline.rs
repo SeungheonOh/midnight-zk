@@ -18,7 +18,6 @@
 use std::{mem::size_of, sync::Mutex};
 
 use blst::blst_p1;
-use midnight_accel::Backend;
 
 use super::{
     Xyzz,
@@ -28,16 +27,12 @@ use super::{
     secret::{ScrubOnExit, Secret, SecretVec},
 };
 use crate::{
-    G1AffineLimbs, Scalar,
+    Backend, G1AffineLimbs, Scalar,
     ctx::{Arg, Buffer, Command, Ctx, Error},
 };
 
-/// Upper-sort groups per window (sppark: `sm_count / 3`, a power of two).
-const SORT_GROUPS: u32 = 8;
 /// Threads of a sort group (sppark `SORT_BLOCKDIM`).
 const SORT_BLOCK: usize = 1024;
-/// Groups of `msm_ones` (sppark: `sm_count` blocks).
-const ONES_GROUPS: usize = 32;
 /// Threads of an `msm_ones` group (sppark `BATCH_ADD_BLOCK_SIZE`).
 const ONES_BLOCK: usize = 256;
 /// Threads of an `msm_accumulate` group (`ACC_GROUP` in msm.metal).
@@ -65,18 +60,6 @@ const KERNELS: [&str; 9] = [
     "msm_integrate",
 ];
 
-/// The most points one bucket of a chunk may hold (the digit-1 bucket of
-/// window 0 excepted). One GPU thread sums a bucket serially, so its length
-/// bounds the command buffer's time; `CHUNK_ADDS` assumes balanced buckets.
-///
-/// With the mask, honest scalars spread evenly over the buckets and stay far
-/// below this limit. Scalars chosen as `s_i = c - r_i` send a whole window to
-/// one bucket, which can run into the GPU watchdog. Above the limit the chunk
-/// skips accumulation and the call declines `device-error`. That decline
-/// reveals one bit about the masked scalars, which honest scalars set with
-/// negligible probability; it is reported only as a generic `device-error`.
-pub(super) const HOT_BUCKET_LIMIT: u32 = 1 << 16;
-
 /// Scalar mode of `msm_digits`: the masked scalars `s + r`.
 pub(super) const MODE_MASKED: u32 = 1;
 /// Scalar mode of `msm_digits`: the mask `r` alone (scalars not read).
@@ -87,6 +70,12 @@ pub(super) const MODE_MASK: u32 = 2;
 pub(super) struct Geometry {
     sort_block: usize,
     ones_block: usize,
+    /// Upper-sort groups per window ([`crate::Tuning::msm_sort_groups`]).
+    sort_groups: u32,
+    /// Groups of `msm_ones` ([`crate::Tuning::msm_ones_groups`]).
+    ones_groups: usize,
+    /// [`crate::Tuning::msm_hot_bucket_limit`].
+    hot_limit: u32,
     /// `msm_integrate` threads per window (a power of two).
     nthr: usize,
 }
@@ -94,7 +83,7 @@ pub(super) struct Geometry {
 impl Geometry {
     /// The thread counts of `pl` on this device, after checking what the
     /// kernels rely on (threadgroup sizes, sort widths, SIMD-group width).
-    pub(super) fn of(c: &Ctx, pl: &Plan) -> Result<Geometry, Error> {
+    pub(super) fn of<B: Backend>(c: &Ctx<B>, pl: &Plan) -> Result<Geometry, Error> {
         let max = |k: &str| c.max_group(k);
         let pow2_floor = |x: usize| if x == 0 { 0 } else { 1usize << lg2(x) };
         let sort_block = [
@@ -117,31 +106,35 @@ impl Geometry {
             return Err(Error::Device("msm: window too wide for the sort".into()));
         }
         simd_width_ok(c)?;
+        let t = &B::TUNING;
         Ok(Geometry {
             sort_block,
             ones_block,
+            sort_groups: t.msm_sort_groups,
+            ones_groups: t.msm_ones_groups,
+            hot_limit: t.msm_hot_bucket_limit,
             nthr,
         })
     }
 
     /// The records `msm_ones` writes: one per 32 threads of its grid.
     pub(super) fn ones_slots(&self) -> usize {
-        ONES_GROUPS * self.ones_block / SIMD_WIDTH
+        self.ones_groups * self.ones_block / SIMD_WIDTH
     }
 }
 
 /// Whether every MSM pipeline has SIMD-groups of [`SIMD_WIDTH`], checked once
 /// per process. Another width is a `device-error` decline.
-fn simd_width_ok(c: &Ctx) -> Result<(), Error> {
-    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let ok = match OK.get() {
+fn simd_width_ok<B: Backend>(c: &Ctx<B>) -> Result<(), Error> {
+    let once = &B::host().msm.simd_ok;
+    let ok = match once.get() {
         Some(&ok) => ok,
         None => {
             let mut ok = true;
             for k in KERNELS {
                 ok &= c.subgroup_width(k)? == SIMD_WIDTH;
             }
-            *OK.get_or_init(|| ok)
+            *once.get_or_init(|| ok)
         }
     };
     if ok {
@@ -154,25 +147,25 @@ fn simd_width_ok(c: &Ctx) -> Result<(), Error> {
 }
 
 /// The device buffers of an MSM.
-pub(super) struct Bufs<'a> {
+pub(super) struct Bufs<'a, B: Backend> {
     /// The points: a registered table, or the caller's copied for the call.
-    pub(super) points: &'a Buffer,
-    pub(super) scalars: &'a Buffer,
+    pub(super) points: &'a Buffer<B>,
+    pub(super) scalars: &'a Buffer<B>,
     /// `nwins` rows of `stride` digits, then of sorted point indices.
-    pub(super) digits: &'a Buffer,
+    pub(super) digits: &'a Buffer<B>,
     /// The sort's (key, value) pairs of one pass.
-    pub(super) temps: &'a Buffer,
+    pub(super) temps: &'a Buffer<B>,
     /// The upper sort's per-group counters of one pass.
-    pub(super) counts: &'a Buffer,
+    pub(super) counts: &'a Buffer<B>,
     /// `nwins` rows of bucket end offsets.
-    pub(super) hist: &'a Buffer,
+    pub(super) hist: &'a Buffer<B>,
     /// `nwins` rows of bucket sums, then of `msm_integrate` partial sums.
-    pub(super) buckets: &'a Buffer,
+    pub(super) buckets: &'a Buffer<B>,
     /// The partial sums of `msm_ones`.
-    pub(super) ones: &'a Buffer,
-    /// Set by `msm_bucket_guard` when a bucket exceeds [`HOT_BUCKET_LIMIT`]
-    /// (reset by `msm_digits`).
-    pub(super) hot: &'a Buffer,
+    pub(super) ones: &'a Buffer<B>,
+    /// Set by `msm_bucket_guard` when a bucket exceeds the hot-bucket limit
+    /// ([`crate::Tuning::msm_hot_bucket_limit`]); reset by `msm_digits`.
+    pub(super) hot: &'a Buffer<B>,
 }
 
 /// Byte sizes of the scratch buffers of `pl`, in [`Bufs`] field order from
@@ -183,7 +176,7 @@ pub(super) fn scratch_bytes(pl: &Plan, g: &Geometry) -> [usize; 7] {
     [
         pl.nwins as usize * pl.stride * 4,
         pl.pass as usize * pl.stride * 8,
-        pl.pass as usize * ntop * SORT_GROUPS as usize * 4,
+        pl.pass as usize * ntop * g.sort_groups as usize * 4,
         rows * 4,
         rows * size_of::<Xyzz>(),
         g.ones_slots() * size_of::<Xyzz>(),
@@ -203,7 +196,7 @@ struct ChunkParams {
     int: [u32; 3],
 }
 
-fn chunk_params(pl: &Plan, mode: u32, h_off: usize, num: usize) -> ChunkParams {
+fn chunk_params(pl: &Plan, g: &Geometry, mode: u32, h_off: usize, num: usize) -> ChunkParams {
     let sort = (0..pl.nwins)
         .step_by(pl.pass as usize)
         .map(|w0| {
@@ -212,7 +205,7 @@ fn chunk_params(pl: &Plan, mode: u32, h_off: usize, num: usize) -> ChunkParams {
                 pl.stride as u32,
                 w0,
                 pl.nwins,
-                SORT_GROUPS,
+                g.sort_groups,
                 pl.top_bits,
                 pl.low_bits,
                 pl.bits,
@@ -230,14 +223,14 @@ fn chunk_params(pl: &Plan, mode: u32, h_off: usize, num: usize) -> ChunkParams {
             mode,
         ],
         sort,
-        acc: [pl.nwins, pl.bits, pl.stride as u32, HOT_BUCKET_LIMIT],
+        acc: [pl.nwins, pl.bits, pl.stride as u32, g.hot_limit],
         int: [pl.nwins, pl.wbits, NBITS],
     }
 }
 
-fn enc_digits<'a>(
-    cmd: &mut Command<'_, 'a>,
-    b: &Bufs<'a>,
+fn enc_digits<'a, B: Backend>(
+    cmd: &mut Command<'_, 'a, B>,
+    b: &Bufs<'a, B>,
     p: &'a ChunkParams,
     h_off: usize,
     num: usize,
@@ -257,9 +250,9 @@ fn enc_digits<'a>(
     )
 }
 
-fn enc_sort<'a>(
-    cmd: &mut Command<'_, 'a>,
-    b: &Bufs<'a>,
+fn enc_sort<'a, B: Backend>(
+    cmd: &mut Command<'_, 'a, B>,
+    b: &Bufs<'a, B>,
     p: &'a ChunkParams,
     pl: &Plan,
     g: &Geometry,
@@ -268,7 +261,7 @@ fn enc_sort<'a>(
     for sp in &p.sort {
         // windows of this pass (`sp[2]`, its first window, is below `nwins`)
         let pw = (pl.nwins - sp[2]).min(pl.pass) as usize;
-        let groups = pw * SORT_GROUPS as usize;
+        let groups = pw * g.sort_groups as usize;
         cmd.dispatch_groups(
             "msm_sort_count",
             groups,
@@ -314,9 +307,9 @@ fn enc_sort<'a>(
 }
 
 /// The hot-bucket guard, `msm_ones` and `msm_accumulate`.
-fn enc_accumulate<'a>(
-    cmd: &mut Command<'_, 'a>,
-    b: &Bufs<'a>,
+fn enc_accumulate<'a, B: Backend>(
+    cmd: &mut Command<'_, 'a, B>,
+    b: &Bufs<'a, B>,
     p: &'a ChunkParams,
     pl: &Plan,
     g: &Geometry,
@@ -332,7 +325,7 @@ fn enc_accumulate<'a>(
     )?;
     cmd.dispatch_groups(
         "msm_ones",
-        ONES_GROUPS,
+        g.ones_groups,
         g.ones_block,
         &[
             Arg::Buffer(b.ones),
@@ -359,9 +352,9 @@ fn enc_accumulate<'a>(
     )
 }
 
-fn enc_integrate<'a>(
-    cmd: &mut Command<'_, 'a>,
-    b: &Bufs<'a>,
+fn enc_integrate<'a, B: Backend>(
+    cmd: &mut Command<'_, 'a, B>,
+    b: &Bufs<'a, B>,
     p: &'a ChunkParams,
     pl: &Plan,
     g: &Geometry,
@@ -386,9 +379,9 @@ type Partials = (SecretVec<Xyzz>, SecretVec<Xyzz>);
 /// Each chunk's partial sums are combined on a host thread while the device
 /// runs the next chunk. Any chunk or collection failure is an error, returned
 /// after every started collection has been joined.
-pub(super) fn run(
-    c: &Ctx,
-    b: &Bufs<'_>,
+pub(super) fn run<B: Backend>(
+    c: &Ctx<B>,
+    b: &Bufs<'_, B>,
     pl: &Plan,
     g: &Geometry,
     mode: u32,
@@ -450,16 +443,16 @@ pub(super) fn run(
 
 /// Runs the chunk of `num` points from `h_off` in one command buffer and
 /// copies out its partial sums before the next chunk reuses the buffers.
-fn run_chunk(
-    c: &Ctx,
-    b: &Bufs<'_>,
+fn run_chunk<B: Backend>(
+    c: &Ctx<B>,
+    b: &Bufs<'_, B>,
     pl: &Plan,
     g: &Geometry,
     mode: u32,
     h_off: usize,
     num: usize,
 ) -> Result<(u64, Partials), Error> {
-    let p = chunk_params(pl, mode, h_off, num);
+    let p = chunk_params(pl, g, mode, h_off, num);
     let ((), ns) = c.run(|cmd| {
         enc_digits(cmd, b, &p, h_off, num)?;
         enc_sort(cmd, b, &p, pl, g)?;
@@ -477,7 +470,7 @@ fn run_chunk(
 
 /// The partial sums of the chunk just run, copied into guards; `None` when a
 /// device buffer is shorter than the plan needs.
-fn copy_partials(b: &Bufs<'_>, pl: &Plan, g: &Geometry) -> Option<Partials> {
+fn copy_partials<B: Backend>(b: &Bufs<'_, B>, pl: &Plan, g: &Geometry) -> Option<Partials> {
     let per_row = 2 * g.nthr;
     let row_len = 1usize << pl.bits;
     let bk = b.buckets.as_slice::<Xyzz>();

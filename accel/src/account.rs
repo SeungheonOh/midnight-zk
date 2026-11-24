@@ -22,6 +22,8 @@ use std::{
     },
 };
 
+use crate::backend::Backend;
+
 /// A hook class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
@@ -102,15 +104,34 @@ impl Reason {
     }
 }
 
-/// Declines by `(class, reason)`.
-static DECLINES: Mutex<BTreeMap<(&'static str, &'static str), u64>> = Mutex::new(BTreeMap::new());
-/// Calls served, and their GPU nanoseconds, by [`Class::index`].
-static SERVED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-static NANOS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// The decline and service counters of one backend.
+pub(crate) struct Account {
+    /// Declines by `(class, reason)`.
+    declines: Mutex<BTreeMap<(&'static str, &'static str), u64>>,
+    /// Calls served, and their GPU nanoseconds, by [`Class::index`].
+    served: [AtomicU64; 4],
+    nanos: [AtomicU64; 4],
+}
+
+impl Account {
+    /// Every counter zero.
+    pub(crate) const fn new() -> Self {
+        Account {
+            declines: Mutex::new(BTreeMap::new()),
+            served: [const { AtomicU64::new(0) }; 4],
+            nanos: [const { AtomicU64::new(0) }; 4],
+        }
+    }
+}
+
+fn account<B: Backend>() -> &'static Account {
+    &B::host().account
+}
 
 /// Counts a decline; returns `false` (the decline value of a `bool` hook).
-pub fn decline(class: Class, reason: Reason) -> bool {
-    *DECLINES
+pub fn decline<B: Backend>(class: Class, reason: Reason) -> bool {
+    *account::<B>()
+        .declines
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .entry((class.name(), reason.name()))
@@ -119,14 +140,16 @@ pub fn decline(class: Class, reason: Reason) -> bool {
 }
 
 /// Counts a call served by the device, with its GPU time.
-pub fn served(class: Class, device_nanos: u64) {
-    SERVED[class.index()].fetch_add(1, Relaxed);
-    NANOS[class.index()].fetch_add(device_nanos, Relaxed);
+pub fn served<B: Backend>(class: Class, device_nanos: u64) {
+    let a = account::<B>();
+    a.served[class.index()].fetch_add(1, Relaxed);
+    a.nanos[class.index()].fetch_add(device_nanos, Relaxed);
 }
 
 /// Every decline: `(class, reason, count)`.
-pub fn declines() -> Vec<(&'static str, &'static str, u64)> {
-    DECLINES
+pub fn declines<B: Backend>() -> Vec<(&'static str, &'static str, u64)> {
+    account::<B>()
+        .declines
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
@@ -135,17 +158,19 @@ pub fn declines() -> Vec<(&'static str, &'static str, u64)> {
 }
 
 /// The service counters of `class`.
-pub fn class_stats(class: Class) -> crate::ClassStats {
+pub fn class_stats<B: Backend>(class: Class) -> crate::ClassStats {
+    let a = account::<B>();
     crate::ClassStats {
-        served: SERVED[class.index()].load(Relaxed),
-        device_nanos: NANOS[class.index()].load(Relaxed),
+        served: a.served[class.index()].load(Relaxed),
+        device_nanos: a.nanos[class.index()].load(Relaxed),
     }
 }
 
 /// Clears every counter.
-pub fn reset() {
-    for c in SERVED.iter().chain(NANOS.iter()) {
+pub fn reset<B: Backend>() {
+    let a = account::<B>();
+    for c in a.served.iter().chain(a.nanos.iter()) {
         c.store(0, Relaxed);
     }
-    DECLINES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    a.declines.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }

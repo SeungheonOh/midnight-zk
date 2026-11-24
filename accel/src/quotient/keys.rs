@@ -28,7 +28,7 @@
 //! whose content changed is counted ([`key_stale`]), loses its registration
 //! and is uploaded for the call only.
 //!
-//! The copies are freed at [`crate::end_request`] unless [`keep_resident`], by
+//! The copies are freed at the end of a request unless [`keep_resident`], by
 //! [`evict_key_copies`], or when the handle is dropped.
 
 use std::{
@@ -39,9 +39,8 @@ use std::{
     },
 };
 
-pub(crate) use midnight_accel::quotient::digest::digest_many;
-
-use crate::{Scalar, ctx::Buffer};
+pub(crate) use super::digest::digest_many;
+use crate::{Backend, Scalar, ctx::Buffer};
 
 /// A registered polynomial.
 struct Entry {
@@ -55,27 +54,36 @@ struct Entry {
 }
 
 /// The device copy of the polynomials of one length of one handle.
-struct KeyCopy {
+struct KeyCopy<B: Backend> {
     /// The handle's polynomials of this length (slots of the copy).
     npolys: usize,
     /// The copy, `npolys * len` values; `None` before the first quotient,
     /// after an eviction, or while lent.
-    buf: Option<Buffer>,
+    buf: Option<Buffer<B>>,
     /// Which slots hold their polynomial, verified against its digest.
     present: Vec<bool>,
 }
 
-#[derive(Default)]
-struct Registry {
+struct Registry<B: Backend> {
     /// By `(address, length)`.
     entries: HashMap<(usize, usize), Entry>,
     /// By `(handle, polynomial length)`.
-    copies: HashMap<(u64, usize), KeyCopy>,
+    copies: HashMap<(u64, usize), KeyCopy<B>>,
     /// Increments at every eviction: a copy lent before it is not returned.
     evictions: u64,
 }
 
-impl Registry {
+impl<B: Backend> Default for Registry<B> {
+    fn default() -> Self {
+        Registry {
+            entries: HashMap::new(),
+            copies: HashMap::new(),
+            evictions: 0,
+        }
+    }
+}
+
+impl<B: Backend> Registry<B> {
     /// Checks the polynomial at `key` against `digest`, its content's digest
     /// now. A match marks it checked in `epoch`; a mismatch counts it stale and
     /// drops its registration and slot. Returns whether it is still
@@ -98,7 +106,7 @@ impl Registry {
             return true;
         }
         let (id, slot) = (e.id, e.slot);
-        KEY_STALE.fetch_add(1, Relaxed);
+        B::host().keys.stale.fetch_add(1, Relaxed);
         self.entries.remove(&key);
         // the slot no longer holds a registered polynomial
         if let Some(c) = self.copies.get_mut(&(id, key.1))
@@ -110,58 +118,80 @@ impl Registry {
     }
 }
 
-static REGISTRY: Mutex<Option<Registry>> = Mutex::new(None);
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-static KEY_STALE: AtomicU64 = AtomicU64::new(0);
-/// The current request ([`begin_request`] and [`end_request`] increment it).
-static EPOCH: AtomicU64 = AtomicU64::new(1);
-/// Whether a request is open. Outside one every serve checks its digests.
-static OPEN: AtomicBool = AtomicBool::new(false);
-static KEEP: OnceLock<AtomicBool> = OnceLock::new();
-
-fn registry() -> MutexGuard<'static, Option<Registry>> {
-    REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
+/// The proving-key state of one backend: the registry and the request epoch.
+pub(crate) struct KeyState<B: Backend> {
+    registry: Mutex<Option<Registry<B>>>,
+    next_id: AtomicU64,
+    /// Registered polynomials dropped because their content changed.
+    stale: AtomicU64,
+    /// The current request ([`begin_request`] and [`end_request`] increment
+    /// it).
+    epoch: AtomicU64,
+    /// Whether a request is open. Outside one every serve checks its digests.
+    open: AtomicBool,
+    /// [`keep_resident`], read from the environment at first use.
+    keep: OnceLock<AtomicBool>,
 }
 
-fn keep() -> &'static AtomicBool {
-    KEEP.get_or_init(|| {
-        AtomicBool::new(std::env::var("MIDNIGHT_METAL_KEEP_KEYS").as_deref() == Ok("1"))
+impl<B: Backend> KeyState<B> {
+    /// No registration, no request.
+    pub(crate) const fn new() -> Self {
+        KeyState {
+            registry: Mutex::new(None),
+            next_id: AtomicU64::new(1),
+            stale: AtomicU64::new(0),
+            epoch: AtomicU64::new(1),
+            open: AtomicBool::new(false),
+            keep: OnceLock::new(),
+        }
+    }
+}
+
+fn registry<B: Backend>() -> MutexGuard<'static, Option<Registry<B>>> {
+    B::host().keys.registry.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn keep<B: Backend>() -> &'static AtomicBool {
+    B::host().keys.keep.get_or_init(|| {
+        AtomicBool::new(std::env::var(format!("{}_KEEP_KEYS", B::ENV_PREFIX)).as_deref() == Ok("1"))
     })
 }
 
 /// Whether the device copies of registered proving-key polynomials stay after
-/// a request (default `false`, or `MIDNIGHT_METAL_KEEP_KEYS=1`).
-pub fn keep_resident() -> bool {
-    keep().load(Relaxed)
+/// a request (default `false`, or `{ENV_PREFIX}_KEEP_KEYS=1`).
+pub fn keep_resident<B: Backend>() -> bool {
+    keep::<B>().load(Relaxed)
 }
 
 /// Sets [`keep_resident`].
-pub fn set_keep_resident(on: bool) {
-    keep().store(on, Relaxed);
+pub fn set_keep_resident<B: Backend>(on: bool) {
+    keep::<B>().store(on, Relaxed);
 }
 
 /// A new request: each digest is checked again at its next serve.
-pub(crate) fn begin_request() {
-    EPOCH.fetch_add(1, Relaxed);
-    OPEN.store(true, Relaxed);
+pub fn begin_request<B: Backend>() {
+    let k = &B::host().keys;
+    k.epoch.fetch_add(1, Relaxed);
+    k.open.store(true, Relaxed);
 }
 
 /// The end of a request: frees the copies unless [`keep_resident`].
-pub(crate) fn end_request() {
-    OPEN.store(false, Relaxed);
+pub fn end_request<B: Backend>() {
+    let k = &B::host().keys;
+    k.open.store(false, Relaxed);
     // a request begun after this one ended checks again (a new epoch)
-    EPOCH.fetch_add(1, Relaxed);
-    if !keep_resident() {
-        evict_key_copies();
+    k.epoch.fetch_add(1, Relaxed);
+    if !keep_resident::<B>() {
+        evict_key_copies::<B>();
     }
 }
 
 /// Frees every device copy (registrations stay). Returns the bytes freed; a
 /// copy lent to a running quotient is freed when returned and not counted.
-pub fn evict_key_copies() -> u64 {
+pub fn evict_key_copies<B: Backend>() -> u64 {
     let mut freed = Vec::new();
     {
-        let mut r = registry();
+        let mut r = registry::<B>();
         let Some(r) = r.as_mut() else { return 0 };
         r.evictions += 1;
         for c in r.copies.values_mut() {
@@ -171,20 +201,29 @@ pub fn evict_key_copies() -> u64 {
     }
     // zeroed in the background and pooled, outside the lock
     let bytes = freed.iter().map(|b| b.len_bytes() as u64).sum();
-    crate::ctx::release_later(freed);
+    crate::ctx::release_later::<B>(freed);
     bytes
 }
 
 /// The registration of proving-key polynomials. While it lives the registrant
 /// keeps them alive and, within a request, unchanged. Dropping it frees the
 /// device copies.
-#[derive(Debug)]
-pub struct KeyHandle {
+pub struct KeyHandle<B: Backend> {
     id: u64,
     keys: Vec<(usize, usize)>,
+    _backend: std::marker::PhantomData<fn() -> B>,
 }
 
-impl KeyHandle {
+impl<B: Backend> std::fmt::Debug for KeyHandle<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyHandle")
+            .field("id", &self.id)
+            .field("keys", &self.keys)
+            .finish()
+    }
+}
+
+impl<B: Backend> KeyHandle<B> {
     /// Whether every registered polynomial still has its registered content
     /// (full digests).
     pub fn verify(&self, polys: &[&[Scalar]]) -> bool {
@@ -192,7 +231,7 @@ impl KeyHandle {
             return false;
         }
         let ds = digest_many(polys);
-        let r = registry();
+        let r = registry::<B>();
         polys.iter().zip(&self.keys).zip(&ds).all(|((p, key), d)| {
             (p.as_ptr() as usize, p.len()) == *key
                 && r.as_ref()
@@ -204,7 +243,7 @@ impl KeyHandle {
     /// The bytes of this handle's device copies now (0 when not made, evicted
     /// or lent).
     pub fn resident_bytes(&self) -> u64 {
-        registry().as_ref().map_or(0, |r| {
+        registry::<B>().as_ref().map_or(0, |r| {
             r.copies
                 .iter()
                 .filter(|((id, _), _)| *id == self.id)
@@ -215,10 +254,10 @@ impl KeyHandle {
     }
 }
 
-impl Drop for KeyHandle {
+impl<B: Backend> Drop for KeyHandle<B> {
     fn drop(&mut self) {
-        let copies: Vec<KeyCopy> = {
-            let mut r = registry();
+        let copies: Vec<KeyCopy<B>> = {
+            let mut r = registry::<B>();
             let Some(r) = r.as_mut() else { return };
             for key in &self.keys {
                 if r.entries.get(key).is_some_and(|e| e.id == self.id) {
@@ -237,16 +276,16 @@ impl Drop for KeyHandle {
 /// Registers proving-key polynomials by their digests. A polynomial
 /// registered again moves to the new handle. Each length has its own device
 /// copy, and a quotient serves from the copy of its extended length only.
-pub fn register_key(polys: &[&[Scalar]]) -> KeyHandle {
-    let id = NEXT_ID.fetch_add(1, Relaxed);
+pub fn register_key<B: Backend>(polys: &[&[Scalar]]) -> KeyHandle<B> {
+    let id = B::host().keys.next_id.fetch_add(1, Relaxed);
     // hash before taking the lock
     let entries: Vec<((usize, usize), [u8; 32])> = polys
         .iter()
         .map(|p| (p.as_ptr() as usize, p.len()))
         .zip(digest_many(polys))
         .collect();
-    let now = EPOCH.load(Relaxed);
-    let mut r = registry();
+    let now = B::host().keys.epoch.load(Relaxed);
+    let mut r = registry::<B>();
     let r = r.get_or_insert_with(Registry::default);
     let mut keys = Vec::with_capacity(entries.len());
     // the next slot of each length
@@ -275,18 +314,22 @@ pub fn register_key(polys: &[&[Scalar]]) -> KeyHandle {
             },
         );
     }
-    KeyHandle { id, keys }
+    KeyHandle {
+        id,
+        keys,
+        _backend: std::marker::PhantomData,
+    }
 }
 
 /// Registered polynomials now.
-pub fn keys_registered() -> usize {
-    registry().as_ref().map_or(0, |r| r.entries.len())
+pub fn keys_registered<B: Backend>() -> usize {
+    registry::<B>().as_ref().map_or(0, |r| r.entries.len())
 }
 
 /// Registered polynomials dropped at a quotient because their content
 /// changed, since process start.
-pub fn key_stale() -> u64 {
-    KEY_STALE.load(Relaxed)
+pub fn key_stale<B: Backend>() -> u64 {
+    B::host().keys.stale.load(Relaxed)
 }
 
 /// Where a proving-key polynomial of a job is read from.
@@ -299,12 +342,12 @@ pub(crate) enum Place {
 }
 
 /// The resident copy lent to one quotient: returned by [`Lent::give_back`].
-pub(crate) struct Lent {
+pub(crate) struct Lent<B: Backend> {
     id: u64,
     /// The length of its polynomials: the job's extended length.
     len: usize,
     /// The copy (`None`: the caller allocates [`Lent::bytes`] bytes).
-    pub(crate) buf: Option<Buffer>,
+    pub(crate) buf: Option<Buffer<B>>,
     pub(crate) npolys: usize,
     /// Which slots hold their verified polynomial; only [`settle`] sets one.
     pub(crate) present: Vec<bool>,
@@ -312,7 +355,7 @@ pub(crate) struct Lent {
     evictions: u64,
 }
 
-impl Lent {
+impl<B: Backend> Lent<B> {
     /// The bytes of the copy: `npolys` polynomials of the job's length.
     pub(crate) fn bytes(&self) -> usize {
         self.npolys * self.len * size_of::<Scalar>()
@@ -322,7 +365,7 @@ impl Lent {
     /// happened; drops it otherwise.
     pub(crate) fn give_back(self) {
         let back = {
-            let mut r = registry();
+            let mut r = registry::<B>();
             match r.as_mut() {
                 Some(r) if r.evictions == self.evictions => {
                     match r.copies.get_mut(&(self.id, self.len)) {
@@ -344,12 +387,12 @@ impl Lent {
 
 /// The placement of a job's proving-key polynomials, made by [`plan`] and
 /// settled by [`settle`].
-pub(crate) struct Plan {
+pub(crate) struct Plan<B: Backend> {
     /// Where each polynomial is read from, assuming that every registered
     /// one still has its content; [`settle`] makes a stale one `Temp`.
     pub(crate) places: Vec<Place>,
     /// The copy lent for the call.
-    pub(crate) lent: Option<Lent>,
+    pub(crate) lent: Option<Lent<B>>,
     /// Indices of the registered polynomials whose digest is checked in this
     /// call, ascending.
     pub(crate) check: Vec<usize>,
@@ -359,7 +402,7 @@ pub(crate) struct Plan {
     epoch: u64,
 }
 
-impl Plan {
+impl<B: Backend> Plan<B> {
     /// Whether polynomial `i` goes in a slot this call fills; its digest is
     /// then computed over the bytes copied into the slot.
     pub(crate) fn fills(&self, i: usize) -> bool {
@@ -395,9 +438,10 @@ fn most_registered(regs: &[Option<(u64, usize)>], keys: &[&[Scalar]], en: usize)
 /// its copy and its polynomials go in their slots; the others are uploaded.
 /// The caller hashes [`Plan::check`] while the device works, and [`settle`]
 /// drops stale ones before any slot is read.
-pub(crate) fn plan(keys: &[&[Scalar]], en: usize) -> Plan {
-    let now = EPOCH.load(Relaxed);
-    let open = OPEN.load(Relaxed);
+pub(crate) fn plan<B: Backend>(keys: &[&[Scalar]], en: usize) -> Plan<B> {
+    let k = &B::host().keys;
+    let now = k.epoch.load(Relaxed);
+    let open = k.open.load(Relaxed);
     let mut p = Plan {
         places: vec![Place::Temp; keys.len()],
         lent: None,
@@ -407,7 +451,7 @@ pub(crate) fn plan(keys: &[&[Scalar]], en: usize) -> Plan {
     };
     let mut released = Vec::new();
     {
-        let mut r = registry();
+        let mut r = registry::<B>();
         let Some(reg) = r.as_mut() else {
             return p;
         };
@@ -459,7 +503,7 @@ pub(crate) fn plan(keys: &[&[Scalar]], en: usize) -> Plan {
             });
         }
     }
-    crate::ctx::release_later(released);
+    crate::ctx::release_later::<B>(released);
     // every slot filled by this call is verified in this call
     for i in 0..keys.len() {
         if p.fills(i) && !p.check.contains(&i) {
@@ -474,10 +518,14 @@ pub(crate) fn plan(keys: &[&[Scalar]], en: usize) -> Plan {
 /// marks the polynomial checked and its filled slot present; a mismatch, or a
 /// registration gone meanwhile, makes it `Temp` and drops its registration and
 /// slot. Returns whether a polynomial placed in a slot became `Temp`.
-pub(crate) fn settle(p: &mut Plan, keys: &[&[Scalar]], digests: &[[u8; 32]]) -> bool {
+pub(crate) fn settle<B: Backend>(
+    p: &mut Plan<B>,
+    keys: &[&[Scalar]],
+    digests: &[[u8; 32]],
+) -> bool {
     debug_assert_eq!(p.check.len(), digests.len());
     let mut moved = false;
-    let mut r = registry();
+    let mut r = registry::<B>();
     for (&i, d) in p.check.iter().zip(digests) {
         let key = (keys[i].as_ptr() as usize, keys[i].len());
         let fresh = r.as_mut().is_some_and(|reg| reg.check(key, p.regs[i], d, p.epoch));

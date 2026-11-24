@@ -287,10 +287,8 @@ fn mask_is_the_cuda_vector() {
     let s = ctx::lock().unwrap();
     let c = s.ctx();
     let out = c.alloc(n as usize * 32).unwrap();
-    c.run(|cmd| {
-        cmd.dispatch("msm_test_mask", n as usize, &[Arg::Buffer(&out)], &[i0, n])
-    })
-    .unwrap();
+    c.run(|cmd| cmd.dispatch("msm_test_mask", n as usize, &[Arg::Buffer(&out)], &[i0, n]))
+        .unwrap();
     assert_eq!(out.as_slice::<Scalar>(), &want[i0 as usize..]);
     assert!(want.iter().all(metal::field::is_reduced));
 }

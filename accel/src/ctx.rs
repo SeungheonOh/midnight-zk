@@ -266,7 +266,7 @@ fn pool<B: Backend>() -> MutexGuard<'static, Pool<B::Raw>> {
 }
 
 /// The most bytes the pool keeps idle: `{ENV_PREFIX}_POOL_MIB` (read once),
-/// else a quarter of the device's memory budget.
+/// else the device's memory budget over [`crate::Tuning::pool_divisor`].
 pub fn pool_limit<B: Backend>() -> u64 {
     let h = B::host();
     let l = h.pool_limit.load(Relaxed);
@@ -278,7 +278,9 @@ pub fn pool_limit<B: Backend>() -> u64 {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(|m| m.saturating_mul(1 << 20))
-        .unwrap_or_else(|| B::probe().map_or(0, |i| i.memory_budget / 4))
+        .unwrap_or_else(|| {
+            B::probe().map_or(0, |i| i.memory_budget / B::TUNING.pool_divisor.max(1))
+        })
         .min(POOL_LIMIT_UNREAD - 1);
     let _ = h.pool_limit.compare_exchange(POOL_LIMIT_UNREAD, l, Relaxed, Relaxed);
     h.pool_limit.load(Relaxed)
@@ -598,10 +600,7 @@ impl<B: Backend> Buffer<B> {
 
     /// The host address of the contents.
     fn ptr(&self) -> *mut u8 {
-        self.raw
-            .host_ptr()
-            .expect("a device buffer without a host mapping")
-            .as_ptr()
+        self.raw.host_ptr().expect("a device buffer without a host mapping").as_ptr()
     }
 
     /// Records that the buffer may now hold a non-zero byte.
@@ -989,10 +988,7 @@ impl<B: Backend> Session<B> {
     }
 
     /// Several per-request buffers at once (for binding them together).
-    pub fn scratch_many<const N: usize>(
-        &self,
-        keys: [&'static str; N],
-    ) -> Option<[&Buffer<B>; N]> {
+    pub fn scratch_many<const N: usize>(&self, keys: [&'static str; N]) -> Option<[&Buffer<B>; N]> {
         let st = self.state.as_ref()?;
         let found: Vec<&Buffer<B>> =
             keys.iter().map(|k| st.scratch.get(k)).collect::<Option<_>>()?;
@@ -1003,9 +999,9 @@ impl<B: Backend> Session<B> {
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn scratch_bytes(&self) -> u64 {
-        self.state.as_ref().map_or(0, |s| {
-            s.scratch.values().map(|b| b.raw.len() as u64).sum()
-        })
+        self.state
+            .as_ref()
+            .map_or(0, |s| s.scratch.values().map(|b| b.raw.len() as u64).sum())
     }
 }
 

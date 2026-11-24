@@ -13,15 +13,12 @@
 
 //! The plan of one MSM (window width, chunks) and the device share of the
 //! CPU/device split. sppark computes the plan by formula; here both come from
-//! tables measured on Apple silicon.
+//! the tables the backend measured ([`Tuning`]).
 
-use crate::lg2_nearest;
+use crate::{Backend, Tuning, lg2_nearest};
 
 /// Bits of a scalar (sppark `scalar_t::bit_length()`).
 pub const NBITS: u32 = 255;
-/// The most window digits of one chunk, so that a command buffer stays near
-/// or below 0.5 s of GPU time.
-pub const CHUNK_ADDS: usize = 1 << 25;
 /// Bytes of the temporary sort buffer one pass may use.
 const SORT_TEMP_BYTES: usize = 64 << 20;
 
@@ -57,37 +54,24 @@ pub const fn lg2(mut n: usize) -> u32 {
     r
 }
 
-/// `(log2 n, wbits, chunks)`, measured on Apple silicon (table path, CPU share
-/// off). Sizes outside the table take the nearest end entry; other lengths
-/// take the entry of [`lg2_nearest`], so a split's device share uses its
-/// power's entry.
-const MEASURED: [(u32, u32, usize); 10] = [
-    (13, 11, 1),
-    (14, 11, 1),
-    (15, 11, 1),
-    (16, 13, 1),
-    (17, 13, 1),
-    (18, 13, 1),
-    (19, 13, 1),
-    (20, 15, 1),
-    (21, 16, 1),
-    (22, 16, 1),
-];
-
-/// `(wbits, chunks)` of [`MEASURED`] for `n` points.
-fn measured(n: usize) -> (u32, usize) {
-    let (lo, hi) = (MEASURED[0].0, MEASURED[MEASURED.len() - 1].0);
+/// `(wbits, chunks)` of [`Tuning::msm_windows`] for `n` points: sizes
+/// outside the table take the nearest end entry; other lengths take the
+/// entry of [`lg2_nearest`], so a split's device share uses its power's
+/// entry.
+fn measured(n: usize, t: &Tuning) -> (u32, usize) {
+    let w = t.msm_windows;
+    let (lo, hi) = (w[0].0, w[w.len() - 1].0);
     let k = lg2_nearest(n).clamp(lo, hi);
-    let e = MEASURED[(k - lo) as usize];
+    let e = w[(k - lo) as usize];
     (e.1, e.2)
 }
 
 /// The plan of an MSM of `n` points.
-pub fn plan(n: usize) -> Plan {
-    let (wbits, batch) = measured(n);
+pub fn plan(n: usize, t: &Tuning) -> Plan {
+    let (wbits, batch) = measured(n, t);
     let nwins = (NBITS - 1) / wbits + 1;
     // cap the GPU time of one command buffer (sppark has no such bound)
-    let max_stride = (CHUNK_ADDS / nwins as usize) & !31;
+    let max_stride = (t.msm_chunk_adds / nwins as usize) & !31;
     let stride = n.div_ceil(batch).next_multiple_of(32).min(max_stride);
     let batch = n.div_ceil(stride);
     let bits = wbits - 1;
@@ -108,116 +92,26 @@ pub fn plan(n: usize) -> Plan {
     }
 }
 
-/// The denominator of the shares in [`MEASURED_SHARE`].
-const SHARE_DEN: usize = 64;
-
-/// The device share by size, `(log2 n, table path, one-shot path)` in 64ths
-/// of the points (64: device only), measured on Apple silicon. At `2^13` to
-/// `2^15` the table path keeps every point on the device: inside a proof the
-/// CPU share keeps all CPU threads busy and the device share slows down over
-/// successive proofs. Below the table: device only; above: the last entry.
-const MEASURED_SHARE: [(u32, usize, usize); 10] = [
-    (13, 64, 40),
-    (14, 64, 40),
-    (15, 64, 40),
-    (16, 64, 48),
-    (17, 54, 52),
-    (18, 54, 40),
-    (19, 54, 40),
-    (20, 52, 40),
-    (21, 52, 48),
-    (22, 52, 44),
-];
+/// The denominator of the shares in [`Tuning::msm_shares`].
+pub const SHARE_DEN: usize = 64;
 
 /// The device share `m` of an MSM of `n` points: the device computes `[0, m)`
 /// and the CPU `[m, n)`. A function of `n` and the path only;
-/// `MIDNIGHT_METAL_MSM_CPU_SHARE=off` or no CPU pool gives `m = n`.
-pub fn device_share(n: usize, table: bool) -> usize {
-    if std::env::var("MIDNIGHT_METAL_MSM_CPU_SHARE").as_deref() == Ok("off")
-        || super::par::cpu_pool().is_none()
+/// `{ENV_PREFIX}_MSM_CPU_SHARE=off` or no CPU pool gives `m = n`.
+pub fn device_share<B: Backend>(n: usize, table: bool) -> usize {
+    if std::env::var(format!("{}_MSM_CPU_SHARE", B::ENV_PREFIX)).as_deref() == Ok("off")
+        || super::par::cpu_pool::<B>().is_none()
     {
         return n;
     }
     let k = lg2_nearest(n);
-    let (lo, hi) = (
-        MEASURED_SHARE[0].0,
-        MEASURED_SHARE[MEASURED_SHARE.len() - 1].0,
-    );
+    let shares = B::TUNING.msm_shares;
+    let (lo, hi) = (shares[0].0, shares[shares.len() - 1].0);
     if k < lo {
         return n;
     }
     // in range: `lo <= k.min(hi) <= hi`, one entry per log2
-    let e = MEASURED_SHARE[(k.min(hi) - lo) as usize];
+    let e = shares[(k.min(hi) - lo) as usize];
     let frac = if table { e.1 } else { e.2 };
     (n * frac / SHARE_DEN).clamp(1, n)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn plan_follows_measured_table() {
-        // (log2 n, wbits, nwins, chunks after the command-buffer bound)
-        for (k, wbits, nwins, batch) in [
-            (13, 11, 24, 1),
-            (14, 11, 24, 1),
-            (15, 11, 24, 1),
-            (16, 13, 20, 1),
-            (17, 13, 20, 1),
-            (18, 13, 20, 1),
-            (19, 13, 20, 1),
-            (20, 15, 17, 1),
-            (21, 16, 16, 1),
-            (22, 16, 16, 2),
-        ] {
-            let p = plan(1 << k);
-            assert_eq!((p.wbits, p.nwins, p.batch), (wbits, nwins, batch), "2^{k}");
-            assert_eq!(p.top, NBITS - wbits * (nwins - 1));
-            assert!(p.stride * p.batch >= 1 << k, "2^{k}");
-        }
-        // outside the table: the end entries; a non-power of two: its
-        // nearest log2 (a device share of 52/64 of 2^20 takes the 2^20 entry)
-        assert_eq!(plan(1).wbits, 11);
-        assert_eq!(plan(1000).wbits, 11);
-        assert_eq!(plan((1 << 20) * 52 / 64).wbits, 15);
-        assert_eq!(plan((1 << 20) * 46 / 64).wbits, 15);
-        assert_eq!(plan((1 << 20) * 45 / 64).wbits, 13);
-        assert_eq!(plan((1 << 21) - 1).wbits, 16);
-        assert_eq!(plan((1 << 21) + 5).wbits, 16);
-        // the command-buffer bound up to 2^28
-        for k in 0..=crate::MAX_MSM_LOG {
-            for n in [1usize << k, (1usize << k) + 33] {
-                let p = plan(n);
-                assert!(p.stride * p.nwins as usize <= CHUNK_ADDS, "{n}");
-                assert!(
-                    p.stride * p.batch >= n && p.stride * (p.batch - 1) < n,
-                    "{n}"
-                );
-                assert!(p.stride.is_multiple_of(32), "{n}");
-                if k >= 22 {
-                    assert_eq!(p.wbits, 16, "{n}");
-                }
-            }
-        }
-        assert_eq!(plan(1 << 23).batch, 4);
-        assert_eq!(plan(1 << 28).batch, 128);
-    }
-
-    #[test]
-    fn device_share_follows_measured_table() {
-        if std::env::var("MIDNIGHT_METAL_MSM_CPU_SHARE").as_deref() == Ok("off") {
-            return;
-        }
-        for &(k, t, o) in &MEASURED_SHARE {
-            let n = 1usize << k;
-            assert_eq!(device_share(n, true), n * t / SHARE_DEN, "2^{k}");
-            assert_eq!(device_share(n, false), n * o / SHARE_DEN, "2^{k}");
-        }
-        assert_eq!(device_share(1000, true), 1000);
-        assert_eq!(device_share(1 << 12, false), 1 << 12);
-        // a length just below a power of two takes that power's share
-        assert_eq!(device_share((1 << 20) - 1, true), ((1 << 20) - 1) * 52 / 64);
-        assert_eq!(device_share(1 << 24, true), (1 << 24) * 52 / 64);
-    }
 }
