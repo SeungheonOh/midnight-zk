@@ -270,7 +270,7 @@ impl VulkanInfo {
 }
 
 /// How [`Context::open`] picks and uses the device.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
     /// Also accept a CPU implementation (lavapipe, SwiftShader), ranked after
     /// every GPU. Test only: CI runners have no GPU.
@@ -279,6 +279,18 @@ pub struct Options {
     /// host, which reaches them through staging copies. Test only: runs the
     /// path of a discrete GPU on a unified device.
     pub discrete: bool,
+    /// Only the device of this index in the enumeration order (decimal), or
+    /// those whose name contains this text (ASCII case ignored). `None`: any
+    /// usable device.
+    pub select: Option<String>,
+}
+
+/// Whether `select` names the device at `index` called `name`.
+fn selects(select: &str, index: usize, name: &str) -> bool {
+    match select.trim().parse::<usize>() {
+        Ok(i) => i == index,
+        Err(_) => name.to_ascii_lowercase().contains(&select.trim().to_ascii_lowercase()),
+    }
 }
 
 /// The device, shared by the context, its buffers and its pipelines.
@@ -558,16 +570,22 @@ impl Context {
             instance.enumerate_physical_devices()
         })?;
         let mut best: Option<(u32, Candidate)> = None;
-        for p in physicals {
-            let Some(c) = Self::candidate(instance, p, options)? else {
+        for (i, p) in physicals.into_iter().enumerate() {
+            let Some(c) = Self::candidate(instance, p, &options)? else {
                 continue;
             };
+            if options.select.as_deref().is_some_and(|s| !selects(s, i, &c.info.name)) {
+                continue;
+            }
             let rank = type_rank(c.info.device_type, options.allow_cpu).unwrap_or(u32::MAX);
             if best.as_ref().is_none_or(|(r, _)| rank < *r) {
                 best = Some((rank, c));
             }
         }
-        let (_, c) = best.ok_or(Error::NoDevice)?;
+        let (_, c) = best.ok_or_else(|| match &options.select {
+            Some(s) => Error::Unsupported(format!("no usable device matches {s:?}")),
+            None => Error::NoDevice,
+        })?;
 
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(c.info.buffer_device_address);
@@ -608,7 +626,7 @@ impl Context {
     fn candidate(
         instance: &ash::Instance,
         p: vk::PhysicalDevice,
-        options: Options,
+        options: &Options,
     ) -> Result<Option<Candidate>> {
         let mut v11 = vk::PhysicalDeviceVulkan11Properties::default();
         let mut v12 = vk::PhysicalDeviceVulkan12Properties::default();

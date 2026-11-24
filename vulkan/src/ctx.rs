@@ -62,6 +62,10 @@ use crate::device::{self, Commands, Context, Grid, Options, Params, PipelineOpti
 pub const ARITH_ENV: &str = "MIDNIGHT_VULKAN_ARITH";
 /// `1`: also take a CPU implementation (lavapipe). Test only.
 pub const ALLOW_CPU_ENV: &str = "MIDNIGHT_VULKAN_ALLOW_CPU";
+/// The device to use: its index in the Vulkan enumeration order, or text its
+/// name contains (ASCII case ignored). Default: the first discrete GPU, else
+/// an integrated one.
+pub const DEVICE_ENV: &str = "MIDNIGHT_VULKAN_DEVICE";
 /// `1`: treat the device as discrete, so host access goes through staging
 /// copies. Test only.
 pub const DISCRETE_ENV: &str = "MIDNIGHT_VULKAN_DISCRETE";
@@ -349,6 +353,7 @@ fn make_context() -> Result<Vulkan, String> {
     let options = Options {
         allow_cpu: env_on(ALLOW_CPU_ENV),
         discrete: env_on(DISCRETE_ENV),
+        select: std::env::var(DEVICE_ENV).ok().filter(|s| !s.trim().is_empty()),
     };
     let dev = Context::open(options).map_err(|e| e.to_string())?;
     let variant = choose_variant(dev.info())?;

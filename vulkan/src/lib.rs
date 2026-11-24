@@ -94,6 +94,9 @@
 //! - `MIDNIGHT_VULKAN_LOADER`: the Vulkan loader library to load instead of the
 //!   system's.
 //! - `MIDNIGHT_VULKAN_ARITH=64|32`: the arithmetic variant ([`variant`]).
+//! - `MIDNIGHT_VULKAN_DEVICE`: the device, by its index in the Vulkan
+//!   enumeration order or by text its name contains (ASCII case ignored);
+//!   default: the first discrete GPU, else an integrated one.
 //!
 //! Test only, never in production:
 //!
