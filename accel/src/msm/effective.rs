@@ -33,7 +33,7 @@ const SPARSE_TABLE_FIXED: usize = 1 << 12;
 /// log2 threshold `k` of its path. With the default thresholds the table path
 /// needs [`SPARSE_TABLE_DIV`]'s formula; with an explicit threshold either path
 /// needs `2^k`. The one-shot path is only reached with an explicit threshold.
-pub(crate) fn effective_need(n: usize, k: u32, table: bool, explicit: bool) -> usize {
+pub fn effective_need(n: usize, k: u32, table: bool, explicit: bool) -> usize {
     if table && !explicit {
         SPARSE_TABLE_FIXED + n / SPARSE_TABLE_DIV
     } else {
@@ -44,7 +44,7 @@ pub(crate) fn effective_need(n: usize, k: u32, table: bool, explicit: bool) -> u
 /// Whether `scalars` has at least `need` non-zero scalars (all zero counts as
 /// 1). Scans a prefix first so a dense input decides early, then counts the
 /// rest in parallel with early exit.
-pub(crate) fn effective_size_reaches(scalars: &[Scalar], need: usize) -> bool {
+pub fn effective_size_reaches(scalars: &[Scalar], need: usize) -> bool {
     const BLOCK: usize = 1 << 13;
     if need <= 1 {
         return true;

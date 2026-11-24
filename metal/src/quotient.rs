@@ -35,9 +35,10 @@
 //! - Outside a request every serve checks the digests of the registered
 //!   polynomials it reads; the CUDA crate checks once per request.
 
-pub mod abi;
+pub use midnight_accel::quotient::abi;
+use midnight_accel::quotient::tables;
+
 mod keys;
-mod tables;
 
 use std::{
     ffi::c_void,

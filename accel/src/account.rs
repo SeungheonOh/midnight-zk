@@ -24,20 +24,20 @@ use std::{
 
 /// A hook class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Class {
-    /// [`crate::msm_g1`].
+pub enum Class {
+    /// The G1 MSM.
     Msm,
-    /// [`crate::fft`].
+    /// The forward FFT.
     Fft,
-    /// [`crate::ifft`].
+    /// The inverse FFT.
     Ifft,
-    /// [`crate::quotient`].
+    /// The quotient.
     Quotient,
 }
 
 impl Class {
-    /// The class's name in [`crate::declines`] and the reports.
-    pub(crate) const fn name(self) -> &'static str {
+    /// The class's name in the decline report and the reports.
+    pub const fn name(self) -> &'static str {
         match self {
             Class::Msm => "msm",
             Class::Fft => "fft",
@@ -53,7 +53,7 @@ impl Class {
 
 /// A decline reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Reason {
+pub enum Reason {
     /// Stub build, no usable device, or `MIDNIGHT_METAL=off`.
     NoDevice,
     /// The size is below the class's threshold (`crate::thresholds`).
@@ -76,8 +76,8 @@ pub(crate) enum Reason {
 }
 
 impl Reason {
-    /// The reason's name in [`crate::declines`].
-    pub(crate) const fn name(self) -> &'static str {
+    /// The reason's name in the decline report.
+    pub const fn name(self) -> &'static str {
         match self {
             Reason::NoDevice => "no-device",
             Reason::BelowMinK => "below-min-k",
@@ -92,8 +92,7 @@ impl Reason {
     }
 
     /// The decline reason of a device-context error.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn of(e: &crate::ctx::Error) -> Self {
+    pub fn of(e: &crate::ctx::Error) -> Self {
         match e {
             crate::ctx::Error::NoDevice(_) => Reason::NoDevice,
             crate::ctx::Error::Memory(_) => Reason::Memory,
@@ -110,7 +109,7 @@ static SERVED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static NANOS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Counts a decline; returns `false` (the decline value of a `bool` hook).
-pub(crate) fn decline(class: Class, reason: Reason) -> bool {
+pub fn decline(class: Class, reason: Reason) -> bool {
     *DECLINES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -120,13 +119,13 @@ pub(crate) fn decline(class: Class, reason: Reason) -> bool {
 }
 
 /// Counts a call served by the device, with its GPU time.
-pub(crate) fn served(class: Class, device_nanos: u64) {
+pub fn served(class: Class, device_nanos: u64) {
     SERVED[class.index()].fetch_add(1, Relaxed);
     NANOS[class.index()].fetch_add(device_nanos, Relaxed);
 }
 
 /// Every decline: `(class, reason, count)`.
-pub(crate) fn declines() -> Vec<(&'static str, &'static str, u64)> {
+pub fn declines() -> Vec<(&'static str, &'static str, u64)> {
     DECLINES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -136,7 +135,7 @@ pub(crate) fn declines() -> Vec<(&'static str, &'static str, u64)> {
 }
 
 /// The service counters of `class`.
-pub(crate) fn class_stats(class: Class) -> crate::ClassStats {
+pub fn class_stats(class: Class) -> crate::ClassStats {
     crate::ClassStats {
         served: SERVED[class.index()].load(Relaxed),
         device_nanos: NANOS[class.index()].load(Relaxed),
@@ -144,7 +143,7 @@ pub(crate) fn class_stats(class: Class) -> crate::ClassStats {
 }
 
 /// Clears every counter.
-pub(crate) fn reset() {
+pub fn reset() {
     for c in SERVED.iter().chain(NANOS.iter()) {
         c.store(0, Relaxed);
     }

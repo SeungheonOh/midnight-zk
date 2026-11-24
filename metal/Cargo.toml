@@ -18,10 +18,11 @@ workspace = true
 default = []
 # Test only: the test switches, test entry points and test kernels, for this
 # crate's tests and those of `midnight-gpu-prover`.
-test-support = []
+test-support = ["midnight-accel/test-support"]
 
 [dependencies]
 blst = "0.3.15"
+midnight-accel = { path = "../accel" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 midnight-curves = { path = "../curves" }

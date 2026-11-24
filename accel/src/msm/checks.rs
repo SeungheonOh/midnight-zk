@@ -26,7 +26,7 @@ const POINT_BLOCK: usize = 1 << 12;
 
 /// Whether `a == b`, comparing every point; a panicked part counts as a
 /// difference.
-pub(super) fn points_equal(a: &[G1AffineLimbs], b: &[G1AffineLimbs]) -> bool {
+pub fn points_equal(a: &[G1AffineLimbs], b: &[G1AffineLimbs]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -48,7 +48,7 @@ pub(super) fn points_equal(a: &[G1AffineLimbs], b: &[G1AffineLimbs]) -> bool {
 
 /// Whether `p` is in G1: all zero (infinity), or on the curve and in the
 /// prime-order subgroup.
-pub(super) fn in_g1(p: &G1AffineLimbs) -> bool {
+pub fn in_g1(p: &G1AffineLimbs) -> bool {
     if p.iter().all(|&w| w == 0) {
         return true;
     }
@@ -68,7 +68,7 @@ pub(super) fn in_g1(p: &G1AffineLimbs) -> bool {
 
 /// The first index of `bases` not in G1, or `bases.len()`. A panicked part
 /// counts from its start.
-pub(super) fn first_not_in_g1(bases: &[G1AffineLimbs]) -> usize {
+pub fn first_not_in_g1(bases: &[G1AffineLimbs]) -> usize {
     let n = bases.len();
     let firsts = par_parts(n, host_threads(), POINT_BLOCK, |lo, hi| {
         (lo..hi).find(|&i| !in_g1(&bases[i])).unwrap_or(n)
@@ -78,7 +78,7 @@ pub(super) fn first_not_in_g1(bases: &[G1AffineLimbs]) -> usize {
 
 /// Whether every point of `bases` is in G1; a panicked part counts as a
 /// failure.
-pub(super) fn all_in_g1(bases: &[G1AffineLimbs]) -> bool {
+pub fn all_in_g1(bases: &[G1AffineLimbs]) -> bool {
     let bad = AtomicBool::new(false);
     let done = par_parts(bases.len(), host_threads(), POINT_BLOCK, |lo, hi| {
         for s in (lo..hi).step_by(POINT_BLOCK) {

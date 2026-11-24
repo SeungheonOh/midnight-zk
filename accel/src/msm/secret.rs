@@ -46,14 +46,20 @@ unsafe fn zero_volatile(p: *mut u8, len: usize) {
 }
 
 /// Writes zero over `v` (a local derived from the scalars), volatile.
-pub(super) fn wipe<T: Copy>(v: &mut T) {
+pub fn wipe<T: Copy>(v: &mut T) {
     // SAFETY: `v` is valid for writes of `size_of::<T>()` bytes.
     unsafe { zero_volatile((v as *mut T).cast::<u8>(), size_of::<T>()) };
 }
 
 /// One value derived from the scalars, zeroed when dropped (unwinding
 /// included).
-pub(super) struct Secret<T: Copy>(pub(super) T);
+pub struct Secret<T: Copy>(pub T);
+
+impl<T: Copy> std::fmt::Debug for Secret<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
 
 impl<T: Copy> Deref for Secret<T> {
     type Target = T;
@@ -79,15 +85,21 @@ impl<T: Copy> Drop for Secret<T> {
 /// A vector of values derived from the scalars; its whole allocation is
 /// zeroed when dropped. It never grows past its initial capacity, because a
 /// reallocation would leave the old block unzeroed.
-pub(super) struct SecretVec<T: Copy>(Vec<T>);
+pub struct SecretVec<T: Copy>(Vec<T>);
+
+impl<T: Copy> std::fmt::Debug for SecretVec<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SecretVec({} values)", self.0.len())
+    }
+}
 
 impl<T: Copy> SecretVec<T> {
-    pub(super) fn with_capacity(n: usize) -> Self {
+    pub fn with_capacity(n: usize) -> Self {
         SecretVec(Vec::with_capacity(n))
     }
 
     /// Appends `s` if it fits in the capacity; `false` otherwise.
-    pub(super) fn extend_within(&mut self, s: &[T]) -> bool {
+    pub fn extend_within(&mut self, s: &[T]) -> bool {
         if self.0.capacity() - self.0.len() < s.len() {
             return false;
         }
@@ -96,7 +108,7 @@ impl<T: Copy> SecretVec<T> {
     }
 
     /// Appends `v` if it fits in the capacity.
-    pub(super) fn push_within(&mut self, v: T) -> bool {
+    pub fn push_within(&mut self, v: T) -> bool {
         self.extend_within(std::slice::from_ref(&v))
     }
 }
@@ -121,7 +133,7 @@ impl<T: Copy> Drop for SecretVec<T> {
 }
 
 /// Bytes of stack [`scrub_stack`] zeroes (the CUDA patch's `SCRUB_BYTES`).
-pub(super) const SCRUB_BYTES: usize = 64 * 1024;
+pub const SCRUB_BYTES: usize = 64 * 1024;
 
 /// Zeroes [`SCRUB_BYTES`] of the calling thread's stack below the caller's
 /// frame, where the host collection, `blst` or the CPU share left temporaries
@@ -129,7 +141,7 @@ pub(super) const SCRUB_BYTES: usize = 64 * 1024;
 /// through `black_box`; the function is out of line so the buffer lies below
 /// the caller's frame.
 #[inline(never)]
-pub(super) fn scrub_stack() {
+pub fn scrub_stack() {
     let mut buf = std::mem::MaybeUninit::<[u64; SCRUB_BYTES / 8]>::uninit();
     let p = buf.as_mut_ptr().cast::<u64>();
     for i in 0..SCRUB_BYTES / 8 {
@@ -141,7 +153,8 @@ pub(super) fn scrub_stack() {
 }
 
 /// Runs [`scrub_stack`] when dropped, on every exit including unwinding.
-pub(super) struct ScrubOnExit;
+#[derive(Debug)]
+pub struct ScrubOnExit;
 
 impl Drop for ScrubOnExit {
     fn drop(&mut self) {
@@ -165,7 +178,7 @@ mod tests {
     }
 
     /// Called by the guards' `Drop` after their zeroing.
-    pub(super) fn observe_wipe(p: *const u8, len: usize) {
+    pub fn observe_wipe(p: *const u8, len: usize) {
         // SAFETY: the guard's memory, still allocated (called before it is
         // released).
         let zero = (0..len).all(|i| unsafe { std::ptr::read_volatile(p.add(i)) } == 0);

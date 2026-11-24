@@ -84,8 +84,12 @@ use std::{
     },
 };
 
-mod account;
-pub mod field;
+use midnight_accel::account;
+pub use midnight_accel::{
+    ClassStats, DEFAULT_THRESHOLDS, G1AffineLimbs, G1JacobianLimbs, MAX_LOG_N, MAX_MSM_LOG, Scalar,
+    Stats, Thresholds, WipeStats, field,
+};
+use midnight_accel::lg2_nearest;
 
 #[cfg(target_os = "macos")]
 pub mod ctx;
@@ -128,33 +132,6 @@ pub use quotient::{
 mod tests;
 
 use account::{Class, Reason};
-
-/// A scalar: `blst_fr`, four little-endian limbs, Montgomery form, reduced
-/// modulo [`field::FR_MODULUS`].
-pub type Scalar = [u64; 4];
-/// An affine G1 point: `blst_p1_affine`, `x` then `y`, Montgomery form; all
-/// zero is the point at infinity.
-pub type G1AffineLimbs = [u64; 12];
-/// A Jacobian G1 point: `blst_p1` limbs.
-pub type G1JacobianLimbs = [u64; 18];
-
-/// The largest log2 transform size taken.
-pub const MAX_LOG_N: u32 = 28;
-/// The largest log2 MSM length taken; a longer one declines (`shape`).
-pub const MAX_MSM_LOG: u32 = 28;
-
-/// `floor(log2(n * sqrt 2))`: the size class of an MSM length, so the `n - 1`
-/// coefficients of a multi-open are in the class of `n`.
-pub(crate) const fn lg2_nearest(n: usize) -> u32 {
-    // 181 / 128 = 1.4140625, just below sqrt 2
-    let mut m = ((n as u128 * 181) >> 7) as usize;
-    let mut r = 0;
-    while m > 1 {
-        m >>= 1;
-        r += 1;
-    }
-    r
-}
 
 // ---------------------------------------------------------------------------
 // Device
@@ -251,60 +228,6 @@ pub fn mem_info() -> Option<(usize, usize)> {
 // ---------------------------------------------------------------------------
 // Thresholds
 
-/// The log2 size from which each class goes to the device.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Thresholds {
-    /// Forward FFTs: the transform size `log_n`.
-    pub fft: u32,
-    /// Inverse FFTs: the transform size `log_n`.
-    pub ifft: u32,
-    /// MSMs on a registered SRS table: the size class of the length.
-    pub msm_table: u32,
-    /// MSMs with no registered table: the size class of the length; `None`:
-    /// never (the default).
-    pub msm_one_shot: Option<u32>,
-    /// Quotients: the extended domain `ext_k`.
-    pub quotient: u32,
-    /// Whether one explicit value applies to every class.
-    pub explicit: bool,
-}
-
-impl Thresholds {
-    /// One value for every class (an explicit `min_k`).
-    pub const fn all(k: u32) -> Thresholds {
-        Thresholds {
-            fft: k,
-            ifft: k,
-            msm_table: k,
-            msm_one_shot: Some(k),
-            quotient: k,
-            explicit: true,
-        }
-    }
-
-    /// `(class, log2 size)` pairs for reports; `None`: never.
-    pub fn named(&self) -> [(&'static str, Option<u32>); 5] {
-        [
-            ("fft", Some(self.fft)),
-            ("ifft", Some(self.ifft)),
-            ("msm-table", Some(self.msm_table)),
-            ("msm-one-shot", self.msm_one_shot),
-            ("quotient-ext", Some(self.quotient)),
-        ]
-    }
-}
-
-/// Per-class break-evens against the stock CPU code, measured on Apple
-/// silicon. The one-shot MSM never breaks even because of its G1 check.
-pub const DEFAULT_THRESHOLDS: Thresholds = Thresholds {
-    fft: 15,
-    ifft: 15,
-    msm_table: 13,
-    msm_one_shot: None,
-    quotient: 14,
-    explicit: false,
-};
-
 /// [`MIN_K`]: not read yet (the environment is read at the next use).
 const MIN_K_UNREAD: u32 = u32::MAX;
 /// [`MIN_K`]: no explicit value (the per-class defaults apply).
@@ -357,28 +280,6 @@ pub fn reset_min_k() {
 
 // ---------------------------------------------------------------------------
 // Counters
-
-/// Calls served in one class since the last [`reset_stats`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ClassStats {
-    /// Calls the device computed.
-    pub served: u64,
-    /// GPU time of those calls in nanoseconds.
-    pub device_nanos: u64,
-}
-
-/// Per-class service counters.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Stats {
-    /// MSMs.
-    pub msm: ClassStats,
-    /// Forward FFTs.
-    pub fft: ClassStats,
-    /// Inverse FFTs.
-    pub ifft: ClassStats,
-    /// Quotients.
-    pub quotient: ClassStats,
-}
 
 /// The service counters since the last [`reset_stats`].
 pub fn stats() -> Stats {
@@ -804,31 +705,6 @@ pub fn begin_request() {
         ctx::begin_request();
         quotient::begin_request();
     }
-}
-
-/// What [`end_request_report`] erased.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct WipeStats {
-    /// Regions zeroed: the per-request buffers and, in check mode, the idle
-    /// pool buffers.
-    pub regions: u64,
-    /// Their bytes.
-    pub bytes: u64,
-    /// Whether every region was read back after its zeroing.
-    pub checked: bool,
-    /// Regions read back (check mode).
-    pub checked_regions: u64,
-    /// Regions that read back non-zero (check mode).
-    pub nonzero_regions: u64,
-    /// Regions that could not be read back from the host (check mode).
-    pub check_failures: u64,
-    /// Of `regions`: idle pool buffers read back (check mode).
-    pub pool_regions: u64,
-    /// Their bytes.
-    pub pool_bytes: u64,
-    /// Zeroings that panicked since the last report. Each was redone on the
-    /// calling thread and its buffer released, not pooled.
-    pub erasure_failures: u64,
 }
 
 /// Ends a request: waits for device work and background zeroing, zeroes the

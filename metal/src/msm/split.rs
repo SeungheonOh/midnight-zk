@@ -21,7 +21,7 @@ use blst::{blst_p1, blst_p1_cneg};
 use super::{
     Served, Trace,
     collect::{add, limbs_of, p1_of},
-    par::{catch, lock, par_parts},
+    par::{catch, cpu_pool, lock, par_parts},
     pipeline::{Bufs, Geometry, MODE_MASK, MODE_MASKED, run, scratch_bytes},
     plan::{Plan, device_share, plan},
     registry::MaskCache,
@@ -96,21 +96,6 @@ pub(super) fn split(
     let mut sum = Secret(p1_of(&d));
     add(&mut sum, &cpu);
     Ok((Secret(limbs_of(&sum)), ns))
-}
-
-/// The thread pool of the CPU share: its own threads, so that the share
-/// never waits for a worker of the caller's pool (the prover calls MSMs from
-/// rayon workers, which may all be blocked on the device lock).
-pub(super) fn cpu_pool() -> Option<&'static rayon::ThreadPool> {
-    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
-    POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(std::thread::available_parallelism().map_or(4, |t| t.get()))
-            .thread_name(|i| format!("midnight-metal-msm-cpu-{i}"))
-            .build()
-            .ok()
-    })
-    .as_ref()
 }
 
 /// The CPU share: the stock `msm_pippenger` on the share's own pool, over the

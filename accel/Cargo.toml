@@ -1,0 +1,31 @@
+[package]
+name = "midnight-accel"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = """
+Backend-independent host side of the midnight-proofs accelerator hooks: admission, accounting, the buffer pool and request wipes, and the MSM, NTT and quotient drivers, generic over a GPU backend
+"""
+license = "Apache-2.0"
+categories = ["cryptography"]
+keywords = ["gpu", "msm", "ntt", "zkp"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Test only: the test switches and test entry points, for the tests of the
+# backend crates.
+test-support = []
+
+[dependencies]
+blst = "0.3.15"
+midnight-curves = { path = "../curves" }
+rayon = { workspace = true }
+
+[dev-dependencies]
+ff = { workspace = true }
+group = { workspace = true }
+rand_chacha = { workspace = true }
+rand_core = { workspace = true }

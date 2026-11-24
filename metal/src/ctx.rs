@@ -72,7 +72,10 @@ use objc2_metal::{
     MTLStorageMode,
 };
 
-use crate::{MetalInfo, account::Reason};
+pub use midnight_accel::ctx::{Error, Pod};
+pub(crate) use midnight_accel::ctx::par_copy;
+
+use crate::MetalInfo;
 
 // MTLCreateSystemDefaultDevice returns no device unless the process links
 // CoreGraphics.
@@ -85,37 +88,6 @@ pub const MSL_VERSION: &str = env!("MIDNIGHT_METAL_MSL_VERSION");
 #[cfg(midnight_metal_metallib)]
 static METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/midnight_metal.metallib"));
 static SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/midnight_metal.metal"));
-
-/// A device failure, mapped to a decline reason by [`Error::reason`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Error {
-    /// No usable device, or the context could not be made.
-    NoDevice(String),
-    /// A buffer could not be allocated (or is above `maxBufferLength`).
-    Memory(String),
-    /// A pipeline, encoder or command buffer failed.
-    Device(String),
-    /// A scalar argument of a device building block is not reduced.
-    Unreduced(String),
-}
-
-impl Error {
-    /// The decline reason of this error.
-    pub fn reason(&self) -> &'static str {
-        Reason::of(self).name()
-    }
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::NoDevice(m) => write!(f, "no device: {m}"),
-            Error::Memory(m) => write!(f, "memory: {m}"),
-            Error::Device(m) => write!(f, "device error: {m}"),
-            Error::Unreduced(m) => write!(f, "unreduced: {m}"),
-        }
-    }
-}
 
 type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
@@ -628,55 +600,7 @@ pub fn settle_releases() {
 }
 
 // ---------------------------------------------------------------------------
-// Host copies
-
-/// Copies `src` into `dst` on several threads when long. Never panics: a part
-/// whose thread cannot be made is copied here, so a copy into a caller's slice
-/// never stops half way.
-pub(crate) fn par_copy(dst: &mut [crate::Scalar], src: &[crate::Scalar]) {
-    const PART: usize = 1 << 15;
-    if src.len() <= 2 * PART {
-        dst.copy_from_slice(src);
-        return;
-    }
-    let threads = std::thread::available_parallelism().map_or(4, |t| t.get()).min(8);
-    let per = src.len().div_ceil(threads).max(PART);
-    std::thread::scope(|s| {
-        for (d, c) in dst.chunks_mut(per).zip(src.chunks(per)) {
-            // the part stays reachable from here if the thread is not made
-            // (a failed `spawn_scoped` drops its closure)
-            let part = Arc::new(Mutex::new(Some((d, c))));
-            let theirs = Arc::clone(&part);
-            let spawned = std::thread::Builder::new().spawn_scoped(s, move || {
-                if let Some((d, c)) = theirs.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                    d.copy_from_slice(c);
-                }
-            });
-            if spawned.is_err()
-                && let Some((d, c)) = part.lock().unwrap_or_else(|e| e.into_inner()).take()
-            {
-                d.copy_from_slice(c);
-            }
-        }
-    });
-}
-
-// ---------------------------------------------------------------------------
 // Buffers
-
-/// Plain data: every bit pattern is valid and there is no padding.
-///
-/// # Safety
-/// Implement it only for such types.
-pub unsafe trait Pod: Copy + 'static {}
-// SAFETY: integers and arrays of them have no padding and no invalid values.
-unsafe impl Pod for u8 {}
-// SAFETY: as above.
-unsafe impl Pod for u32 {}
-// SAFETY: as above.
-unsafe impl Pod for u64 {}
-// SAFETY: as above.
-unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
 
 /// A shared-storage Metal buffer, zeroed when dropped.
 pub struct Buffer {

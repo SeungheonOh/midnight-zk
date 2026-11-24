@@ -25,7 +25,7 @@ use super::{
 use crate::G1JacobianLimbs;
 
 /// `a += b`.
-pub(super) fn add(a: &mut blst_p1, b: &blst_p1) {
+pub fn add(a: &mut blst_p1, b: &blst_p1) {
     let t = *a;
     // SAFETY: valid blst points; the output does not alias the inputs.
     unsafe { blst_p1_add_or_double(a, &t, b) };
@@ -60,7 +60,7 @@ fn p1_of_xyzz(r: &Xyzz) -> blst_p1 {
 }
 
 /// Jacobian limbs as a blst point.
-pub(super) fn p1_of(l: &G1JacobianLimbs) -> blst_p1 {
+pub fn p1_of(l: &G1JacobianLimbs) -> blst_p1 {
     let fp = |i: usize| {
         let mut f = [0u64; 6];
         f.copy_from_slice(&l[6 * i..6 * i + 6]);
@@ -74,7 +74,7 @@ pub(super) fn p1_of(l: &G1JacobianLimbs) -> blst_p1 {
 }
 
 /// A blst point as Jacobian limbs.
-pub(super) fn limbs_of(p: &blst_p1) -> G1JacobianLimbs {
+pub fn limbs_of(p: &blst_p1) -> G1JacobianLimbs {
     let mut out = [0u64; 18];
     out[..6].copy_from_slice(&p.x.l);
     out[6..12].copy_from_slice(&p.y.l);
@@ -151,7 +151,7 @@ fn collect_rows(
 /// from the top window, plus the digit-1 bucket of window 0 (`ones`). `None`:
 /// the rows are short or a worker panicked. Every worker scrubs its stack
 /// ([`ScrubOnExit`]); the caller scrubs this thread's.
-pub(super) fn collect(
+pub fn collect(
     rows: SecretVec<Xyzz>,
     ones: SecretVec<Xyzz>,
     pl: &Plan,

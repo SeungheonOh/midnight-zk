@@ -18,37 +18,37 @@
 use crate::lg2_nearest;
 
 /// Bits of a scalar (sppark `scalar_t::bit_length()`).
-pub(super) const NBITS: u32 = 255;
+pub const NBITS: u32 = 255;
 /// The most window digits of one chunk, so that a command buffer stays near
 /// or below 0.5 s of GPU time.
-pub(super) const CHUNK_ADDS: usize = 1 << 25;
+pub const CHUNK_ADDS: usize = 1 << 25;
 /// Bytes of the temporary sort buffer one pass may use.
 const SORT_TEMP_BYTES: usize = 64 << 20;
 
 /// The window plan of an MSM of `n` points.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Plan {
-    pub(super) n: usize,
-    pub(super) wbits: u32,
-    pub(super) nwins: u32,
+pub struct Plan {
+    pub n: usize,
+    pub wbits: u32,
+    pub nwins: u32,
     /// Chunks (command buffers).
-    pub(super) batch: usize,
+    pub batch: usize,
     /// Points per chunk (a multiple of 32).
-    pub(super) stride: usize,
+    pub stride: usize,
     /// `wbits - 1`: bucket index bits.
-    pub(super) bits: u32,
+    pub bits: u32,
     /// Bits of the upper sort (`bits / 2`).
-    pub(super) top_bits: u32,
+    pub top_bits: u32,
     /// Bits of the lower sort (`bits - top_bits`).
-    pub(super) low_bits: u32,
+    pub low_bits: u32,
     /// Bits of the top window (sppark `top`).
-    pub(super) top: u32,
+    pub top: u32,
     /// Windows per sort pass.
-    pub(super) pass: u32,
+    pub pass: u32,
 }
 
 /// sppark `lg2`: floor of log2, 0 for 0.
-pub(super) const fn lg2(mut n: usize) -> u32 {
+pub const fn lg2(mut n: usize) -> u32 {
     let mut r = 0;
     while n > 1 {
         n >>= 1;
@@ -83,7 +83,7 @@ fn measured(n: usize) -> (u32, usize) {
 }
 
 /// The plan of an MSM of `n` points.
-pub(super) fn plan(n: usize) -> Plan {
+pub fn plan(n: usize) -> Plan {
     let (wbits, batch) = measured(n);
     let nwins = (NBITS - 1) / wbits + 1;
     // cap the GPU time of one command buffer (sppark has no such bound)
@@ -132,9 +132,9 @@ const MEASURED_SHARE: [(u32, usize, usize); 10] = [
 /// The device share `m` of an MSM of `n` points: the device computes `[0, m)`
 /// and the CPU `[m, n)`. A function of `n` and the path only;
 /// `MIDNIGHT_METAL_MSM_CPU_SHARE=off` or no CPU pool gives `m = n`.
-pub(super) fn device_share(n: usize, table: bool) -> usize {
+pub fn device_share(n: usize, table: bool) -> usize {
     if std::env::var("MIDNIGHT_METAL_MSM_CPU_SHARE").as_deref() == Ok("off")
-        || super::split::cpu_pool().is_none()
+        || super::par::cpu_pool().is_none()
     {
         return n;
     }

@@ -27,12 +27,12 @@ use super::abi::{
 use crate::{Scalar, account::Reason, field};
 
 /// A polynomial handle is `(bank << HANDLE_SHIFT) | index`.
-pub(crate) const HANDLE_SHIFT: u32 = 30;
-pub(crate) const BANK_PROOF: u32 = 0;
-pub(crate) const BANK_KEY_RES: u32 = 1;
-pub(crate) const BANK_KEY_TMP: u32 = 2;
+pub const HANDLE_SHIFT: u32 = 30;
+pub const BANK_PROOF: u32 = 0;
+pub const BANK_KEY_RES: u32 = 1;
+pub const BANK_KEY_TMP: u32 = 2;
 /// Polynomials per bank.
-pub(crate) const MAX_BANK_POLYS: usize = 1 << HANDLE_SHIFT;
+pub const MAX_BANK_POLYS: usize = 1 << HANDLE_SHIFT;
 
 /// The word counts of `shaders/include/quotient.h`.
 const OP_WORDS: usize = 5;
@@ -42,35 +42,45 @@ const CHUNK_WORDS: usize = 2;
 const TRASH_WORDS: usize = 4;
 
 /// The job, flattened: its polynomials and the kernel's tables.
-pub(crate) struct Tables<'j> {
+pub struct Tables<'j> {
     /// The proof's polynomials (coefficients, `2^k` each), distinct, in the
     /// order of their cosets in the proof bank.
-    pub(crate) proof: Vec<&'j [Scalar]>,
+    pub proof: Vec<&'j [Scalar]>,
     /// The proving-key polynomials (extended cosets), distinct.
-    pub(crate) keys: Vec<&'j [Scalar]>,
+    pub keys: Vec<&'j [Scalar]>,
     /// The kernel's words. A key handle is written as its index in `keys`
     /// and fixed by [`Tables::place_keys`].
-    pub(crate) words: Vec<u32>,
+    pub words: Vec<u32>,
     /// The programs' uniforms.
-    pub(crate) uniforms: Vec<Scalar>,
+    pub uniforms: Vec<Scalar>,
     /// The word offsets of the key handles in `words`.
     key_words: Vec<usize>,
     /// Word offsets of the gates program, the permutation's handles, the
     /// lookup descriptors and the trash descriptors.
-    pub(crate) gates: u32,
-    pub(crate) perm: u32,
-    pub(crate) lookups: u32,
-    pub(crate) trash: u32,
+    pub gates: u32,
+    pub perm: u32,
+    pub lookups: u32,
+    pub trash: u32,
     /// Handles (key indices until placed) of `l0`, `l_last`, `l_active`.
-    pub(crate) lagrange: [u32; 3],
+    pub lagrange: [u32; 3],
     /// Field multiplications per row, about (the command-buffer split).
-    pub(crate) cost_per_row: u64,
+    pub cost_per_row: u64,
     /// The index of each distinct polynomial, by address.
     proof_ix: HashMap<usize, usize>,
     key_ix: HashMap<usize, usize>,
     /// The lengths of a proof polynomial and of a key polynomial.
     n: usize,
     en: usize,
+}
+
+impl std::fmt::Debug for Tables<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tables")
+            .field("proof", &self.proof.len())
+            .field("keys", &self.keys.len())
+            .field("words", &self.words.len())
+            .finish_non_exhaustive()
+    }
 }
 
 fn handle(bank: u32, index: usize) -> u32 {
@@ -107,7 +117,7 @@ impl<'j> Tables<'j> {
     /// The job's contract: every pointer and count of `j` is valid, and its
     /// header has passed [`super::checked`] (so `k` and `ext_k` are lengths
     /// the polynomials have).
-    pub(crate) unsafe fn new(j: &'j QuotientJobAbi) -> Result<Self, Reason> {
+    pub unsafe fn new(j: &'j QuotientJobAbi) -> Result<Self, Reason> {
         let mut t = Tables {
             proof: Vec::new(),
             keys: Vec::new(),
@@ -418,7 +428,7 @@ impl<'j> Tables<'j> {
 
     /// Writes the key handles: `bank_of[i]` is `(bank, index)` of key `i`.
     /// Returns the handles of `l0`, `l_last`, `l_active`.
-    pub(crate) fn place_keys(&mut self, bank_of: &[(u32, usize)]) -> [u32; 3] {
+    pub fn place_keys(&mut self, bank_of: &[(u32, usize)]) -> [u32; 3] {
         // every key word holds an index into `keys`, which `bank_of` covers
         for &w in &self.key_words {
             let (b, i) = bank_of[self.words[w] as usize];

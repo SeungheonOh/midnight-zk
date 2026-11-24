@@ -228,7 +228,7 @@ pub struct QuotientJobAbi {
 ///
 /// # Safety
 /// For a non-zero count, `p` is valid for `n` reads.
-pub(crate) unsafe fn slice<'a, T>(p: *const T, n: usize) -> &'a [T] {
+pub unsafe fn slice<'a, T>(p: *const T, n: usize) -> &'a [T] {
     if n == 0 {
         &[]
     } else {

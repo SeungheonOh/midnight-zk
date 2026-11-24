@@ -67,14 +67,12 @@ macro_rules! trace {
     };
 }
 
-mod checks;
-mod collect;
-mod effective;
-mod par;
+use midnight_accel::msm::{Xyzz, checks, effective, par};
+#[allow(unused_imports)]
+use midnight_accel::msm::{collect, plan, secret};
+
 mod pipeline;
-mod plan;
 mod registry;
-mod secret;
 mod split;
 
 pub(crate) use effective::{effective_need, effective_size_reaches};
@@ -84,9 +82,6 @@ use registry::{ONE_SHOT, Store, TABLES_SERVED, Table};
 pub use registry::{SrsHandle, msm_counts, register_srs, srs_handles, srs_stale};
 use secret::{Secret, scrub_stack};
 use split::{Points, split};
-
-/// A device XYZZ record (`g1::Xyzz`): `X, Y, ZZZ, ZZ`, six limbs each.
-type Xyzz = [u64; 24];
 
 // The host types the code reinterprets.
 const _: () = {

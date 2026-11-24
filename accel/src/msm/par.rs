@@ -19,12 +19,27 @@ use std::{
 };
 
 /// The threads of a host pass over the points or the scalars.
-pub(super) fn host_threads() -> usize {
+pub fn host_threads() -> usize {
     std::thread::available_parallelism().map_or(4, |t| t.get()).min(16)
 }
 
+/// The thread pool of the CPU share of an MSM: its own threads, so that the
+/// share never waits for a worker of the caller's pool (the prover calls MSMs
+/// from rayon workers, which may all be blocked on the device lock).
+pub fn cpu_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(std::thread::available_parallelism().map_or(4, |t| t.get()))
+            .thread_name(|i| format!("midnight-metal-msm-cpu-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
 /// `f` with a panic caught: `None` when it panicked.
-pub(super) fn catch<R>(f: impl FnOnce() -> R) -> Option<R> {
+pub fn catch<R>(f: impl FnOnce() -> R) -> Option<R> {
     std::panic::catch_unwind(AssertUnwindSafe(f)).ok()
 }
 
@@ -32,7 +47,7 @@ pub(super) fn catch<R>(f: impl FnOnce() -> R) -> Option<R> {
 /// least `min` items): the first on the calling thread, the others on scoped
 /// threads, or on the calling thread when a thread cannot be started.
 /// `None`: a part panicked. Never panics.
-pub(super) fn par_parts<R: Send>(
+pub fn par_parts<R: Send>(
     len: usize,
     parts: usize,
     min: usize,
@@ -77,17 +92,17 @@ pub(super) fn par_parts<R: Send>(
 
 /// A read lock, poisoned or not: data under these locks is only ever replaced
 /// whole, so it is valid after any panic.
-pub(super) fn read<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+pub fn read<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
     l.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A write lock, poisoned or not (see [`read`]).
-pub(super) fn write<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+pub fn write<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     l.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A mutex, poisoned or not (see [`read`]).
-pub(super) fn lock<T>(l: &Mutex<T>) -> MutexGuard<'_, T> {
+pub fn lock<T>(l: &Mutex<T>) -> MutexGuard<'_, T> {
     l.lock().unwrap_or_else(|e| e.into_inner())
 }
 
