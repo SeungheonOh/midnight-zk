@@ -55,9 +55,8 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer XyzzRef {
 #define XYZZ_AT(base, i) XyzzRef(addr_at(base, i, 192u)).v
 
 // The field multiplication of the curve formulas. build.rs keeps it out of
-// line (SPIR-V `DontInline`) in the kernels that list it: one copy of its
-// unrolled body then serves every multiplication of a formula. A driver may
-// still inline it.
+// line (SPIR-V `DontInline`) in the kernels that list it, as it keeps
+// `fp_mul` in every kernel. A driver may still inline it.
 Fp g1_mul(Fp a, Fp b) {
     return fp_mul(a, b);
 }

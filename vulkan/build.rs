@@ -19,10 +19,20 @@
 //!
 //! 1. GLSL to unoptimised SPIR-V 1.6 (Vulkan 1.3) with `glslangValidator` or
 //!    `glslc`;
-//! 2. the functions the kernel lists in `keep` get the SPIR-V function
-//!    control `DontInline`;
-//! 3. `spirv-opt -O`, which inlines every other function and fully unrolls
-//!    the `[[unroll]]` loops.
+//! 2. the field multiplications ([`OUT_OF_LINE`]) and the functions the
+//!    kernel lists in `keep` get the SPIR-V function control `DontInline`;
+//! 3. `spirv-opt` with [`PASSES`]: `-O` without its loop unrolling, which
+//!    inlines every other function into the entry point and cleans up.
+//!
+//! Neither step unrolls loops or copies a multiplication's body into its
+//! callers: the driver's compiler does both (it keeps the `[[unroll]]` hints
+//! as SPIR-V loop controls). `-O` unrolled every `[[unroll]]` loop of the
+//! inlined multiplications and then ran `redundancy-elimination`, whose
+//! memory grows with the product of a function's blocks and values: several
+//! GB for one kernel. Here each module stays small, so the tools need little
+//! memory and time. At most [`MAX_WORKERS`] (cargo's `NUM_JOBS` if fewer)
+//! tool processes run at once, and one running past [`TOOL_TIMEOUT`] fails
+//! the build.
 //!
 //! The SPIR-V is embedded with `include_bytes!` through
 //! `$OUT_DIR/shaders.rs`, and the cfg `midnight_vulkan_spirv` is set. A
@@ -42,9 +52,56 @@
 use std::{
     env,
     fmt::Write as _,
+    io::Read as _,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
 };
+
+/// Tool processes running at once.
+const MAX_WORKERS: usize = 4;
+
+/// A tool process running longer is stopped and fails the build.
+const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Functions kept out of line in every kernel that defines them: the field
+/// multiplications, by GLSL name.
+const OUT_OF_LINE: &[&str] = &["fr_mul", "fp_mul"];
+
+/// The `spirv-opt` passes: those of `-O` (SPIRV-Tools v2026) without
+/// `loop-unroll` and the passes that only clean up after it.
+const PASSES: &[&str] = &[
+    "wrap-opkill",
+    "eliminate-dead-branches",
+    "merge-return",
+    "inline-entry-points-exhaustive",
+    "eliminate-dead-functions",
+    "eliminate-dead-code-aggressive",
+    "private-to-local",
+    "eliminate-local-single-block",
+    "eliminate-local-single-store",
+    "eliminate-dead-code-aggressive",
+    "scalar-replacement=0",
+    "convert-local-access-chains",
+    "eliminate-local-single-block",
+    "eliminate-local-single-store",
+    "eliminate-dead-code-aggressive",
+    "ssa-rewrite",
+    "eliminate-dead-code-aggressive",
+    "ccp",
+    "eliminate-dead-code-aggressive",
+    "simplify-instructions",
+    "eliminate-dead-code-aggressive",
+    "merge-blocks",
+    "redundancy-elimination",
+    "eliminate-dead-branches",
+    "merge-blocks",
+    "simplify-instructions",
+];
 
 /// A kernel: one entry point, compiled from `source` with `defines`.
 struct Kernel {
@@ -175,25 +232,29 @@ fn main() {
     let mut rs = String::from("pub(crate) static SHADERS: &[Shader] = &[\n");
     match tools() {
         Ok((frontend, opt)) => {
+            let jobs: Vec<(&Kernel, (&str, u32))> =
+                kernels.iter().flat_map(|k| VARIANTS.iter().map(move |v| (*k, *v))).collect();
+            let next = AtomicUsize::new(0);
+            let errors = Mutex::new(Vec::new());
             std::thread::scope(|s| {
-                let jobs: Vec<_> = kernels
-                    .iter()
-                    .flat_map(|k| VARIANTS.iter().map(move |v| (*k, *v)))
-                    .map(|(k, v)| {
-                        let (frontend, opt, out, shaders, include) =
-                            (&frontend, &opt, &out, &shaders, &include);
-                        s.spawn(move || compile(k, v, frontend, opt, shaders, include, out))
-                    })
-                    .collect();
-                let errors: Vec<String> =
-                    jobs.into_iter().filter_map(|j| j.join().unwrap().err()).collect();
-                if !errors.is_empty() {
-                    panic!(
-                        "midnight-vulkan: shader build failed:\n{}",
-                        errors.join("\n")
-                    );
+                for _ in 0..workers() {
+                    s.spawn(|| {
+                        while let Some(&(k, v)) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            if let Err(e) = compile(k, v, &frontend, &opt, &shaders, &include, &out)
+                            {
+                                errors.lock().unwrap().push(e);
+                            }
+                        }
+                    });
                 }
             });
+            let errors = errors.into_inner().unwrap();
+            if !errors.is_empty() {
+                panic!(
+                    "midnight-vulkan: shader build failed:\n{}",
+                    errors.join("\n")
+                );
+            }
             for k in &kernels {
                 let path = |suffix: &str| out.join(format!("{}.{suffix}.spv", k.name));
                 writeln!(
@@ -258,16 +319,47 @@ fn tool(var: &str, names: &[&str]) -> Option<PathBuf> {
     })
 }
 
+/// Concurrent tool processes: cargo's `NUM_JOBS`, at most [`MAX_WORKERS`].
+fn workers() -> usize {
+    let jobs = env::var("NUM_JOBS").ok().and_then(|j| j.parse().ok()).unwrap_or(1usize);
+    jobs.clamp(1, MAX_WORKERS)
+}
+
+/// Runs `cmd`, killing it after [`TOOL_TIMEOUT`].
 fn run(cmd: &mut Command, what: &str) -> Result<(), String> {
-    let o = cmd
-        .output()
-        .map_err(|e| format!("{what}: could not run {:?}: {e}", cmd.get_program()))?;
-    if !o.status.success() {
-        return Err(format!(
-            "{what}: {}{}",
-            String::from_utf8_lossy(&o.stdout),
-            String::from_utf8_lossy(&o.stderr)
-        ));
+    let program = cmd.get_program().to_owned();
+    let mut child = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{what}: could not run {program:?}: {e}"))?;
+    // the tools write little; drain stderr so a full pipe cannot block them
+    let mut stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    });
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if start.elapsed() > TOOL_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{what}: {program:?} ran for more than {} s and was stopped; the shader \
+                     build is expected to take seconds",
+                    TOOL_TIMEOUT.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => return Err(format!("{what}: waiting for {program:?}: {e}")),
+        }
+    };
+    let stderr = reader.join().unwrap_or_default();
+    if !status.success() {
+        return Err(format!("{what}: {program:?} failed ({status}): {stderr}"));
     }
     Ok(())
 }
@@ -307,11 +399,12 @@ fn compile(
     run(&mut cmd, &what)?;
 
     let mut words = read_words(&raw).map_err(|e| format!("{what}: {e}"))?;
-    keep_out_of_line(&mut words, k.keep).map_err(|e| format!("{what}: {e}"))?;
+    keep_out_of_line(&mut words, k.keep, OUT_OF_LINE).map_err(|e| format!("{what}: {e}"))?;
     write_words(&raw, &words).map_err(|e| format!("{what}: {e}"))?;
     run(
         Command::new(opt)
-            .args(["-O", "--target-env=vulkan1.3"])
+            .args(PASSES.iter().map(|p| format!("--{p}")))
+            .arg("--target-env=vulkan1.3")
             .arg(&raw)
             .arg("-o")
             .arg(&dst),
@@ -360,12 +453,10 @@ const CAPABILITY_INT64: u32 = 11;
 const FUNCTION_CONTROL_INLINE: u32 = 0x1;
 const FUNCTION_CONTROL_DONT_INLINE: u32 = 0x2;
 
-/// Sets `DontInline` on every function whose GLSL name is in `keep`
-/// (glslang and glslc name a function `name(<mangled parameters>`).
-fn keep_out_of_line(words: &mut [u32], keep: &[&str]) -> Result<(), String> {
-    if keep.is_empty() {
-        return Ok(());
-    }
+/// Sets `DontInline` on every function whose GLSL name is in `keep` (each
+/// must exist) or in `global` (where it exists); glslang and glslc name a
+/// function `name(<mangled parameters>`.
+fn keep_out_of_line(words: &mut [u32], keep: &[&str], global: &[&str]) -> Result<(), String> {
     let mut ids = Vec::new();
     let mut found = vec![false; keep.len()];
     for (_, op, args) in instructions(words) {
@@ -375,9 +466,14 @@ fn keep_out_of_line(words: &mut [u32], keep: &[&str]) -> Result<(), String> {
         let bytes: Vec<u8> = args[1..].iter().flat_map(|w| w.to_le_bytes()).collect();
         let name = bytes.split(|b| *b == 0).next().unwrap_or_default();
         let base = name.split(|b| *b == b'(').next().unwrap_or_default();
+        if !name.contains(&b'(') {
+            continue;
+        }
         if let Some(i) = keep.iter().position(|k| k.as_bytes() == base) {
             ids.push(args[0]);
             found[i] = true;
+        } else if global.iter().any(|k| k.as_bytes() == base) {
+            ids.push(args[0]);
         }
     }
     if let Some(i) = found.iter().position(|f| !f) {
