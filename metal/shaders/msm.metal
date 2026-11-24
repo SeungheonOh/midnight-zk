@@ -75,8 +75,8 @@ MONT_INLINE uint booth_encode(uint wval, uint wmask, uint wbits) {
 // `scalars` is bound but not read.
 kernel void msm_digits(device const Fr *scalars [[buffer(0)]],
                        device uint *digits [[buffer(1)]],
-                       constant msm::DigitsParams &p [[buffer(2)]],
-                       device uint *hot [[buffer(3)]],
+                       device uint *hot [[buffer(2)]],
+                       constant msm::DigitsParams &p [[buffer(3)]],
                        uint i [[thread_position_in_grid]]) {
     using namespace msm;
     if (i == 0) *hot = 0;
@@ -458,8 +458,8 @@ kernel void msm_accumulate(device g1::Xyzz *buckets [[buffer(0)]],
                            device const g1::Affine *points [[buffer(1)]],
                            device const uint *digits [[buffer(2)]],
                            device const uint *hist [[buffer(3)]],
-                           constant msm::AccParams &p [[buffer(4)]],
-                           device const uint *hot [[buffer(5)]],
+                           device const uint *hot [[buffer(4)]],
+                           constant msm::AccParams &p [[buffer(5)]],
                            uint g [[thread_position_in_grid]],
                            uint tid [[thread_index_in_threadgroup]],
                            uint tpg [[threads_per_threadgroup]]) {

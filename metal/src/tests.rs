@@ -51,14 +51,8 @@ fn run_op<T: ctx::Pod + Default>(kernel: &str, op: u32, a: &[T], b: &[T]) -> Vec
     let out = c.alloc(size_of_val(a)).unwrap();
     let n = a.len() as u32;
     c.run(|cmd| {
-        let args = [
-            Arg::Buffer(&ba),
-            Arg::Buffer(&bb),
-            Arg::Buffer(&out),
-            Arg::value(&op),
-            Arg::value(&n),
-        ];
-        cmd.dispatch(kernel, a.len(), &args)
+        let args = [Arg::Buffer(&ba), Arg::Buffer(&bb), Arg::Buffer(&out)];
+        cmd.dispatch(kernel, a.len(), &args, &[op, n])
     })
     .unwrap();
     let mut r = vec![T::default(); a.len()];
@@ -243,7 +237,7 @@ fn errors_are_values() {
     require_device();
     let s = ctx::lock().unwrap();
     let c = s.ctx();
-    let e = c.run(|cmd| cmd.dispatch("no_such_kernel", 1, &[])).unwrap_err();
+    let e = c.run(|cmd| cmd.dispatch("no_such_kernel", 1, &[], &())).unwrap_err();
     assert_eq!(e.reason(), "device-error");
     let e = c.alloc(usize::MAX / 2).unwrap_err();
     assert_eq!(e.reason(), "memory");
@@ -255,13 +249,14 @@ fn errors_are_values() {
                 "diag_iota",
                 1,
                 1 << 20,
-                &[Arg::Buffer(&out), Arg::value(&n)],
+                &[Arg::Buffer(&out)],
+                &n,
                 &[],
             )
         })
         .unwrap_err();
     assert_eq!(e.reason(), "device-error");
-    c.run(|cmd| cmd.dispatch("diag_iota", 1, &[Arg::Buffer(&out), Arg::value(&n)]))
+    c.run(|cmd| cmd.dispatch("diag_iota", 1, &[Arg::Buffer(&out)], &n))
         .unwrap();
 }
 
@@ -826,10 +821,8 @@ fn a_backend_panic_is_a_counted_decline() {
 /// transform of that size.
 #[test]
 fn ntt_pass_takes_the_planned_threadgroups() {
-    use objc2_metal::MTLComputePipelineState;
     require_device();
-    let p = ctx::context().unwrap().pipeline("ntt_pass").unwrap();
-    let max = p.maxTotalThreadsPerThreadgroup();
+    let max = ctx::context().unwrap().max_group("ntt_pass").unwrap();
     for log_n in 1..=crate::MAX_LOG_N {
         for t in crate::ntt::pass_group_threads(log_n) {
             assert!(

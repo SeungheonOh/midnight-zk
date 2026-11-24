@@ -26,6 +26,18 @@ enum : uint {
     OP_FROM_AFFINE = 2 // b_affine as XYZZ, negated with the flag
 };
 
+// The arguments of `msm_test_g1`.
+struct G1Params {
+    uint op;
+    uint n;
+};
+
+// The arguments of `msm_test_mask`.
+struct MaskParams {
+    uint i0;
+    uint n;
+};
+
 } // namespace msm_test
 
 kernel void msm_test_g1(device const g1::Xyzz *a [[buffer(0)]],
@@ -33,14 +45,13 @@ kernel void msm_test_g1(device const g1::Xyzz *a [[buffer(0)]],
                         device const g1::Affine *b_affine [[buffer(2)]],
                         device const uint *flags [[buffer(3)]],
                         device g1::Xyzz *out [[buffer(4)]],
-                        constant uint &op [[buffer(5)]],
-                        constant uint &n [[buffer(6)]],
+                        constant msm_test::G1Params &p [[buffer(5)]],
                         uint i [[thread_position_in_grid]]) {
     using namespace msm_test;
-    if (i >= n) return;
+    if (i >= p.n) return;
     g1::Xyzz r = a[i];
     bool flag = flags[i] != 0;
-    switch (op) {
+    switch (p.op) {
     case OP_MADD: g1::add(r, b_affine[i], flag); break;
     case OP_ADD: g1::add(r, b[i]); break;
     default:
@@ -53,9 +64,8 @@ kernel void msm_test_g1(device const g1::Xyzz *a [[buffer(0)]],
 
 // The mask element `i0 + i` of the MSM (msm.metal), as Montgomery limbs.
 kernel void msm_test_mask(device Fr *out [[buffer(0)]],
-                          constant uint &i0 [[buffer(1)]],
-                          constant uint &n [[buffer(2)]],
+                          constant msm_test::MaskParams &p [[buffer(1)]],
                           uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    out[i] = msm::mask_elem((ulong)i0 + i);
+    if (i >= p.n) return;
+    out[i] = msm::mask_elem((ulong)p.i0 + i);
 }

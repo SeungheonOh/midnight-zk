@@ -54,6 +54,8 @@ impl std::fmt::Display for Error {
 /// # Safety
 /// Implement it only for such types.
 pub unsafe trait Pod: Copy + 'static {}
+// SAFETY: no bytes at all.
+unsafe impl Pod for () {}
 // SAFETY: integers and arrays of them have no padding and no invalid values.
 unsafe impl Pod for u8 {}
 // SAFETY: as above.
@@ -62,6 +64,12 @@ unsafe impl Pod for u32 {}
 unsafe impl Pod for u64 {}
 // SAFETY: as above.
 unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
+
+/// The bytes of a plain value.
+pub fn bytes_of<T: Pod>(v: &T) -> &[u8] {
+    // SAFETY: a Pod value is valid to view as its bytes.
+    unsafe { std::slice::from_raw_parts((v as *const T).cast(), size_of::<T>()) }
+}
 
 // ---------------------------------------------------------------------------
 // Host copies

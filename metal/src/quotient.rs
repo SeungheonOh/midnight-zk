@@ -1019,8 +1019,8 @@ fn numerator_ranges(
                         Arg::Buffer(bufs[4]),
                         Arg::Buffer(bufs[5]),
                         Arg::Buffer(bufs[6]),
-                        Arg::value(&p),
                     ],
+                    &p,
                 )
             })
             .map_err(err)?

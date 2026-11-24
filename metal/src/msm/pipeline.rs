@@ -18,7 +18,6 @@
 use std::{mem::size_of, sync::Mutex};
 
 use blst::blst_p1;
-use objc2_metal::MTLComputePipelineState;
 
 use super::{
     Xyzz,
@@ -95,9 +94,7 @@ impl Geometry {
     /// The thread counts of `pl` on this device, after checking what the
     /// kernels rely on (threadgroup sizes, sort widths, SIMD-group width).
     pub(super) fn of(c: &Ctx, pl: &Plan) -> Result<Geometry, Error> {
-        let max = |k: &str| -> Result<usize, Error> {
-            Ok(c.pipeline(k)?.maxTotalThreadsPerThreadgroup())
-        };
+        let max = |k: &str| c.max_group(k);
         let pow2_floor = |x: usize| if x == 0 { 0 } else { 1usize << lg2(x) };
         let sort_block = [
             "msm_sort_count",
@@ -141,7 +138,7 @@ fn simd_width_ok(c: &Ctx) -> Result<(), Error> {
         None => {
             let mut ok = true;
             for k in KERNELS {
-                ok &= c.pipeline(k)?.threadExecutionWidth() == SIMD_WIDTH;
+                ok &= c.subgroup_width(k)? == SIMD_WIDTH;
             }
             *OK.get_or_init(|| ok)
         }
@@ -254,12 +251,8 @@ fn enc_digits<'a>(
     cmd.dispatch(
         "msm_digits",
         num,
-        &[
-            sc,
-            Arg::Buffer(b.digits),
-            Arg::value(&p.digits),
-            Arg::Buffer(b.hot),
-        ],
+        &[sc, Arg::Buffer(b.digits), Arg::Buffer(b.hot)],
+        &p.digits,
     )
 }
 
@@ -275,19 +268,20 @@ fn enc_sort<'a>(
         // windows of this pass (`sp[2]`, its first window, is below `nwins`)
         let pw = (pl.nwins - sp[2]).min(pl.pass) as usize;
         let groups = pw * SORT_GROUPS as usize;
-        let prm = Arg::value(sp);
         cmd.dispatch_groups(
             "msm_sort_count",
             groups,
             g.sort_block,
-            &[Arg::Buffer(b.digits), Arg::Buffer(b.counts), prm],
+            &[Arg::Buffer(b.digits), Arg::Buffer(b.counts)],
+            sp,
             &[],
         )?;
         cmd.dispatch_groups(
             "msm_sort_scan",
             pw,
             g.sort_block,
-            &[Arg::Buffer(b.counts), Arg::Buffer(b.hist), prm],
+            &[Arg::Buffer(b.counts), Arg::Buffer(b.hist)],
+            sp,
             &[],
         )?;
         cmd.dispatch_groups(
@@ -298,8 +292,8 @@ fn enc_sort<'a>(
                 Arg::Buffer(b.digits),
                 Arg::Buffer(b.counts),
                 Arg::Buffer(b.temps),
-                prm,
             ],
+            sp,
             &[],
         )?;
         cmd.dispatch_groups(
@@ -310,8 +304,8 @@ fn enc_sort<'a>(
                 Arg::Buffer(b.digits),
                 Arg::Buffer(b.temps),
                 Arg::Buffer(b.hist),
-                prm,
             ],
+            sp,
             &[],
         )?;
     }
@@ -332,7 +326,8 @@ fn enc_accumulate<'a>(
     cmd.dispatch(
         "msm_bucket_guard",
         total,
-        &[Arg::Buffer(b.hist), Arg::Buffer(b.hot), Arg::value(&p.acc)],
+        &[Arg::Buffer(b.hist), Arg::Buffer(b.hot)],
+        &p.acc,
     )?;
     cmd.dispatch_groups(
         "msm_ones",
@@ -344,6 +339,7 @@ fn enc_accumulate<'a>(
             Arg::Buffer(b.digits),
             Arg::Buffer(b.hist),
         ],
+        &(),
         &[],
     )?;
     cmd.dispatch_with(
@@ -355,9 +351,9 @@ fn enc_accumulate<'a>(
             pts,
             Arg::Buffer(b.digits),
             Arg::Buffer(b.hist),
-            Arg::value(&p.acc),
             Arg::Buffer(b.hot),
         ],
+        &p.acc,
         &[],
     )
 }
@@ -373,7 +369,8 @@ fn enc_integrate<'a>(
         "msm_integrate",
         pl.nwins as usize,
         g.nthr,
-        &[Arg::Buffer(b.buckets), Arg::value(&p.int)],
+        &[Arg::Buffer(b.buckets)],
+        &p.int,
         &[],
     )
 }

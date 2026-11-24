@@ -19,7 +19,7 @@
 //! let a = s.ctx().upload(scalars)?;           // a scoped, zeroed-on-drop buffer
 //! let tw = s.scratch("ntt-twiddles", bytes)?; // a per-request buffer
 //! let ns = s.ctx().run(|c| {
-//!     c.dispatch("ntt_radix2", n / 2, &[Arg::Buffer(&a), Arg::value(&n)])?;
+//!     c.dispatch("ntt_radix2", n / 2, &[Arg::Buffer(&a)], &(n as u32))?;
 //!     Ok(())
 //! })?.1;
 //! a.read(out);
@@ -72,7 +72,7 @@ use objc2_metal::{
     MTLStorageMode,
 };
 
-pub use midnight_accel::ctx::{Error, Pod};
+pub use midnight_accel::ctx::{Error, Pod, bytes_of};
 pub(crate) use midnight_accel::ctx::par_copy;
 
 use crate::MetalInfo;
@@ -925,6 +925,16 @@ impl Ctx {
         Ok(p)
     }
 
+    /// The most threads of one threadgroup of `kernel`'s pipeline.
+    pub fn max_group(&self, kernel: &str) -> Result<usize, Error> {
+        Ok(self.pipeline(kernel)?.maxTotalThreadsPerThreadgroup())
+    }
+
+    /// The SIMD-group width of `kernel`'s pipeline.
+    pub fn subgroup_width(&self, kernel: &str) -> Result<usize, Error> {
+        Ok(self.pipeline(kernel)?.threadExecutionWidth())
+    }
+
     /// Encodes the dispatches of `f` into one command buffer, commits it and
     /// waits. Returns `f`'s value and the GPU time in nanoseconds. An error
     /// from `f` is returned only after the encoded work completed, so no
@@ -967,23 +977,14 @@ impl Ctx {
 // ---------------------------------------------------------------------------
 // Dispatch
 
-/// A kernel argument, bound at the index of its position in the list.
+/// A buffer argument of a kernel, bound at the index of its position in the
+/// list; the kernel's parameters follow the buffers.
 #[derive(Clone, Copy, Debug)]
 pub enum Arg<'a> {
     /// A buffer from its start.
     Buffer(&'a Buffer),
     /// A buffer from a byte offset.
     BufferAt(&'a Buffer, usize),
-    /// Bytes copied into the command (`setBytes`, at most 4 KiB).
-    Bytes(&'a [u8]),
-}
-
-impl<'a> Arg<'a> {
-    /// A plain value as [`Arg::Bytes`].
-    pub fn value<T: Pod>(v: &'a T) -> Self {
-        // SAFETY: a Pod value is valid to view as its bytes.
-        Arg::Bytes(unsafe { std::slice::from_raw_parts((v as *const T).cast(), size_of::<T>()) })
-    }
 }
 
 /// The command buffer being encoded in [`Ctx::run`]: one serial compute
@@ -1001,8 +1002,15 @@ impl std::fmt::Debug for Command<'_> {
 }
 
 impl<'a> Command<'a> {
-    /// Sets the pipeline, arguments and threadgroup memory of `kernel`.
-    fn bind(&self, kernel: &str, args: &[Arg<'a>], tg_mem: &[usize]) -> Result<Pipeline, Error> {
+    /// Sets the pipeline, the buffers, the parameters (at the index after the
+    /// buffers, none when empty) and the threadgroup memory of `kernel`.
+    fn bind(
+        &self,
+        kernel: &str,
+        args: &[Arg<'a>],
+        params: &[u8],
+        tg_mem: &[usize],
+    ) -> Result<Pipeline, Error> {
         let p = self.ctx.pipeline(kernel)?;
         self.enc.setComputePipelineState(&p);
         for (i, a) in args.iter().enumerate() {
@@ -1023,23 +1031,23 @@ impl<'a> Command<'a> {
                     // SAFETY: as above, and the offset is inside the buffer.
                     unsafe { self.enc.setBuffer_offset_atIndex(Some(&b.raw), off, i) }
                 }
-                Arg::Bytes(v) => {
-                    if v.is_empty() || v.len() > 4096 {
-                        return Err(Error::Device(format!(
-                            "argument {i}: {} bytes inline",
-                            v.len()
-                        )));
-                    }
-                    // SAFETY: valid for `v.len()` bytes; Metal copies them
-                    // and never writes through the pointer.
-                    unsafe {
-                        self.enc.setBytes_length_atIndex(
-                            NonNull::from(v).cast::<c_void>(),
-                            v.len(),
-                            i,
-                        )
-                    }
-                }
+            }
+        }
+        if !params.is_empty() {
+            if params.len() > 4096 {
+                return Err(Error::Device(format!(
+                    "`{kernel}`: {} bytes of parameters",
+                    params.len()
+                )));
+            }
+            // SAFETY: valid for `params.len()` bytes; Metal copies them and
+            // never writes through the pointer.
+            unsafe {
+                self.enc.setBytes_length_atIndex(
+                    NonNull::from(params).cast::<c_void>(),
+                    params.len(),
+                    args.len(),
+                )
             }
         }
         for (i, len) in tg_mem.iter().enumerate() {
@@ -1052,13 +1060,14 @@ impl<'a> Command<'a> {
 
     /// `threads` threads in threadgroups of up to 256; the last group may be
     /// partial, so kernels check their index.
-    pub fn dispatch(
+    pub fn dispatch<P: Pod>(
         &mut self,
         kernel: &str,
         threads: usize,
         args: &[Arg<'a>],
+        params: &P,
     ) -> Result<(), Error> {
-        let p = self.bind(kernel, args, &[])?;
+        let p = self.bind(kernel, args, bytes_of(params), &[])?;
         let tg = p.maxTotalThreadsPerThreadgroup().clamp(1, 256);
         self.threads(threads, tg);
         Ok(())
@@ -1066,15 +1075,16 @@ impl<'a> Command<'a> {
 
     /// `threads` threads in groups of `group` threads, with threadgroup memory
     /// of `tg_mem[i]` bytes at `[[threadgroup(i)]]`.
-    pub fn dispatch_with(
+    pub fn dispatch_with<P: Pod>(
         &mut self,
         kernel: &str,
         threads: usize,
         group: usize,
         args: &[Arg<'a>],
+        params: &P,
         tg_mem: &[usize],
     ) -> Result<(), Error> {
-        let p = self.bind(kernel, args, tg_mem)?;
+        let p = self.bind(kernel, args, bytes_of(params), tg_mem)?;
         check_group(kernel, &p, group)?;
         self.threads(threads, group);
         Ok(())
@@ -1082,15 +1092,16 @@ impl<'a> Command<'a> {
 
     /// `groups` whole threadgroups of `group` threads, with threadgroup
     /// memory as [`Command::dispatch_with`].
-    pub fn dispatch_groups(
+    pub fn dispatch_groups<P: Pod>(
         &mut self,
         kernel: &str,
         groups: usize,
         group: usize,
         args: &[Arg<'a>],
+        params: &P,
         tg_mem: &[usize],
     ) -> Result<(), Error> {
-        let p = self.bind(kernel, args, tg_mem)?;
+        let p = self.bind(kernel, args, bytes_of(params), tg_mem)?;
         check_group(kernel, &p, group)?;
         if groups > 0 {
             self.enc.dispatchThreadgroups_threadsPerThreadgroup(size1(groups), size1(group));

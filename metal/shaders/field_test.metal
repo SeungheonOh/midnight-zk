@@ -55,6 +55,12 @@ MONT_INLINE mont::Elem<P> apply(uint op, mont::Elem<P> a, mont::Elem<P> b) {
     }
 }
 
+// The arguments of `field_test_kernel`.
+struct Params {
+    uint op;
+    uint n;
+};
+
 } // namespace field_test
 
 // out[i] = op(a[i], b[i]) for i < n.
@@ -62,14 +68,13 @@ template <typename P>
 kernel void field_test_kernel(device const mont::Elem<P> *a [[buffer(0)]],
                               device const mont::Elem<P> *b [[buffer(1)]],
                               device mont::Elem<P> *out [[buffer(2)]],
-                              constant uint &op [[buffer(3)]],
-                              constant uint &n [[buffer(4)]],
+                              constant field_test::Params &p [[buffer(3)]],
                               uint gid [[thread_position_in_grid]]) {
-    if (gid >= n) return;
-    out[gid] = field_test::apply<P>(op, a[gid], b[gid]);
+    if (gid >= p.n) return;
+    out[gid] = field_test::apply<P>(p.op, a[gid], b[gid]);
 }
 
 template [[host_name("field_test_fr")]] kernel void field_test_kernel<FrParams>(
-    device const Fr *, device const Fr *, device Fr *, constant uint &, constant uint &, uint);
+    device const Fr *, device const Fr *, device Fr *, constant field_test::Params &, uint);
 template [[host_name("field_test_fp")]] kernel void field_test_kernel<FpParams>(
-    device const Fp *, device const Fp *, device Fp *, constant uint &, constant uint &, uint);
+    device const Fp *, device const Fp *, device Fp *, constant field_test::Params &, uint);

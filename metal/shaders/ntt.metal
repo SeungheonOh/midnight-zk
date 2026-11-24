@@ -199,14 +199,13 @@ kernel void ntt_scale_copy(device const Fr *src [[buffer(0)]],
     dst[gid] = fr_mul(src[gid], c);
 }
 
-// a[i] *= [1, z1, z2][i mod 3].
+// a[i] *= [1, z[0], z[1]][i mod 3].
 kernel void ntt_distribute_zeta(device Fr *a [[buffer(0)]],
-                                constant Fr &z1 [[buffer(1)]],
-                                constant Fr &z2 [[buffer(2)]],
+                                constant Fr *z [[buffer(1)]],
                                 uint gid [[thread_position_in_grid]]) {
     const uint m = gid % 3u;
-    if (m == 1u) a[gid] = fr_mul(a[gid], z1);
-    else if (m == 2u) a[gid] = fr_mul(a[gid], z2);
+    if (m == 1u) a[gid] = fr_mul(a[gid], z[0]);
+    else if (m == 2u) a[gid] = fr_mul(a[gid], z[1]);
 }
 
 // a[i] *= t[i & mask] (a period of mask + 1, a power of two).

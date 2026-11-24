@@ -278,7 +278,8 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
                     cmd.dispatch(
                         "ntt_scale_copy",
                         1usize << (UNIVERSAL_LOG - HI_BITS),
-                        &[Arg::Buffer(&tables.lo[d]), Arg::Buffer(b), Arg::value(c)],
+                        &[Arg::Buffer(&tables.lo[d]), Arg::Buffer(b)],
+                        c,
                     )?;
                 }
                 for i in q..end {
@@ -293,7 +294,6 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
                         Arg::BufferAt(dst, dst_off),
                         Arg::Buffer(hi),
                         Arg::Buffer(lo_tab),
-                        Arg::value(p),
                     ];
                     let e_log = p.log_r + p.log_g;
                     cmd.dispatch_groups(
@@ -301,6 +301,7 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
                         n >> e_log,
                         group_threads(e_log),
                         &args,
+                        p,
                         &[SCALAR_BYTES << e_log],
                     )?;
                 }
@@ -491,7 +492,8 @@ pub(crate) fn encode_distribute_zeta<'a>(
     cmd.dispatch(
         "ntt_distribute_zeta",
         n,
-        &[Arg::Buffer(a), Arg::value(&zeta[0]), Arg::value(&zeta[1])],
+        &[Arg::Buffer(a)],
+        zeta,
     )
 }
 
@@ -507,7 +509,7 @@ pub(crate) fn encode_scale<'a>(
     if !field::is_reduced(c) {
         return Err(Error::Unreduced("scale: the factor".into()));
     }
-    cmd.dispatch("ntt_scale", n, &[Arg::Buffer(a), Arg::value(c)])
+    cmd.dispatch("ntt_scale", n, &[Arg::Buffer(a)], c)
 }
 
 /// Encodes `a[i] *= t[i mod 2^log_tn]` for `i < n`, as
@@ -527,11 +529,8 @@ pub(crate) fn encode_mul_periodic<'a>(
     cmd.dispatch(
         "ntt_mul_periodic",
         n,
-        &[
-            Arg::Buffer(a),
-            Arg::Buffer(t),
-            Arg::value(&MASKS[log_tn as usize]),
-        ],
+        &[Arg::Buffer(a), Arg::Buffer(t)],
+        &MASKS[log_tn as usize],
     )
 }
 

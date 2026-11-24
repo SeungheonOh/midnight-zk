@@ -229,9 +229,8 @@ fn g1_kernel(op: u32, a: &[Xyzz], b: &[Xyzz], b_aff: &[G1AffineLimbs], flags: &[
         c.alloc(size_of_val(a)).unwrap(),
     ];
     c.run(|cmd| {
-        let mut args: Vec<Arg> = bufs.iter().map(Arg::Buffer).collect();
-        args.extend([Arg::value(&op), Arg::value(&n)]);
-        cmd.dispatch("msm_test_g1", n as usize, &args)
+        let args: Vec<Arg> = bufs.iter().map(Arg::Buffer).collect();
+        cmd.dispatch("msm_test_g1", n as usize, &args, &[op, n])
     })
     .unwrap();
     bufs[4].as_slice::<Xyzz>().to_vec()
@@ -289,8 +288,7 @@ fn mask_is_the_cuda_vector() {
     let c = s.ctx();
     let out = c.alloc(n as usize * 32).unwrap();
     c.run(|cmd| {
-        let args = [Arg::Buffer(&out), Arg::value(&i0), Arg::value(&n)];
-        cmd.dispatch("msm_test_mask", n as usize, &args)
+        cmd.dispatch("msm_test_mask", n as usize, &[Arg::Buffer(&out)], &[i0, n])
     })
     .unwrap();
     assert_eq!(out.as_slice::<Scalar>(), &want[i0 as usize..]);
