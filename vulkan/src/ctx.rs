@@ -35,8 +35,11 @@
 //! count. The quotient numerator's parameter block is larger than a
 //! push-constant block: it is copied into a small host-visible buffer of the
 //! run, whose address ends the block. The workgroup width and the NTT pass's
-//! shared memory are specialization constants of the cached pipelines; the
-//! MSM pipelines run in subgroups of 32.
+//! shared memory are specialization constants of the cached pipelines.
+//! `msm_ones`, the one MSM kernel with subgroup operations, runs in pinned
+//! subgroups of 32 where the device allows, else of the device's fixed
+//! width, reducing Metal's runs of 32 across narrower subgroups through
+//! shared memory.
 //!
 //! On a unified device every buffer is mapped for the host, as on Metal. On a
 //! discrete one device buffers are device-local and unmapped: the shared
@@ -472,8 +475,34 @@ const SLAB_BYTES: usize = 4096;
 const SLAB_ALIGN: usize = 16;
 /// The workgroup width of [`Encoder::dispatch`] (at most).
 const DISPATCH_GROUP: usize = 256;
-/// The subgroup width of the MSM kernels.
-const MSM_SUBGROUP: u32 = 32;
+/// The invocations of the runs the MSM kernels reduce (Metal's SIMD-group
+/// width).
+const MSM_RUN: u32 = 32;
+
+/// The subgroup width `msm_ones` runs with: [`MSM_RUN`] where the device lets
+/// a pipeline require it, else the device's fixed width when it is a power
+/// of two. `None`: neither.
+fn ones_subgroup(info: &device::VulkanInfo) -> Option<u32> {
+    if info.takes_subgroup(MSM_RUN) {
+        return Some(MSM_RUN);
+    }
+    let fixed = info.subgroup_size;
+    (fixed.is_power_of_two() && info.takes_subgroup(fixed)).then_some(fixed)
+}
+
+/// The subgroup lanes `msm_ones` reduces with shuffles, below its subgroup
+/// width (0: the subgroup width up to [`MSM_RUN`]). Test support.
+static ONES_LANES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Makes `msm_ones` reduce with shuffles over `lanes` invocations (a power
+/// of two up to its subgroup width) and the rest through shared memory, the
+/// path of a device with narrow subgroups; `None`: the default. Test
+/// support.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn set_ones_lanes(lanes: Option<u32>) {
+    ONES_LANES.store(lanes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
 
 /// What a kernel takes besides its buffer addresses and parameter block in
 /// the push-constant block.
@@ -485,8 +514,9 @@ struct Shape {
     /// The parameter block is read from a buffer whose address ends the
     /// push-constant block.
     params_by_address: bool,
-    /// Runs in subgroups of [`MSM_SUBGROUP`].
-    msm: bool,
+    /// `msm_ones`: runs in pinned subgroups ([`ones_subgroup`]), with the
+    /// lanes it reduces by shuffles in specialization constant 1.
+    ones: bool,
     /// Shared-memory block 0 is specialization constant 1, in words.
     shared_words: bool,
 }
@@ -506,8 +536,8 @@ fn shape(kernel: &str) -> Shape {
             params_by_address: true,
             ..Shape::default()
         },
-        k if k.starts_with("msm_") && !k.starts_with("msm_test") => Shape {
-            msm: true,
+        "msm_ones" => Shape {
+            ones: true,
             ..Shape::default()
         },
         _ => Shape::default(),
@@ -603,10 +633,29 @@ impl<'a> VulkanCommand<'a> {
                 )));
             }
         }
+        let mut subgroup = None;
+        if sh.ones {
+            let width = ones_subgroup(info).ok_or_else(|| {
+                Error::Device(format!("`{kernel}`: no power-of-two subgroup width"))
+            })?;
+            let lanes = match ONES_LANES.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => width.min(MSM_RUN),
+                l => l,
+            };
+            if !lanes.is_power_of_two()
+                || lanes > width.min(MSM_RUN)
+                || !group.is_multiple_of(width.max(MSM_RUN) as usize)
+            {
+                return Err(Error::Device(format!(
+                    "`{kernel}`: workgroup of {group} in subgroups of {width}, {lanes} lanes"
+                )));
+            }
+            subgroup = Some(width);
+            spec[0] = lanes;
+        }
         let options = PipelineOptions {
             workgroup: group as u32,
-            subgroup: (sh.msm && group.is_multiple_of(MSM_SUBGROUP as usize))
-                .then_some(MSM_SUBGROUP),
+            subgroup,
             spec,
         };
         let pipeline = vk.dev.pipeline(kernel, vk.variant, options).map_err(err)?;
@@ -808,9 +857,14 @@ impl Backend for Vulkan {
         if !device::kernels().any(|k| k == kernel) {
             return Err(Error::Device(format!("no kernel `{kernel}`")));
         }
+        // The MSM kernels' contract is Metal's SIMD-groups of 32: `msm_ones`
+        // reduces runs of 32 invocations whatever its subgroup width, and no
+        // other MSM kernel uses subgroups. So the width of the MSM kernels is
+        // that of the runs, wherever `msm_ones` has a subgroup width.
         let info = self.dev.info();
-        Ok(if shape(kernel).msm && info.takes_subgroup(MSM_SUBGROUP) {
-            MSM_SUBGROUP as usize
+        let msm = kernel.starts_with("msm_") && !kernel.starts_with("msm_test");
+        Ok(if msm && ones_subgroup(info).is_some() {
+            MSM_RUN as usize
         } else {
             info.subgroup_size as usize
         })

@@ -30,9 +30,11 @@
 //   the first `2 * threads` records of each row hold the partial sums the
 //   host combines.
 //
-// The kernels using subgroup operations (`msm_sort_scan`, `msm_sort_lower`,
-// `msm_ones`) assume subgroups of 32 invocations: the host pins the width of
-// every MSM pipeline to 32 with full subgroups.
+// `msm_ones` is the one kernel using subgroup operations. It reduces runs of
+// 32 invocations, as the Metal kernel does in SIMD-groups of 32: in full
+// subgroups of `ONES_LANES` invocations (specialization constant 1, a power
+// of two up to 32: the host pins the subgroup width), then, below 32, across
+// subgroups through shared memory.
 //
 // Push constants (addresses in Metal's buffer order, then the Metal kernel's
 // parameter struct):
@@ -49,9 +51,10 @@
 // (Metal's buffer offset `h_off`).
 
 #extension GL_GOOGLE_include_directive : require
+#if defined(MSM_ONES)
 #extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_shuffle_relative : require
+#endif
 
 #include "fr.glsl"
 #include "g1.glsl"
@@ -135,27 +138,23 @@ void slice_of(uint len, uint groups, uint g, out uint base, out uint slice) {
 
 #if defined(MSM_SORT_SCAN) || defined(MSM_SORT_LOWER)
 
-shared uint sg_tot[33];
+shared uint scan[gl_WorkGroupSize.x];
 
 // Exclusive prefix sum over the workgroup, one value per invocation; `total`
-// is the sum of all values. The workgroup is whole subgroups of 32, so the
-// subgroup totals fit one subgroup.
+// is the sum of all values. A scan in shared memory: it does not depend on
+// the subgroup width.
 uint group_exclusive_sum(uint x, out uint total) {
-    const uint lane = gl_SubgroupInvocationID, sg = gl_SubgroupID;
-    const uint nsg = gl_NumSubgroups, width = gl_SubgroupSize;
-    uint incl = subgroupInclusiveAdd(x);
-    if (lane == width - 1u) sg_tot[sg] = incl;
+    const uint tid = gl_LocalInvocationID.x, tpg = gl_WorkGroupSize.x;
+    scan[tid] = x;
     barrier();
-    if (sg == 0u) {
-        uint v = lane < nsg ? sg_tot[lane] : 0u;
-        uint ex = subgroupExclusiveAdd(v);
-        uint all = subgroupAdd(v);
-        if (lane < nsg) sg_tot[lane] = ex;
-        if (lane == 0u) sg_tot[32] = all;
+    for (uint off = 1u; off < tpg; off <<= 1) {
+        uint v = tid >= off ? scan[tid - off] : 0u;
+        barrier();
+        scan[tid] += v;
+        barrier();
     }
-    barrier();
-    total = sg_tot[32];
-    uint r = incl - x + sg_tot[sg];
+    total = scan[tpg - 1u];
+    uint r = scan[tid] - x;
     barrier();
     return r;
 }
@@ -438,9 +437,10 @@ void main() {
 
 // sppark `batch_addition`: the bucket of digit 1 in window 0 (the first
 // `hist[0]` sorted entries of row 0), summed by the whole grid, then reduced
-// in runs of 32 lanes. The invocation whose grid index is a multiple of 32
-// writes one partial sum, so every one of the `threads / 32` records is
-// written at every run.
+// in runs of 32 invocations. The invocation whose grid index is a multiple of
+// 32 writes one partial sum, so every one of the `threads / 32` records is
+// written at every run. The workgroup is whole subgroups of at least
+// `ONES_LANES` invocations, and a multiple of 32.
 
 layout(push_constant) uniform Push {
     uvec2 ones;
@@ -448,6 +448,12 @@ layout(push_constant) uniform Push {
     uvec2 digits;
     uvec2 hist;
 } pc;
+
+// The invocations reduced with subgroup shuffles (a power of two up to 32).
+layout(constant_id = 1) const uint ONES_LANES = 32u;
+
+// The partial sums of each `ONES_LANES` invocations, below 32.
+shared G1Xyzz parts[ONES_LANES < 32u ? gl_WorkGroupSize.x / ONES_LANES : 1u];
 
 Fp shuffle_down(Fp a, uint delta) {
     Fp r;
@@ -475,12 +481,21 @@ void main() {
         g1_madd(acc, AFFINE_AT(pc.points, digit & 0x7fffffffu), (digit >> 31) != 0u);
     }
 
-    // reduce each run of 32 lanes into its first lane (a lane reads only
-    // lanes above it within the subgroup)
-    for (uint off = 1u; off < 32u;) {
+    // reduce each run of ONES_LANES lanes into its first lane (a lane reads
+    // only lanes above it within the subgroup)
+    for (uint off = 1u; off < ONES_LANES;) {
         G1Xyzz down = shuffle_down(acc, off);
         off <<= 1;
         if ((lane & (off - 1u)) == 0u) g1_add(acc, down);
+    }
+    // then each run of 32 into its first invocation, through shared memory
+    if (ONES_LANES < 32u) {
+        const uint lid = gl_LocalInvocationID.x;
+        if ((lid & (ONES_LANES - 1u)) == 0u) parts[lid / ONES_LANES] = acc;
+        barrier();
+        if ((lid & 31u) == 0u) {
+            for (uint j = 1u; j < 32u / ONES_LANES; j++) g1_add(acc, parts[lid / ONES_LANES + j]);
+        }
     }
 
     if ((tid & 31u) == 0u) XYZZ_AT(pc.ones, tid / 32u) = acc;
