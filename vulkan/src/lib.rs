@@ -117,7 +117,8 @@ pub mod ctx;
 pub mod device;
 mod tuning;
 
-use ctx::Vulkan;
+/// The Vulkan backend of `midnight-accel`, for code generic over the backend.
+pub use ctx::Vulkan;
 pub use device::{Variant, VulkanInfo};
 /// MSM path and plan of one call (feature `test-support`).
 #[cfg(any(test, feature = "test-support"))]

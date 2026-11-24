@@ -11,10 +11,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Build script: sets the `midnight_gpu_linked` cfg with the `cuda` feature
-//! and `midnight_metal_linked` with `metal`, marking builds in which the
-//! device crate and the `gpu` feature of `midnight-proofs` are linked (see
-//! `src/device.rs`).
+//! Build script: sets the `midnight_gpu_linked` cfg with the `cuda` feature,
+//! `midnight_metal_linked` with `metal` and `midnight_vulkan_linked` with
+//! `vulkan`, marking builds in which the device crate and the `gpu` feature
+//! of `midnight-proofs` are linked (see `src/device.rs`).
 
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(midnight_gpu_linked)");
@@ -25,6 +25,10 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(midnight_metal_linked)");
     if std::env::var_os("CARGO_FEATURE_METAL").is_some() {
         println!("cargo::rustc-cfg=midnight_metal_linked");
+    }
+    println!("cargo::rustc-check-cfg=cfg(midnight_vulkan_linked)");
+    if std::env::var_os("CARGO_FEATURE_VULKAN").is_some() {
+        println!("cargo::rustc-cfg=midnight_vulkan_linked");
     }
     println!("cargo::rerun-if-changed=build.rs");
 }

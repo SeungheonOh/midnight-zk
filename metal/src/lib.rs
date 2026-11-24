@@ -87,12 +87,15 @@ pub use midnight_accel::{
 
 #[cfg(target_os = "macos")]
 pub mod ctx;
+/// The Metal backend of `midnight-accel`, for code generic over the backend.
 #[cfg(target_os = "macos")]
-use ctx::Metal;
+pub use ctx::Metal;
 #[cfg(not(target_os = "macos"))]
 mod stub;
+/// The Metal backend of `midnight-accel`, for code generic over the backend:
+/// a type without values on this target.
 #[cfg(not(target_os = "macos"))]
-use stub::Metal;
+pub use stub::Metal;
 mod tuning;
 
 /// MSM path and plan of one call (feature `test-support`).

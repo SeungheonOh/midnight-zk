@@ -26,7 +26,11 @@ cuda = ["dep:midnight-gpu", "midnight-gpu/cuda", "midnight-proofs/gpu"]
 # device layer tries CUDA first (the hooks of `midnight-proofs` are installed once per
 # process). On a target other than macOS the build compiles and the device layer
 # reports no device.
-metal = ["dep:midnight-metal", "midnight-proofs/gpu"]
+metal = ["dep:midnight-metal", "dep:midnight-accel", "midnight-proofs/gpu"]
+# Route proof phases to a Vulkan GPU through `midnight-vulkan`. With `cuda` or `metal`
+# also on, the device layer tries CUDA, then Metal, then Vulkan. Without a Vulkan loader,
+# a usable device, or the shader tools at build time, the device layer reports no device.
+vulkan = ["dep:midnight-vulkan", "dep:midnight-accel", "midnight-proofs/gpu"]
 # The seeded prover entry `ProverService::prove_seeded`, for byte-identity tests only.
 # It turns on the test switches of the hook layer (seeded quotient blinding). The daemon
 # never takes a seed.
@@ -52,6 +56,8 @@ midnight-zk-stdlib = { version = "3.0.0-rc.1", path = "../zk_stdlib" }
 midnight-circuits = { version = "8.0.0-rc.1" }
 midnight-gpu = { version = "0.1.0", path = "../gpu", optional = true }
 midnight-metal = { version = "0.1.0", path = "../metal", optional = true }
+midnight-vulkan = { version = "0.1.0", path = "../vulkan", optional = true }
+midnight-accel = { version = "0.1.0", path = "../accel", optional = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true, optional = true }
 rayon = { workspace = true }
@@ -61,9 +67,10 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 midnight-gpu = { version = "0.1.0", path = "../gpu", features = ["test-fault"] }
-# the erasure check's test switches (`ctx::set_plant_nonzero`), for the tests
+# the erasure checks' test switches (`ctx::set_plant_nonzero`), for the tests
 # only: a build of the daemon never gets `test-support`
 midnight-metal = { version = "0.1.0", path = "../metal", features = ["test-support"] }
+midnight-vulkan = { version = "0.1.0", path = "../vulkan", features = ["test-support"] }
 rand_chacha = { workspace = true }
 tempfile = "3"
 
@@ -78,6 +85,10 @@ path = "src/bin/midnight-gpu-prover-client.rs"
 # Seeded proofs on the device and the CPU path, for byte-identity checks.
 # Test builds only: the release image is built without `test-seed`, and
 # `container/check-no-test-seed.sh` checks that.
+[[test]]
+name = "vulkan"
+required-features = ["vulkan"]
+
 [[example]]
 name = "seeded_prove"
 required-features = ["test-seed"]

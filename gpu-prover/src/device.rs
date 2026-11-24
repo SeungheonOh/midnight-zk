@@ -12,22 +12,28 @@
 // limitations under the License.
 
 //! The device layer: the one place where this crate meets the device crates
-//! (the CUDA crate `midnight-gpu`, the Apple GPU crate `midnight-metal`) and
-//! the hook layer `midnight_proofs::gpu`.
+//! (the CUDA crate `midnight-gpu`, the Apple GPU crate `midnight-metal`, the
+//! Vulkan crate `midnight-vulkan`) and the hook layer `midnight_proofs::gpu`.
 //!
-//! The service talks to a device only through the [`Device`] trait. Three
+//! The service talks to a device only through the [`Device`] trait. Four
 //! implementations exist:
 //!
 //! - [`NoDevice`]: no device. Every phase runs on the CPU. Used by a build
-//!   without the `cuda` and `metal` features, by `device = "off"`, and when the
-//!   run-time detection finds no device.
+//!   without the `cuda`, `metal` and `vulkan` features, by `device = "off"`,
+//!   and when the run-time detection finds no device.
 //! - `CudaDevice` (module `cuda`): the hooks of `midnight_proofs::gpu` backed
 //!   by `midnight-gpu`. It is compiled only when the build has the cfg
 //!   `midnight_gpu_linked`, which the build script sets with the `cuda`
 //!   feature.
 //! - `MetalDevice` (module `metal`): the same hooks backed by `midnight-metal`,
-//!   compiled only with the cfg `midnight_metal_linked` (feature `metal`). With
-//!   both features CUDA is tried first.
+//!   compiled only with the cfg `midnight_metal_linked` (feature `metal`).
+//! - `VulkanDevice` (module `vulkan`): the same hooks backed by
+//!   `midnight-vulkan`, compiled only with the cfg `midnight_vulkan_linked`
+//!   (feature `vulkan`).
+//!
+//! `MetalDevice` and `VulkanDevice` are one binding generic over the
+//! `midnight-accel` backend (module `accel`). With several features CUDA is
+//! tried first, then Metal, then Vulkan.
 //!
 //! Tests and embedders can implement [`Device`] themselves, for example to
 //! give the admission ladder a fake memory reading.
@@ -114,7 +120,8 @@ impl Serialize for Phases {
 pub struct DeviceInfo {
     /// Device name as the driver reports it (a GPU model, never a host name).
     pub name: String,
-    /// Compute capability of the device, for example `"12.0"`.
+    /// Compute capability of the device, for example `"12.0"`. Vulkan: the
+    /// PCI vendor and device id.
     pub arch: String,
     /// Device architectures the device code of this build was compiled for.
     pub build_archs: String,
@@ -124,8 +131,8 @@ pub struct DeviceInfo {
     pub driver_version: String,
     /// Total device memory, bytes.
     pub total_bytes: u64,
-    /// Metal only: the log2 size from which each kernel class goes to the
-    /// device; `None` (JSON `null`) for never.
+    /// Metal and Vulkan only: the log2 size from which each kernel class goes
+    /// to the device; `None` (JSON `null`) for never.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub size_thresholds: BTreeMap<String, Option<u32>>,
 }
@@ -189,23 +196,26 @@ pub struct Fallback {
 /// time; no field depends on a scalar value.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct DeviceCounters {
-    /// MSM count. CUDA: the MSMs that ran on the device. Metal: every MSM
-    /// hook invocation, as the served count depends on the scalar values.
+    /// MSM count. CUDA: the MSMs that ran on the device. Metal and Vulkan:
+    /// every MSM hook invocation, as the served count depends on the scalar
+    /// values.
     pub msm_count: u64,
-    /// MSM seconds. CUDA: the wall time of the device MSMs. Metal: the wall
-    /// time of every MSM hook invocation.
+    /// MSM seconds. CUDA: the wall time of the device MSMs. Metal and Vulkan:
+    /// the wall time of every MSM hook invocation.
     pub msm_seconds: f64,
-    /// Metal only: MSM hook invocations the device takes by length and
-    /// bases, without reading a scalar.
+    /// Metal and Vulkan only: MSM hook invocations the device takes by length
+    /// and bases, without reading a scalar.
     pub msm_sized: u64,
-    /// Device calls served, by operation name (no `msm` for Metal).
+    /// Device calls served, by operation name (no `msm` for Metal and
+    /// Vulkan).
     pub calls: BTreeMap<String, u64>,
     /// Fallbacks to the CPU: declines of an admitted phase that the device
     /// should have taken.
     pub fallbacks: Vec<Fallback>,
     /// Every declined hook call by phase and reason, fallbacks included:
     /// also the size threshold (`below-min-k`), no device (`no-device`) and
-    /// the admission's decision (`not-admitted`). Metal: no `msm` row.
+    /// the admission's decision (`not-admitted`). Metal and Vulkan: no `msm`
+    /// row.
     pub declines: Vec<Fallback>,
     /// Peak device bytes this process held during the request, without a
     /// pool of idle buffers.
@@ -383,6 +393,9 @@ pub fn build_features() -> Vec<&'static str> {
     if cfg!(feature = "metal") {
         v.push("metal");
     }
+    if cfg!(feature = "vulkan") {
+        v.push("vulkan");
+    }
     if cfg!(feature = "test-seed") {
         v.push("test-seed");
     }
@@ -392,12 +405,16 @@ pub fn build_features() -> Vec<&'static str> {
     if cfg!(midnight_metal_linked) {
         v.push("midnight-metal-linked");
     }
+    if cfg!(midnight_vulkan_linked) {
+        v.push("midnight-vulkan-linked");
+    }
     v
 }
 
-/// The device of this build and configuration: a CUDA device (feature `cuda`)
-/// or a Metal device (feature `metal`) when the build links the device crates,
-/// `select` is not `off` and one is detected; otherwise [`NoDevice`].
+/// The device of this build and configuration: a CUDA device (feature `cuda`),
+/// a Metal device (feature `metal`) or a Vulkan device (feature `vulkan`), in
+/// that order, when the build links the device crates, `select` is not `off`
+/// and one is detected; otherwise [`NoDevice`].
 pub fn detect(select: crate::config::DeviceSelect) -> Box<dyn Device> {
     if select == crate::config::DeviceSelect::Off {
         return Box::new(NoDevice);
@@ -411,18 +428,25 @@ pub fn detect(select: crate::config::DeviceSelect) -> Box<dyn Device> {
     if let Some(d) = metal::MetalDevice::detect() {
         return Box::new(d);
     }
+    // after a CUDA or Metal device took the hooks this finds no device
+    #[cfg(all(feature = "vulkan", midnight_vulkan_linked))]
+    if let Some(d) = vulkan::VulkanDevice::detect() {
+        return Box::new(d);
+    }
     Box::new(NoDevice)
 }
 
 /// The decline and success classes of the hook contract, and their phases.
 #[cfg(any(
     all(feature = "cuda", midnight_gpu_linked),
-    all(feature = "metal", midnight_metal_linked)
+    all(feature = "metal", midnight_metal_linked),
+    all(feature = "vulkan", midnight_vulkan_linked)
 ))]
 const CLASSES: [&str; 4] = ["msm", "fft", "ifft", "quotient"];
 #[cfg(any(
     all(feature = "cuda", midnight_gpu_linked),
-    all(feature = "metal", midnight_metal_linked)
+    all(feature = "metal", midnight_metal_linked),
+    all(feature = "vulkan", midnight_vulkan_linked)
 ))]
 const PHASES: [Phases; 4] = [Phases::MSM, Phases::FFT, Phases::IFFT, Phases::QUOTIENT];
 
@@ -431,7 +455,8 @@ const PHASES: [Phases; 4] = [Phases::MSM, Phases::FFT, Phases::IFFT, Phases::QUO
 /// quotient only when the key reaches its size threshold).
 #[cfg(any(
     all(feature = "cuda", midnight_gpu_linked),
-    all(feature = "metal", midnight_metal_linked)
+    all(feature = "metal", midnight_metal_linked),
+    all(feature = "vulkan", midnight_vulkan_linked)
 ))]
 fn fallback_rows(
     declines: &[Fallback],
@@ -452,8 +477,15 @@ fn fallback_rows(
         .collect()
 }
 
+#[cfg(any(
+    all(feature = "metal", midnight_metal_linked),
+    all(feature = "vulkan", midnight_vulkan_linked)
+))]
+mod accel;
 #[cfg(all(feature = "metal", midnight_metal_linked))]
 mod metal;
+#[cfg(all(feature = "vulkan", midnight_vulkan_linked))]
+mod vulkan;
 
 /// The binding to `midnight-gpu` and `midnight_proofs::gpu`: every call into
 /// those crates is in this module. Compiled only with the cfg
@@ -1165,6 +1197,15 @@ mod tests {
         const { assert!(cfg!(midnight_metal_linked)) };
         assert!(build_features().contains(&"midnight-metal-linked"));
         let _ = midnight_metal::present();
+    }
+
+    /// Fails when the `vulkan` feature is on but the binding is compiled out.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn vulkan_feature_links_the_device_crates() {
+        const { assert!(cfg!(midnight_vulkan_linked)) };
+        assert!(build_features().contains(&"midnight-vulkan-linked"));
+        let _ = midnight_vulkan::present();
     }
 
     #[test]
