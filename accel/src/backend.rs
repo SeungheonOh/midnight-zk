@@ -187,6 +187,21 @@ pub trait RawBuffer: Send + Sync + 'static {
     /// Called once when the shared code releases the buffer, before it is
     /// dropped.
     fn on_release(&self) {}
+    /// Writes a non-zero byte near the middle of the allocation, behind the
+    /// shared code's back: the test switches' planted byte. `false` when it
+    /// could not. The caller has exclusive use of the buffer. Never panics.
+    #[doc(hidden)]
+    fn write_test_byte(&self) -> bool {
+        match self.host_ptr() {
+            Some(p) => {
+                // SAFETY: the middle byte is inside the allocation; the
+                // caller has exclusive use of the buffer.
+                unsafe { std::ptr::write_volatile(p.as_ptr().add(self.len() / 2), 0xa5) };
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// The encoder of one command buffer. Dispatches and copies run in order,

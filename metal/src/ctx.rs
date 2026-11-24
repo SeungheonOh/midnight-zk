@@ -213,7 +213,8 @@ pub fn plant_in_idle_pool() -> Option<u64> {
     acc::plant_in_idle_pool::<Metal>()
 }
 
-/// The ids of the idle buffers of the pool. Test support.
+/// The ids of the idle buffers of the pool and the staging pool. Test
+/// support.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn idle_pool_ids() -> Vec<u64> {

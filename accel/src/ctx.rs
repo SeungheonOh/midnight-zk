@@ -1128,7 +1128,8 @@ impl<'a, B: Backend> Command<'_, 'a, B> {
                 self.down.swap_remove(i);
                 continue;
             }
-            self.enc.copy(raw, &sh.raw, sh.raw.len())?;
+            // a shadow from the staging pool may be longer than its buffer
+            self.enc.copy(raw, &sh.raw, raw.len())?;
             i += 1;
         }
         Ok(())
@@ -1405,13 +1406,10 @@ mod test_switch {
     }
 
     /// Writes one non-zero byte into the middle of `raw` behind the shared
-    /// code's back (`dirty` not set) through its host mapping, and records its
-    /// id. The caller has exclusive use of the buffer.
+    /// code's back (`dirty` not set, [`RawBuffer::write_test_byte`]), and
+    /// records its id. The caller has exclusive use of the buffer.
     pub(super) fn plant_raw<B: Backend>(raw: &B::Raw) {
-        if let Some(p) = raw.host_ptr() {
-            // SAFETY: the middle byte is inside the allocation; the caller
-            // has exclusive use of the buffer.
-            unsafe { std::ptr::write_volatile(p.as_ptr().add(raw.len() / 2), 0xa5) };
+        if raw.write_test_byte() {
             B::host().switches.last_plant.store(raw.id(), Relaxed);
         }
     }
@@ -1463,11 +1461,16 @@ pub fn plant_in_idle_pool<B: Backend>() -> Option<u64> {
     Some(b.id())
 }
 
-/// The ids of the idle buffers of the pool. Test support.
+/// The ids of the idle buffers of the pool and of the staging pool (the
+/// regions a checked report reads back besides the per-request buffers).
+/// Test support.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn idle_pool_ids<B: Backend>() -> Vec<u64> {
-    pool::<B>().free.iter().map(|b| b.id()).collect()
+    let mut ids: Vec<u64> = pool::<B>().free.iter().map(|b| b.id()).collect();
+    let staging = B::host().staging.lock().unwrap_or_else(|e| e.into_inner());
+    ids.extend(staging.free.iter().map(|b| b.id()));
+    ids
 }
 
 /// Whether every idle pool buffer reads zero. Test support.
@@ -1927,6 +1930,25 @@ mod tests {
         b.host_write(|v: &mut [u64]| v[1] = 7).unwrap();
         c.run(|cmd| cmd.download(&b)).unwrap();
         assert_eq!(got(&b)[1], 7);
+    }
+
+    /// A shadow from the staging pool may be longer than its buffer: a
+    /// download copies the buffer's bytes only.
+    #[test]
+    fn a_longer_shadow_downloads_its_buffer() {
+        let c = context::<Mock>().unwrap();
+        let mut b = c.alloc_pooled(5000).unwrap();
+        b.host_write(|v: &mut [u8]| v.fill(1)).unwrap();
+        drop(b);
+        let data: Vec<u64> = (1..=512).collect();
+        let b = c.upload(&data).unwrap();
+        c.run(|cmd| {
+            cmd.dispatch("double", 512, &[Arg::Buffer(&b)], &())?;
+            cmd.download(&b)
+        })
+        .unwrap();
+        let got = b.host_read(|v: &[u64]| v.to_vec()).unwrap();
+        assert_eq!(got, data.iter().map(|v| 2 * v).collect::<Vec<_>>());
     }
 
     /// A buffer and its shadow are zeroed together and both pools stay zero.
