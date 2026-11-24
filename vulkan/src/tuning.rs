@@ -83,8 +83,51 @@ pub(crate) const TUNING: Tuning = Tuning {
     pool_divisor: 4,
 };
 
-/// The constants of discrete GPUs (device memory the host does not map).
-pub(crate) const DISCRETE: Tuning = Tuning { ..TUNING };
+/// `(log2 n, wbits, chunks)` of the MSM on a discrete GPU.
+const DISCRETE_MSM_WINDOWS: &[(u32, u32, usize)] = &[
+    (13, 11, 1),
+    (14, 11, 1),
+    (15, 11, 1),
+    (16, 13, 1),
+    (17, 13, 1),
+    (18, 14, 1),
+    (19, 15, 1),
+    (20, 16, 1),
+    (21, 16, 1),
+    (22, 16, 1),
+];
+
+/// The device share of the MSM on a discrete GPU, in 64ths: a desktop CPU
+/// next to it takes a larger part than Apple's cores do.
+const DISCRETE_MSM_SHARES: &[(u32, usize, usize)] = &[
+    (13, 40, 40),
+    (14, 32, 40),
+    (15, 32, 40),
+    (16, 32, 48),
+    (17, 32, 52),
+    (18, 36, 40),
+    (19, 40, 40),
+    (20, 40, 40),
+    (21, 40, 48),
+    (22, 40, 44),
+];
+
+/// The constants of discrete GPUs (device memory the host does not map),
+/// measured on an RDNA2 GPU next to a 16-core desktop CPU.
+pub(crate) const DISCRETE: Tuning = Tuning {
+    thresholds: Thresholds {
+        fft: 15,
+        ifft: 15,
+        // below, the upload and the fixed cost exceed the CPU MSM
+        msm_table: 15,
+        msm_one_shot: None,
+        quotient: 14,
+        explicit: false,
+    },
+    msm_windows: DISCRETE_MSM_WINDOWS,
+    msm_shares: DISCRETE_MSM_SHARES,
+    ..TUNING
+};
 
 /// The constants of `info`'s device class: [`DISCRETE`] for a GPU whose
 /// memory the host does not map, else [`TUNING`] (Apple GPUs through

@@ -136,9 +136,9 @@ pub use midnight_accel::QuotientStages;
 #[doc(hidden)]
 pub use midnight_accel::quotient::abi as quotient_abi;
 
-/// Per-class break-evens against the stock CPU code: the Metal backend's
-/// until measured on Vulkan devices. The one-shot MSM never breaks even
-/// because of its G1 check.
+/// Per-class break-evens against the stock CPU code on a unified-memory
+/// device: the Metal backend's. A discrete GPU has its own ([`thresholds`]).
+/// The one-shot MSM never breaks even because of its G1 check.
 pub const DEFAULT_THRESHOLDS: Thresholds = tuning::TUNING.thresholds;
 
 // ---------------------------------------------------------------------------
