@@ -1,0 +1,32 @@
+[package]
+name = "midnight-vulkan"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = """
+Vulkan compute kernels for the midnight-proofs accelerator hooks: BLS12-381 field and G1 arithmetic and the device context
+"""
+license = "Apache-2.0"
+categories = ["cryptography"]
+keywords = ["vulkan", "gpu", "msm", "ntt", "zkp"]
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Test only: the test and measurement kernels, for this crate's tests.
+test-support = []
+
+[dependencies]
+ash = { version = "0.38.0", default-features = false, features = ["loaded", "std", "debug"] }
+
+[dev-dependencies]
+midnight-vulkan = { path = ".", features = ["test-support"] }
+blst = "0.3.15"
+ff = { workspace = true }
+group = { workspace = true }
+midnight-curves = { path = "../curves" }
+rand_chacha = { workspace = true }
+rand_core = { workspace = true }
