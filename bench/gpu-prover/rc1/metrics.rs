@@ -206,10 +206,86 @@ pub mod device {
             kzg::params::ParamsKZG,
         },
     };
-    use midnight_vulkan as vulkan;
+    use std::{
+        ffi::c_void,
+        sync::atomic::{AtomicU64, Ordering::Relaxed},
+        time::Instant,
+    };
+
+    use midnight_vulkan::{self as vulkan, G1AffineLimbs, G1JacobianLimbs, Scalar};
 
     use super::Metrics;
     use crate::{Key, Result};
+
+    /// Wall time inside each hook (MSM, FFT, inverse FFT, quotient), served
+    /// or declined, in nanoseconds since `begin`.
+    static WALL: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+    fn timed<R>(class: usize, f: impl FnOnce() -> R) -> R {
+        let t = Instant::now();
+        let r = f();
+        WALL[class].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        r
+    }
+
+    fn msm_g1(s: &[Scalar], b: &[G1AffineLimbs]) -> Option<G1JacobianLimbs> {
+        timed(0, || vulkan::msm_g1(s, b))
+    }
+
+    fn fft(a: &mut [Scalar], omega: Scalar, log_n: u32) -> bool {
+        timed(1, || vulkan::fft(a, omega, log_n))
+    }
+
+    fn ifft(a: &mut [Scalar], omega_inv: Scalar, log_n: u32, divisor: Scalar) -> bool {
+        timed(2, || vulkan::ifft(a, omega_inv, log_n, divisor))
+    }
+
+    /// # Safety
+    /// As [`vulkan::quotient`].
+    unsafe fn quotient(job: *const c_void, out: &mut [Scalar]) -> bool {
+        // SAFETY: the prover's job, passed through unchanged.
+        timed(3, || unsafe { vulkan::quotient(job, out) })
+    }
+
+    /// One stderr line of where the proof's device time went: per hook
+    /// class the wall time inside the hook and the GPU time of the calls
+    /// served, then the host's copies, zeroing and command buffers.
+    fn report_phases() {
+        let ms = |ns: u64| ns as f64 * 1e-6;
+        let st = vulkan::stats();
+        let h = vulkan::host_times();
+        let w = |i: usize| ms(WALL[i].load(Relaxed));
+        eprintln!(
+            "phases_ms msm {:.1}/{:.1} fft {:.1}/{:.1} ifft {:.1}/{:.1} quotient {:.1}/{:.1} \
+             copy {:.1} zero {:.1} zero_bg {:.1} runs {} run {:.1}/{:.1} (wall/gpu)",
+            w(0),
+            ms(st.msm.device_nanos),
+            w(1),
+            ms(st.fft.device_nanos),
+            w(2),
+            ms(st.ifft.device_nanos),
+            w(3),
+            ms(st.quotient.device_nanos),
+            ms(h.copy_nanos),
+            ms(h.zero_nanos),
+            ms(h.zero_background_nanos),
+            h.runs,
+            ms(h.run_nanos),
+            ms(h.run_gpu_nanos),
+        );
+        // the pipelines are made in the first (cold) proof
+        static LISTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let mut p = vulkan::pipeline_times();
+        if !p.is_empty() && !LISTED.swap(true, Relaxed) {
+            p.sort_by_key(|x| std::cmp::Reverse(x.2));
+            let total: f64 = p.iter().map(|x| x.2.as_secs_f64() * 1e3).sum();
+            let list: Vec<String> = p
+                .iter()
+                .map(|(k, wg, t)| format!("{k}/{wg} {:.1}", t.as_secs_f64() * 1e3))
+                .collect();
+            eprintln!("pipelines_ms total {total:.1}: {}", list.join(", "));
+        }
+    }
 
     /// The device model and the budget of its device-local memory in bytes.
     pub fn info() -> Result<(String, u64)> {
@@ -238,10 +314,10 @@ pub mod device {
         let key =
             vulkan::register_key(&polys.iter().map(|p| adapter::scalars(p)).collect::<Vec<_>>());
         if !hooks::install(hooks::GpuHooks {
-            msm_g1: Some(vulkan::msm_g1),
-            fft: Some(vulkan::fft),
-            ifft: Some(vulkan::ifft),
-            quotient: Some(vulkan::quotient),
+            msm_g1: Some(msm_g1),
+            fft: Some(fft),
+            ifft: Some(ifft),
+            quotient: Some(quotient),
         }) {
             return Err("hooks already installed".into());
         }
@@ -255,12 +331,16 @@ pub mod device {
         vulkan::begin_request();
         vulkan::reset_stats();
         hooks::reset_hook_declines();
+        for w in &WALL {
+            w.store(0, Relaxed);
+        }
         Baseline
     }
 
     /// The crate counts no transfers: the transfer and staging counters are
     /// 0, also on a discrete GPU.
     pub fn finish(_: Baseline) -> Result<Metrics> {
+        report_phases();
         let stats = vulkan::stats();
         let hook_declines = hooks::hook_declines();
         let declines = vulkan::declines();
