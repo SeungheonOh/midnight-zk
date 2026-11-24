@@ -66,7 +66,10 @@ pub(crate) const TUNING: Tuning = Tuning {
     msm_sort_groups: 8,
     // sppark: `sm_count` blocks
     msm_ones_groups: 32,
-    msm_hot_bucket_limit: 1 << 16,
+    // one invocation sums a bucket serially: this bound keeps that chain far
+    // below the watchdog of AMD's graphics ring (10 s), also on integrated
+    // GPUs, whose single-thread rate is a fraction of a discrete GPU's
+    msm_hot_bucket_limit: 1 << 12,
     // crossovers against the stock CPU MSM: `n/5` at large `n`, plus a fixed
     // part for the device's fixed cost near the threshold
     msm_sparse_div: 5,

@@ -418,7 +418,8 @@ pub fn msm_odd_lengths<B: Backend>() {
 }
 
 /// Scalars at the boundary of the `abs` step of `msm_digits`, raw and as
-/// `B - mask_i` so the masked value on the device is `B`.
+/// `B - mask_i` so the masked value on the device is `B`. Few distinct
+/// values fill few buckets: the size stays within the hot-bucket limit.
 pub fn abs_boundary_scalars_match_cpu<B: Backend>() {
     let _g = setup::<B>(Some(0), true);
     let half = Fq::from(2).invert().unwrap();
@@ -432,7 +433,7 @@ pub fn abs_boundary_scalars_match_cpu<B: Backend>() {
         (top + Fq::ONE) * p2(224) - Fq::ONE, // top limb of s and r - s equal
         top * p2(224),                       // top limbs next to each other
     ];
-    let n = 1usize << 14;
+    let n = (1usize << 14).min(B::TUNING.msm_hot_bucket_limit as usize);
     let bases = &points_cache()[..n];
     let mask = mask_fq(n);
     for split in [false, true] {
@@ -495,9 +496,9 @@ pub fn wide_windows_and_chunks_match_cpu<B: Backend>() {
 /// `s_i = c - mask_i` puts every point of a window in one bucket: exact up
 /// to the hot-bucket limit, a `device-error` decline above it.
 pub fn hot_bucket_is_exact_or_declined<B: Backend>() {
-    let _g = setup::<B>(Some(14), true);
-    let c = Fq::random(ChaCha8Rng::seed_from_u64(4242));
     let lim = B::TUNING.msm_hot_bucket_limit.ilog2();
+    let _g = setup::<B>(Some(lim.min(14)), true);
+    let c = Fq::random(ChaCha8Rng::seed_from_u64(4242));
     for (k, served) in [(lim, true), (lim + 1, false)] {
         let n = 1usize << k;
         let bases = &points_cache()[..n];
