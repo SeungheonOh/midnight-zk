@@ -71,6 +71,22 @@ uint grid_threads() {
 // ---------------------------------------------------------------------------
 // 64-bit values as (low, high) word pairs, and device addresses.
 
+// a * b as (low, high) words. Not `umulExtended`: SPIRV-Cross (MoltenVK)
+// emits it as a call to a function compiled without optimisation. Variant
+// B multiplies the 16-bit halves.
+uvec2 mul32(uint a, uint b) {
+#if MONT_INT64
+    uint64_t p = uint64_t(a) * b;
+    return uvec2(uint(p), uint(p >> 32));
+#else
+    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
+    uint ll = al * bl, lh = al * bh, hl = ah * bl;
+    // below 3 * 2^16: no overflow
+    uint mid = (ll >> 16) + (lh & 0xffffu) + (hl & 0xffffu);
+    return uvec2((ll & 0xffffu) | (mid << 16), ah * bh + (lh >> 16) + (hl >> 16) + (mid >> 16));
+#endif
+}
+
 uvec2 add64(uvec2 a, uvec2 b) {
     uint c;
     uint lo = uaddCarry(a.x, b.x, c);
@@ -79,16 +95,13 @@ uvec2 add64(uvec2 a, uvec2 b) {
 
 // a * b mod 2^64.
 uvec2 mul64(uvec2 a, uvec2 b) {
-    uint hi, lo;
-    umulExtended(a.x, b.x, hi, lo);
-    return uvec2(lo, hi + a.x * b.y + a.y * b.x);
+    uvec2 p = mul32(a.x, b.x);
+    return uvec2(p.x, p.y + a.x * b.y + a.y * b.x);
 }
 
 // The address of element i of `size` bytes from `base`.
 uvec2 addr_at(uvec2 base, uint i, uint size) {
-    uvec2 off;
-    umulExtended(i, size, off.y, off.x);
-    return add64(base, off);
+    return add64(base, mul32(i, size));
 }
 
 // The address of element i (a 64-bit index) of `size` bytes from `base`.

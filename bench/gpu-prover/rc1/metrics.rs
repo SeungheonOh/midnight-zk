@@ -17,6 +17,53 @@ pub struct Metrics {
     pub peak_bytes: u64,
 }
 
+/// One stderr line of where a proof's device time went: per hook class
+/// (MSM, FFT, inverse FFT, quotient) the wall time inside the hook and the
+/// GPU time of the calls served, then the host's copies, zeroing and command
+/// buffers (`[copy, zero, zero_bg, runs, run wall, run gpu]`). Nanoseconds in,
+/// milliseconds out.
+#[cfg(any(feature = "rc1-bench-metal", feature = "rc1-bench-vulkan"))]
+pub fn report_phases(wall: [u64; 4], gpu: [u64; 4], host: [u64; 6]) {
+    let ms = |ns: u64| ns as f64 * 1e-6;
+    eprintln!(
+        "phases_ms msm {:.1}/{:.1} fft {:.1}/{:.1} ifft {:.1}/{:.1} quotient {:.1}/{:.1} copy {:.1} \
+         zero {:.1} zero_bg {:.1} runs {} run {:.1}/{:.1} (wall/gpu)",
+        ms(wall[0]),
+        ms(gpu[0]),
+        ms(wall[1]),
+        ms(gpu[1]),
+        ms(wall[2]),
+        ms(gpu[2]),
+        ms(wall[3]),
+        ms(gpu[3]),
+        ms(host[0]),
+        ms(host[1]),
+        ms(host[2]),
+        host[3],
+        ms(host[4]),
+        ms(host[5]),
+    );
+}
+
+/// Wall time inside each hook (MSM, FFT, inverse FFT, quotient), served or
+/// declined, in nanoseconds since the last [`reset_wall`].
+#[cfg(any(feature = "rc1-bench-metal", feature = "rc1-bench-vulkan"))]
+static WALL: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[cfg(any(feature = "rc1-bench-metal", feature = "rc1-bench-vulkan"))]
+fn timed<R>(class: usize, f: impl FnOnce() -> R) -> R {
+    let t = std::time::Instant::now();
+    let r = f();
+    WALL[class].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    r
+}
+
+#[cfg(any(feature = "rc1-bench-metal", feature = "rc1-bench-vulkan"))]
+fn reset_wall() -> [u64; 4] {
+    WALL.each_ref().map(|w| w.swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 #[cfg(feature = "rc1-bench-cuda")]
 pub mod device {
     use midnight_curves::Bls12;
@@ -110,7 +157,9 @@ pub mod device {
 #[cfg(all(feature = "rc1-bench-metal", not(feature = "rc1-bench-cuda")))]
 pub mod device {
     use midnight_curves::Bls12;
-    use midnight_metal as metal;
+    use std::ffi::c_void;
+
+    use midnight_metal::{self as metal, G1AffineLimbs, G1JacobianLimbs, Scalar};
     use midnight_proofs::{
         gpu::{self as hooks, adapter},
         poly::{
@@ -119,8 +168,27 @@ pub mod device {
         },
     };
 
-    use super::Metrics;
+    use super::{Metrics, timed};
     use crate::{Key, Result};
+
+    fn msm_g1(s: &[Scalar], b: &[G1AffineLimbs]) -> Option<G1JacobianLimbs> {
+        timed(0, || metal::msm_g1(s, b))
+    }
+
+    fn fft(a: &mut [Scalar], omega: Scalar, log_n: u32) -> bool {
+        timed(1, || metal::fft(a, omega, log_n))
+    }
+
+    fn ifft(a: &mut [Scalar], omega_inv: Scalar, log_n: u32, divisor: Scalar) -> bool {
+        timed(2, || metal::ifft(a, omega_inv, log_n, divisor))
+    }
+
+    /// # Safety
+    /// As [`metal::quotient`].
+    unsafe fn quotient(job: *const c_void, out: &mut [Scalar]) -> bool {
+        // SAFETY: the prover's job, passed through unchanged.
+        timed(3, || unsafe { metal::quotient(job, out) })
+    }
 
     /// The device model and its recommended working set in bytes.
     pub fn info() -> Result<(String, u64)> {
@@ -148,10 +216,10 @@ pub mod device {
         let key =
             metal::register_key(&polys.iter().map(|p| adapter::scalars(p)).collect::<Vec<_>>());
         if !hooks::install(hooks::GpuHooks {
-            msm_g1: Some(metal::msm_g1),
-            fft: Some(metal::fft),
-            ifft: Some(metal::ifft),
-            quotient: Some(metal::quotient),
+            msm_g1: Some(msm_g1),
+            fft: Some(fft),
+            ifft: Some(ifft),
+            quotient: Some(quotient),
         }) {
             return Err("hooks already installed".into());
         }
@@ -165,12 +233,26 @@ pub mod device {
         metal::begin_request();
         metal::reset_stats();
         hooks::reset_hook_declines();
+        super::reset_wall();
         Baseline
     }
 
     /// Unified memory: the transfer and staging counters are 0.
     pub fn finish(_: Baseline) -> Result<Metrics> {
         let stats = metal::stats();
+        let h = metal::host_times();
+        super::report_phases(
+            super::reset_wall(),
+            [stats.msm, stats.fft, stats.ifft, stats.quotient].map(|c| c.device_nanos),
+            [
+                h.copy_nanos,
+                h.zero_nanos,
+                h.zero_background_nanos,
+                h.runs,
+                h.run_nanos,
+                h.run_gpu_nanos,
+            ],
+        );
         let hook_declines = hooks::hook_declines();
         let declines = metal::declines();
         let peak_bytes = metal::device_bytes().1;
@@ -206,27 +288,12 @@ pub mod device {
             kzg::params::ParamsKZG,
         },
     };
-    use std::{
-        ffi::c_void,
-        sync::atomic::{AtomicU64, Ordering::Relaxed},
-        time::Instant,
-    };
+    use std::{ffi::c_void, sync::atomic::Ordering::Relaxed};
 
     use midnight_vulkan::{self as vulkan, G1AffineLimbs, G1JacobianLimbs, Scalar};
 
-    use super::Metrics;
+    use super::{Metrics, timed};
     use crate::{Key, Result};
-
-    /// Wall time inside each hook (MSM, FFT, inverse FFT, quotient), served
-    /// or declined, in nanoseconds since `begin`.
-    static WALL: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-
-    fn timed<R>(class: usize, f: impl FnOnce() -> R) -> R {
-        let t = Instant::now();
-        let r = f();
-        WALL[class].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
-        r
-    }
 
     fn msm_g1(s: &[Scalar], b: &[G1AffineLimbs]) -> Option<G1JacobianLimbs> {
         timed(0, || vulkan::msm_g1(s, b))
@@ -247,31 +314,24 @@ pub mod device {
         timed(3, || unsafe { vulkan::quotient(job, out) })
     }
 
-    /// One stderr line of where the proof's device time went: per hook
-    /// class the wall time inside the hook and the GPU time of the calls
-    /// served, then the host's copies, zeroing and command buffers.
+    /// The phase line ([`super::report_phases`]), the per-kernel GPU times
+    /// with `MIDNIGHT_VULKAN_PROFILE=1`, and after the first proof the
+    /// pipelines' creation times.
     fn report_phases() {
         let ms = |ns: u64| ns as f64 * 1e-6;
         let st = vulkan::stats();
         let h = vulkan::host_times();
-        let w = |i: usize| ms(WALL[i].load(Relaxed));
-        eprintln!(
-            "phases_ms msm {:.1}/{:.1} fft {:.1}/{:.1} ifft {:.1}/{:.1} quotient {:.1}/{:.1} \
-             copy {:.1} zero {:.1} zero_bg {:.1} runs {} run {:.1}/{:.1} (wall/gpu)",
-            w(0),
-            ms(st.msm.device_nanos),
-            w(1),
-            ms(st.fft.device_nanos),
-            w(2),
-            ms(st.ifft.device_nanos),
-            w(3),
-            ms(st.quotient.device_nanos),
-            ms(h.copy_nanos),
-            ms(h.zero_nanos),
-            ms(h.zero_background_nanos),
-            h.runs,
-            ms(h.run_nanos),
-            ms(h.run_gpu_nanos),
+        super::report_phases(
+            super::reset_wall(),
+            [st.msm, st.fft, st.ifft, st.quotient].map(|c| c.device_nanos),
+            [
+                h.copy_nanos,
+                h.zero_nanos,
+                h.zero_background_nanos,
+                h.runs,
+                h.run_nanos,
+                h.run_gpu_nanos,
+            ],
         );
         let k = vulkan::device::kernel_profile();
         if !k.is_empty() {
@@ -337,9 +397,7 @@ pub mod device {
         vulkan::begin_request();
         vulkan::reset_stats();
         hooks::reset_hook_declines();
-        for w in &WALL {
-            w.store(0, Relaxed);
-        }
+        super::reset_wall();
         Baseline
     }
 

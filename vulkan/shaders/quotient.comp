@@ -98,8 +98,7 @@ uint rotate(uint idx, int rot) {
 
 // The address of scratch slot `i` of this invocation.
 uvec2 scratch_at(uint i) {
-    uvec2 e;
-    umulExtended(i, P.threads, e.y, e.x);
+    const uvec2 e = mul32(i, P.threads);
     return addr_at64(pc.scratch, add64(e, uvec2(g_tid, 0u)), 32u);
 }
 

@@ -81,8 +81,8 @@ use std::ffi::c_void;
 
 use midnight_accel as accel;
 pub use midnight_accel::{
-    ClassStats, G1AffineLimbs, G1JacobianLimbs, MAX_LOG_N, MAX_MSM_LOG, Scalar, Stats, Thresholds,
-    WipeStats, field,
+    ClassStats, G1AffineLimbs, G1JacobianLimbs, HostTimes, MAX_LOG_N, MAX_MSM_LOG, Scalar, Stats,
+    Thresholds, WipeStats, field,
 };
 
 #[cfg(target_os = "macos")]
@@ -210,6 +210,12 @@ pub fn reset_min_k() {
 /// The service counters since the last [`reset_stats`].
 pub fn stats() -> Stats {
     accel::stats::<Metal>()
+}
+
+/// The host time around the device work since the last [`reset_stats`]:
+/// copies, zeroing and command buffers.
+pub fn host_times() -> HostTimes {
+    accel::host_times::<Metal>()
 }
 
 /// Every decline since the last [`reset_stats`]: `(class, reason, count)`.
