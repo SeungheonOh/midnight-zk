@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// A diagnostic kernel of the device context (src/ctx.rs).
+// A diagnostic kernel of the device context (src/device.rs).
 
 #extension GL_GOOGLE_include_directive : require
 

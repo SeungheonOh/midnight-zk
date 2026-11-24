@@ -1340,6 +1340,7 @@ dependencies = [
  "blst",
  "ff",
  "group",
+ "midnight-accel",
  "midnight-curves",
  "midnight-vulkan",
  "rand_chacha",

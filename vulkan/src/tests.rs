@@ -20,7 +20,7 @@ use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 
 use crate::{
-    Error, Grid, Params, PipelineOptions, Variant,
+    device::{Error, Grid, Params, PipelineOptions, Variant},
     test_support::{context, run},
 };
 
@@ -307,4 +307,43 @@ fn dispatch_grid_and_errors() {
     assert!(matches!(e, Error::Invalid(_)), "{e}");
     drop(cmds);
     assert!(!c.failed());
+}
+
+/// Device buffers are mapped on a unified device and never with
+/// `MIDNIGHT_VULKAN_DISCRETE=1`; staging buffers always are. Fills and
+/// read-backs run on the GPU either way.
+#[test]
+fn buffers_follow_the_memory_mode() {
+    let c = context();
+    let info = c.info();
+    if std::env::var(crate::ctx::DISCRETE_ENV).as_deref() == Ok("1") {
+        assert!(!info.unified_memory);
+    }
+    let b = c.alloc(4096 + 4).unwrap();
+    assert_eq!(b.is_mapped(), info.unified_memory);
+    assert!(c.staging(4096).unwrap().is_mapped());
+    c.fill(&b, 0, None, 0x0102_0304).unwrap();
+    c.fill(&b, 8, Some(4), 0).unwrap();
+    let mut bytes = Vec::new();
+    let all = c.read_chunks(&b, |p| {
+        bytes.extend_from_slice(p);
+        true
+    });
+    assert!(all.unwrap());
+    let words: Vec<u32> =
+        bytes.chunks(4).map(|w| u32::from_ne_bytes(w.try_into().unwrap())).collect();
+    assert_eq!(words.len(), 1025);
+    assert!(
+        words
+            .iter()
+            .enumerate()
+            .all(|(i, w)| *w == if i == 2 { 0 } else { 0x0102_0304 })
+    );
+    assert!(matches!(c.fill(&b, 2, Some(4), 0), Err(Error::Invalid(_))));
+    assert!(matches!(
+        c.fill(&b, 4096, Some(8), 0),
+        Err(Error::Invalid(_))
+    ));
+    let (used, total) = c.budget();
+    assert!(used > 0 && total > 0, "{used} of {total}");
 }

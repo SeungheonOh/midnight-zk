@@ -17,7 +17,7 @@
 #![allow(dead_code)]
 
 use blst::{blst_fp, blst_fp_mul};
-use midnight_curves::{Fq, G1Affine, G1Projective};
+use midnight_curves::{G1Affine, G1Projective};
 
 /// An XYZZ record: `X`, `Y`, `ZZZ`, `ZZ` in `Fp` limbs.
 pub type Xyzz = [u64; 24];
@@ -51,14 +51,6 @@ pub fn from_jacobian(a: [u64; 18]) -> G1Projective {
     unsafe { std::mem::transmute_copy(&a) }
 }
 
-/// The limbs of a scalar (`blst_fr`).
-pub fn scalar(a: &Fq) -> [u64; 4] {
-    const { assert!(size_of::<Fq>() == size_of::<[u64; 4]>()) };
-    // SAFETY: `Fq` is a transparent `blst_fr`, `[u64; 4]` (size checked
-    // above).
-    unsafe { std::mem::transmute_copy(a) }
-}
-
 pub fn fp(l: &[u64]) -> blst_fp {
     blst_fp {
         l: l.try_into().unwrap(),
@@ -89,11 +81,6 @@ pub fn xyzz_point(r: &Xyzz) -> G1Projective {
     from_jacobian(j)
 }
 
-/// The limbs of scalars.
-pub fn scalars(a: &[Fq]) -> Vec<[u64; 4]> {
-    a.iter().map(scalar).collect()
-}
-
 /// The CUDA crate's mask vector (gpu/src/msm.rs `mask_vector`) from
 /// element `i0` on: the splitmix64 stream advanced by `4 i0` outputs.
 pub fn cuda_mask_vector(i0: u64, n: usize) -> Vec<[u64; 4]> {
@@ -107,10 +94,4 @@ pub fn cuda_mask_vector(i0: u64, n: usize) -> Vec<[u64; 4]> {
         z ^ (z >> 31)
     };
     (0..n).map(|_| [next(), next(), next(), next() >> 3]).collect()
-}
-
-/// The scalar of reduced Montgomery limbs.
-pub fn fq(a: &[u64; 4]) -> Fq {
-    // SAFETY: as `scalar`; `a` is reduced.
-    unsafe { std::mem::transmute_copy(a) }
 }

@@ -11,1410 +11,808 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The Vulkan device context: one device, one compute queue, the embedded
-//! compute pipelines, buffers, and recorded command buffers that are
-//! submitted and waited for.
+//! The Vulkan backend of `midnight-accel`: the device of [`crate::device`],
+//! made at first use ([`context`]), with its arithmetic variant; and this
+//! crate's names for the shared device context of `midnight_accel::ctx`, with
+//! [`Vulkan`] as the backend.
 //!
-//! # Kernel interface
+//! ```ignore
+//! let mut s = ctx::lock()?;                  // serialises device work
+//! let a = s.ctx().upload(scalars)?;           // a scoped, zeroed-on-drop buffer
+//! let tw = s.scratch("ntt-twiddles", bytes)?; // a per-request buffer
+//! let ns = s.ctx().run(|c| {
+//!     c.dispatch("ntt_radix2", n / 2, &[Arg::Buffer(&a)], &(n as u32))?;
+//!     Ok(())
+//! })?.1;
+//! a.read(out);
+//! ```
 //!
-//! A kernel binds no descriptor. It reads one push-constant block of at most
-//! [`MAX_PARAMS_BYTES`] bytes ([`Params`]): the device addresses of its
-//! buffers first (`bufferDeviceAddress`, 8 bytes each), then its scalar
-//! parameters. A parameter struct too large for the block is passed in a
-//! buffer whose address is in the block. Every pipeline shares one pipeline
-//! layout (that push-constant range alone).
+//! [`Vulkan::run`] records dispatches and copies into one command buffer,
+//! each ordered after the writes of the earlier ones, submits it and waits.
+//! A kernel's push-constant block holds the device addresses of its buffers
+//! in list order (with each argument's byte offset), then its parameter
+//! block, then, for the elementwise NTT kernels, the dispatch's element
+//! count. The quotient numerator's parameter block is larger than a
+//! push-constant block: it is copied into a small host-visible buffer of the
+//! run, whose address ends the block. The workgroup width and the NTT pass's
+//! shared memory are specialization constants of the cached pipelines; the
+//! MSM pipelines run in subgroups of 32.
 //!
-//! Specialization constant 0 is the workgroup width; constants 1 to 3 are
-//! per-kernel tunables ([`PipelineOptions::spec`]).
-//!
-//! The dispatches of one [`Commands`] run in order: each one waits for the
-//! memory writes of everything recorded before it, as in a serial Metal
-//! encoder.
-//!
-//! Every Vulkan failure is a returned [`Error`]. `VK_ERROR_DEVICE_LOST`
-//! latches the context as failed: every later call returns
-//! [`Error::Failed`].
+//! On a unified device every buffer is mapped for the host, as on Metal. On a
+//! discrete one device buffers are device-local and unmapped: the shared
+//! code reaches them through staging shadows ([`Backend::alloc_staging`],
+//! [`Encoder::copy`]), and buffers are zeroed and read back on the GPU.
 
 use std::{
-    collections::HashMap,
-    ffi::{CStr, c_char},
-    fmt,
-    io::Cursor,
-    marker::PhantomData,
+    cell::Cell,
     ptr::NonNull,
-    sync::{
-        Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::{Duration, Instant},
+    sync::{Mutex, OnceLock},
 };
 
-use ash::vk;
+pub use midnight_accel::ctx::{Error, Pod, ReadBack, bytes_of};
+use midnight_accel::{Backend, DeviceInfo, Encoder, HostState, RawBuffer, Tuning, ctx as acc};
 
-/// The environment variable naming the Vulkan loader library to load
-/// instead of the system's (`libvulkan.so.1`, `libvulkan.dylib`,
-/// `vulkan-1.dll`).
-pub const LOADER_ENV: &str = "MIDNIGHT_VULKAN_LOADER";
-/// The bytes of push constants a kernel's params block may take: the
-/// minimum `maxPushConstantsSize` Vulkan guarantees.
-pub const MAX_PARAMS_BYTES: u32 = 128;
-/// The specialization constants after the workgroup width (ids `1..=3`).
-pub const SPEC_CONSTANTS: usize = 3;
-/// The workgroup width of [`PipelineOptions::default`].
-pub const DEFAULT_WORKGROUP: u32 = 256;
+use crate::device::{self, Commands, Context, Grid, Options, Params, PipelineOptions, Variant};
 
-/// An embedded kernel: its SPIR-V for both arithmetic variants.
-pub(crate) struct Shader {
-    pub(crate) name: &'static str,
-    pub(crate) int64: &'static [u8],
-    pub(crate) int32: &'static [u8],
+/// The arithmetic variant: `64` (variant A, the default where the device has
+/// `shaderInt64`) or `32` (variant B).
+pub const ARITH_ENV: &str = "MIDNIGHT_VULKAN_ARITH";
+/// `1`: also take a CPU implementation (lavapipe). Test only.
+pub const ALLOW_CPU_ENV: &str = "MIDNIGHT_VULKAN_ALLOW_CPU";
+/// `1`: treat the device as discrete, so host access goes through staging
+/// copies. Test only.
+pub const DISCRETE_ENV: &str = "MIDNIGHT_VULKAN_DISCRETE";
+
+// ---------------------------------------------------------------------------
+// The shared context under this crate's names
+
+/// The device context: [`Vulkan`] with the shared buffer management.
+pub type Ctx = acc::Ctx<Vulkan>;
+/// A Vulkan buffer, zeroed when dropped.
+pub type Buffer = acc::Buffer<Vulkan>;
+/// Exclusive use of the device: the context and the per-request buffers.
+pub type Session = acc::Session<Vulkan>;
+/// A per-request buffer checked out by [`take_request_buffer`].
+pub type RequestBuffer = acc::RequestBuffer<Vulkan>;
+/// The command buffer being encoded in [`Ctx::run`].
+pub type Command<'c, 'a> = acc::Command<'c, 'a, Vulkan>;
+/// A buffer argument of a kernel.
+pub type Arg<'a> = acc::Arg<'a, Vulkan>;
+
+/// The context, made at the first call. A failure is kept: later calls
+/// return it without trying again.
+pub fn context() -> Result<&'static Ctx, Error> {
+    acc::context::<Vulkan>()
 }
 
-include!(concat!(env!("OUT_DIR"), "/shaders.rs"));
-
-/// The names of the embedded kernels.
-pub fn kernels() -> impl Iterator<Item = &'static str> {
-    SHADERS.iter().map(|s| s.name)
+/// Takes the device, making the context if needed.
+pub fn lock() -> Result<Session, Error> {
+    acc::lock::<Vulkan>()
 }
 
-/// The arithmetic variant of a kernel (shaders/include/common.glsl).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Variant {
-    /// Variant A: 32-bit limbs with 64-bit accumulators; needs
-    /// `shaderInt64`.
-    Int64,
-    /// Variant B: 32-bit words only (`umulExtended`, `uaddCarry`,
-    /// `usubBorrow`); the SPIR-V declares no `Int64` capability.
-    Int32,
+/// `(now, peak)` bytes held in this crate's Vulkan buffers, idle pool
+/// buffers included. The peak is since process start or the last
+/// [`begin_request`].
+pub fn device_bytes() -> (u64, u64) {
+    acc::device_bytes::<Vulkan>()
 }
 
-impl Variant {
-    /// Both variants.
-    pub const ALL: [Variant; 2] = [Variant::Int64, Variant::Int32];
+/// Bytes in buffers in use now: [`device_bytes`] without idle pool buffers.
+pub fn in_use_bytes() -> u64 {
+    acc::in_use_bytes::<Vulkan>()
 }
 
-/// A failure of the device or of a call.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Error {
-    /// The Vulkan loader library could not be loaded.
-    Loader(String),
-    /// No Vulkan 1.3 GPU with a compute queue and `bufferDeviceAddress`.
-    NoDevice,
-    /// The crate was built without SPIR-V (the shader tools were missing).
-    NoSpirv,
-    /// The device lacks a feature, extension or limit the call needs.
-    Unsupported(String),
-    /// Host or device memory is exhausted, or no memory type fits.
-    OutOfMemory,
-    /// `VK_ERROR_DEVICE_LOST`; the context is now failed.
-    DeviceLost,
-    /// The context failed earlier (device lost).
-    Failed,
-    /// Any other Vulkan error.
-    Vulkan {
-        /// The Vulkan function.
-        call: &'static str,
-        /// Its result.
-        result: vk::Result,
-    },
-    /// An argument the context cannot serve.
-    Invalid(String),
+/// The peak of [`in_use_bytes`] since the last [`begin_request`], which resets
+/// it to the bytes in use then.
+pub fn request_peak_bytes() -> u64 {
+    acc::request_peak_bytes::<Vulkan>()
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Loader(e) => write!(f, "the Vulkan loader could not be loaded: {e}"),
-            Error::NoDevice => write!(
-                f,
-                "no Vulkan 1.3 GPU with a compute queue and bufferDeviceAddress"
-            ),
-            Error::NoSpirv => write!(
-                f,
-                "midnight-vulkan was built without SPIR-V: install glslang (or shaderc) and \
-                 SPIRV-Tools and rebuild"
-            ),
-            Error::Unsupported(what) => write!(f, "unsupported by the device: {what}"),
-            Error::OutOfMemory => write!(f, "out of memory"),
-            Error::DeviceLost => write!(f, "the Vulkan device was lost"),
-            Error::Failed => write!(f, "the Vulkan context failed earlier"),
-            Error::Vulkan { call, result } => write!(f, "{call} failed: {result}"),
-            Error::Invalid(what) => write!(f, "invalid call: {what}"),
-        }
-    }
+/// Opens a request and resets the peaks of [`device_bytes`] and
+/// [`request_peak_bytes`].
+pub fn begin_request() {
+    acc::begin_request::<Vulkan>()
 }
 
-impl std::error::Error for Error {}
-
-/// A result of this module.
-pub type Result<T> = std::result::Result<T, Error>;
-
-/// Plain data that may be copied to and from device buffers byte for byte.
-///
-/// # Safety
-///
-/// Every bit pattern of the type's size is a valid value, and it has no
-/// padding.
-pub unsafe trait Pod: Copy + Send + Sync + 'static {}
-
-// SAFETY: integers have no padding and no invalid bit patterns.
-unsafe impl Pod for u8 {}
-// SAFETY: as above.
-unsafe impl Pod for u16 {}
-// SAFETY: as above.
-unsafe impl Pod for u32 {}
-// SAFETY: as above.
-unsafe impl Pod for u64 {}
-// SAFETY: as above.
-unsafe impl Pod for i32 {}
-// SAFETY: as above.
-unsafe impl Pod for i64 {}
-// SAFETY: an array of `Pod` has no padding between its elements.
-unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
-
-/// The device as its properties describe it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeviceInfo {
-    /// `deviceName`.
-    pub name: String,
-    /// `vendorID`.
-    pub vendor_id: u32,
-    /// `deviceID`.
-    pub device_id: u32,
-    /// `deviceType`.
-    pub device_type: vk::PhysicalDeviceType,
-    /// `apiVersion` as (major, minor, patch).
-    pub api_version: (u32, u32, u32),
-    /// `driverName` and `driverInfo`.
-    pub driver: String,
-    /// The default subgroup size (`subgroupSize`).
-    pub subgroup_size: u32,
-    /// `minSubgroupSize`.
-    pub min_subgroup_size: u32,
-    /// `maxSubgroupSize`.
-    pub max_subgroup_size: u32,
-    /// A compute pipeline may require a subgroup size
-    /// (`subgroupSizeControl` and compute in `requiredSubgroupSizeStages`).
-    pub subgroup_size_control: bool,
-    /// `computeFullSubgroups`.
-    pub compute_full_subgroups: bool,
-    /// `maxComputeSharedMemorySize` in bytes.
-    pub max_compute_shared_memory_size: u32,
-    /// `maxPushConstantsSize` in bytes.
-    pub max_push_constants_size: u32,
-    /// `maxComputeWorkGroupCount`.
-    pub max_compute_work_group_count: [u32; 3],
-    /// `maxComputeWorkGroupSize`.
-    pub max_compute_work_group_size: [u32; 3],
-    /// `maxComputeWorkGroupInvocations`.
-    pub max_compute_work_group_invocations: u32,
-    /// `minStorageBufferOffsetAlignment` in bytes.
-    pub min_storage_buffer_offset_alignment: u64,
-    /// `maxStorageBufferRange` in bytes.
-    pub max_storage_buffer_range: u32,
-    /// `maxMemoryAllocationSize` in bytes.
-    pub max_memory_allocation_size: u64,
-    /// `shaderInt64` (variant A).
-    pub shader_int64: bool,
-    /// `bufferDeviceAddress` (required).
-    pub buffer_device_address: bool,
-    /// An integrated GPU: device memory is mapped for the host.
-    pub unified_memory: bool,
+/// Whether a request is open ([`begin_request`] was called and its
+/// [`end_request_report`] has not started).
+pub fn request_open() -> bool {
+    acc::request_open::<Vulkan>()
 }
 
-/// The device, shared by the context, its buffers and its pipelines.
-struct Shared {
-    _entry: ash::Entry,
-    instance: ash::Instance,
-    device: ash::Device,
-    memory: vk::PhysicalDeviceMemoryProperties,
-    failed: AtomicBool,
-    /// Held from a submission to its fence. A buffer is freed only outside
-    /// that window: MoltenVK makes every buffer with a device address
-    /// resident for each submission, so freeing one meanwhile, even one the
-    /// submission never reads, faults the GPU (`VK_ERROR_DEVICE_LOST`).
-    in_flight: Mutex<()>,
+/// The most bytes the pool keeps idle: `MIDNIGHT_VULKAN_POOL_MIB` (read
+/// once), else a quarter of the device-local memory budget.
+pub fn pool_limit() -> u64 {
+    acc::pool_limit::<Vulkan>()
 }
 
-impl Shared {
-    fn alive(&self) -> Result<()> {
-        if self.failed.load(Ordering::Acquire) {
-            Err(Error::Failed)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Maps a Vulkan result; a lost device latches the context as failed.
-    fn check<T>(&self, call: &'static str, r: std::result::Result<T, vk::Result>) -> Result<T> {
-        r.map_err(|result| match result {
-            vk::Result::ERROR_DEVICE_LOST => {
-                self.failed.store(true, Ordering::Release);
-                Error::DeviceLost
-            }
-            vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
-                Error::OutOfMemory
-            }
-            result => Error::Vulkan { call, result },
-        })
-    }
+/// Sets [`pool_limit`] in bytes (`None`: the default again) and releases
+/// idle buffers above it. Test support.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn set_pool_limit(limit: Option<u64>) {
+    acc::set_pool_limit::<Vulkan>(limit)
 }
 
-impl Drop for Shared {
-    fn drop(&mut self) {
-        // SAFETY: the last owner; every buffer, pipeline and command object
-        // of the device was destroyed before.
-        unsafe {
-            let _ = self.device.device_wait_idle();
-            self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
-        }
-    }
+/// Bytes of the idle (zeroed) buffers in the pool.
+pub fn pool_bytes() -> u64 {
+    acc::pool_bytes::<Vulkan>()
 }
 
-/// The objects of one submission at a time.
-struct Submit {
-    queue: vk::Queue,
-    pool: vk::CommandPool,
-    cmd: vk::CommandBuffer,
-    fence: vk::Fence,
+/// Releases every idle buffer of the pool once background zeroing has ended.
+/// Returns the bytes released.
+pub fn release_pool() -> u64 {
+    acc::release_pool::<Vulkan>()
 }
 
-/// The pipeline cache key.
-type Key = (&'static str, Variant, PipelineOptions);
-
-/// A Vulkan device with a compute queue.
-pub struct Context {
-    shared: Arc<Shared>,
-    info: DeviceInfo,
-    pipeline_layout: vk::PipelineLayout,
-    submit: Mutex<Submit>,
-    pipelines: Mutex<HashMap<Key, Arc<Pipeline>>>,
+/// Drops `bufs` (each zeroed, then pooled or released) on a background
+/// thread; [`settle_releases`] waits for it.
+pub fn release_later(bufs: Vec<Buffer>) {
+    acc::release_later(bufs)
 }
 
-impl fmt::Debug for Context {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Context").field("info", &self.info).finish_non_exhaustive()
-    }
+/// Whether a [`release_later`] call has not completed yet. Test support.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn releases_pending() -> bool {
+    acc::releases_pending::<Vulkan>()
 }
 
-fn c_string(s: std::result::Result<&CStr, std::ffi::FromBytesUntilNulError>) -> String {
-    s.map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+/// Waits until every [`release_later`] call made before this one has
+/// completed.
+pub fn settle_releases() {
+    acc::settle_releases::<Vulkan>()
 }
 
-/// Maps a Vulkan result of instance or device creation.
-fn init_error<T>(call: &'static str, r: std::result::Result<T, vk::Result>) -> Result<T> {
-    r.map_err(|result| match result {
-        vk::Result::ERROR_INCOMPATIBLE_DRIVER | vk::Result::ERROR_INITIALIZATION_FAILED => {
-            Error::NoDevice
-        }
-        vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
-            Error::OutOfMemory
-        }
-        result => Error::Vulkan { call, result },
-    })
+/// A per-request buffer under `key` taken without the device
+/// ([`midnight_accel::ctx::take_request_buffer`]).
+pub fn take_request_buffer(key: &'static str, bytes: usize) -> Result<RequestBuffer, Error> {
+    acc::take_request_buffer::<Vulkan>(key, bytes)
 }
 
-/// The rank of a device type; lower is preferred, `None` is never used.
-fn type_rank(t: vk::PhysicalDeviceType) -> Option<u32> {
-    match t {
-        vk::PhysicalDeviceType::DISCRETE_GPU => Some(0),
-        vk::PhysicalDeviceType::INTEGRATED_GPU => Some(1),
-        vk::PhysicalDeviceType::VIRTUAL_GPU => Some(2),
-        vk::PhysicalDeviceType::CPU => None,
-        _ => Some(3),
-    }
+/// Makes every later [`end_request_report`]`(true)` plant a non-zero byte in
+/// its first region after zeroing, so the read-back fails. Test support.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn set_plant_nonzero(on: bool) {
+    acc::set_plant_nonzero::<Vulkan>(on)
 }
 
-/// A candidate device: its handle, compute queue family and properties.
-struct Candidate {
-    physical: vk::PhysicalDevice,
-    family: u32,
-    info: DeviceInfo,
-    portability_subset: bool,
+/// The id of the buffer of the last planted byte. Test support.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn last_planted() -> u64 {
+    acc::last_planted::<Vulkan>()
 }
 
-impl Context {
-    /// Loads the Vulkan loader ([`LOADER_ENV`]) and opens the preferred
-    /// device: a discrete GPU, else an integrated one; CPU implementations
-    /// are skipped.
-    pub fn new() -> Result<Context> {
-        if !cfg!(midnight_vulkan_spirv) {
-            return Err(Error::NoSpirv);
-        }
-        // SAFETY: loading the Vulkan loader runs its initialisers, which is
-        // the documented use of the library.
-        let entry = match std::env::var_os(LOADER_ENV) {
-            Some(path) => unsafe { ash::Entry::load_from(&path) },
-            None => unsafe { ash::Entry::load() },
-        }
-        .map_err(|e| Error::Loader(e.to_string()))?;
-        // SAFETY: valid entry; no layer name.
-        let exts = init_error("vkEnumerateInstanceExtensionProperties", unsafe {
-            entry.enumerate_instance_extension_properties(None)
-        })?;
-        let has = |name: &CStr| exts.iter().any(|e| e.extension_name_as_c_str() == Ok(name));
-        let mut names: Vec<*const c_char> = Vec::new();
-        let mut flags = vk::InstanceCreateFlags::empty();
-        if has(vk::KHR_PORTABILITY_ENUMERATION_NAME) {
-            names.push(vk::KHR_PORTABILITY_ENUMERATION_NAME.as_ptr());
-            flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
-        }
-        let app = vk::ApplicationInfo::default()
-            .application_name(c"midnight-vulkan")
-            .engine_name(c"midnight-vulkan")
-            .api_version(vk::API_VERSION_1_3);
-        let create = vk::InstanceCreateInfo::default()
-            .application_info(&app)
-            .enabled_extension_names(&names)
-            .flags(flags);
-        // SAFETY: the create info and the strings it points to outlive the
-        // call.
-        let instance = init_error("vkCreateInstance", unsafe {
-            entry.create_instance(&create, None)
-        })?;
-        match Self::open(&instance) {
-            Ok((device, memory, candidate)) => {
-                Self::finish(entry, instance, device, memory, candidate)
-            }
-            Err(e) => {
-                // SAFETY: on failure the instance has no child object.
-                unsafe { instance.destroy_instance(None) };
-                Err(e)
-            }
-        }
-    }
-
-    /// Picks the device and creates it.
-    fn open(
-        instance: &ash::Instance,
-    ) -> Result<(ash::Device, vk::PhysicalDeviceMemoryProperties, Candidate)> {
-        // SAFETY: valid instance.
-        let physicals = init_error("vkEnumeratePhysicalDevices", unsafe {
-            instance.enumerate_physical_devices()
-        })?;
-        let mut best: Option<(u32, Candidate)> = None;
-        for p in physicals {
-            let Some(c) = Self::candidate(instance, p)? else {
-                continue;
-            };
-            let rank = type_rank(c.info.device_type).unwrap_or(u32::MAX);
-            if best.as_ref().is_none_or(|(r, _)| rank < *r) {
-                best = Some((rank, c));
-            }
-        }
-        let (_, c) = best.ok_or(Error::NoDevice)?;
-
-        let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
-            .buffer_device_address(c.info.buffer_device_address);
-        let mut v13 = vk::PhysicalDeviceVulkan13Features::default()
-            .subgroup_size_control(c.info.subgroup_size_control)
-            .compute_full_subgroups(c.info.compute_full_subgroups);
-        let features = vk::PhysicalDeviceFeatures::default().shader_int64(c.info.shader_int64);
-        let priorities = [1.0f32];
-        let queues = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(c.family)
-            .queue_priorities(&priorities)];
-        let mut exts: Vec<*const c_char> = Vec::new();
-        if c.portability_subset {
-            exts.push(vk::KHR_PORTABILITY_SUBSET_NAME.as_ptr());
-        }
-        let create = vk::DeviceCreateInfo::default()
-            .queue_create_infos(&queues)
-            .enabled_extension_names(&exts)
-            .enabled_features(&features)
-            .push_next(&mut v12)
-            .push_next(&mut v13);
-        // SAFETY: every enabled feature and extension is supported (queried
-        // in `candidate`); the create info outlives the call.
-        let device = init_error("vkCreateDevice", unsafe {
-            instance.create_device(c.physical, &create, None)
-        })?;
-        // SAFETY: valid physical device.
-        let memory = unsafe { instance.get_physical_device_memory_properties(c.physical) };
-        Ok((device, memory, c))
-    }
-
-    /// The device `p` if it is a usable GPU: Vulkan 1.3, not a CPU
-    /// implementation, with a compute queue.
-    fn candidate(instance: &ash::Instance, p: vk::PhysicalDevice) -> Result<Option<Candidate>> {
-        let mut v11 = vk::PhysicalDeviceVulkan11Properties::default();
-        let mut v12 = vk::PhysicalDeviceVulkan12Properties::default();
-        let mut v13 = vk::PhysicalDeviceVulkan13Properties::default();
-        let mut props = vk::PhysicalDeviceProperties2::default()
-            .push_next(&mut v11)
-            .push_next(&mut v12)
-            .push_next(&mut v13);
-        // SAFETY: valid physical device; the chain outlives the call.
-        unsafe { instance.get_physical_device_properties2(p, &mut props) };
-        let base = props.properties;
-        if vk::api_version_major(base.api_version) < 1
-            || (vk::api_version_major(base.api_version) == 1
-                && vk::api_version_minor(base.api_version) < 3)
-            || type_rank(base.device_type).is_none()
-        {
-            return Ok(None);
-        }
-        // SAFETY: valid physical device.
-        let families = unsafe { instance.get_physical_device_queue_family_properties(p) };
-        let compute: Vec<(usize, &vk::QueueFamilyProperties)> = families
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| f.queue_flags.contains(vk::QueueFlags::COMPUTE) && f.queue_count > 0)
-            .collect();
-        // a universal queue first: the one every driver schedules best
-        let Some(&(family, _)) = compute
-            .iter()
-            .find(|(_, f)| f.queue_flags.contains(vk::QueueFlags::GRAPHICS))
-            .or(compute.first())
-        else {
-            return Ok(None);
-        };
-
-        let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
-        let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
-        let mut features =
-            vk::PhysicalDeviceFeatures2::default().push_next(&mut f12).push_next(&mut f13);
-        // SAFETY: as above.
-        unsafe { instance.get_physical_device_features2(p, &mut features) };
-        let shader_int64 = features.features.shader_int64 == vk::TRUE;
-        // SAFETY: valid physical device.
-        let exts = unsafe { instance.enumerate_device_extension_properties(p) };
-        let exts = init_error("vkEnumerateDeviceExtensionProperties", exts)?;
-        let portability_subset = exts
-            .iter()
-            .any(|e| e.extension_name_as_c_str() == Ok(vk::KHR_PORTABILITY_SUBSET_NAME));
-
-        let limits = base.limits;
-        let v = base.api_version;
-        let info = DeviceInfo {
-            name: c_string(base.device_name_as_c_str()),
-            vendor_id: base.vendor_id,
-            device_id: base.device_id,
-            device_type: base.device_type,
-            api_version: (
-                vk::api_version_major(v),
-                vk::api_version_minor(v),
-                vk::api_version_patch(v),
-            ),
-            driver: format!(
-                "{} {}",
-                c_string(v12.driver_name_as_c_str()),
-                c_string(v12.driver_info_as_c_str())
-            ),
-            subgroup_size: v11.subgroup_size,
-            min_subgroup_size: v13.min_subgroup_size,
-            max_subgroup_size: v13.max_subgroup_size,
-            subgroup_size_control: f13.subgroup_size_control == vk::TRUE
-                && v13.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE),
-            compute_full_subgroups: f13.compute_full_subgroups == vk::TRUE,
-            max_compute_shared_memory_size: limits.max_compute_shared_memory_size,
-            max_push_constants_size: limits.max_push_constants_size,
-            max_compute_work_group_count: limits.max_compute_work_group_count,
-            max_compute_work_group_size: limits.max_compute_work_group_size,
-            max_compute_work_group_invocations: limits.max_compute_work_group_invocations,
-            min_storage_buffer_offset_alignment: limits.min_storage_buffer_offset_alignment,
-            max_storage_buffer_range: limits.max_storage_buffer_range,
-            max_memory_allocation_size: v11.max_memory_allocation_size,
-            shader_int64,
-            buffer_device_address: f12.buffer_device_address == vk::TRUE,
-            unified_memory: base.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU,
-        };
-        if !info.buffer_device_address {
-            return Ok(None);
-        }
-        Ok(Some(Candidate {
-            physical: p,
-            family: family as u32,
-            info,
-            portability_subset,
-        }))
-    }
-
-    /// Creates the queue, command and layout objects.
-    fn finish(
-        entry: ash::Entry,
-        instance: ash::Instance,
-        device: ash::Device,
-        memory: vk::PhysicalDeviceMemoryProperties,
-        c: Candidate,
-    ) -> Result<Context> {
-        let shared = Arc::new(Shared {
-            _entry: entry,
-            instance,
-            device,
-            memory,
-            failed: AtomicBool::new(false),
-            in_flight: Mutex::new(()),
-        });
-        // From here `Shared` owns the device; objects created below are
-        // destroyed by `Context::drop` or, on failure, by `Partial::drop`.
-        let mut p = Partial {
-            shared: &shared,
-            submit: Submit {
-                // SAFETY: the family and index exist (one queue created).
-                queue: unsafe { shared.device.get_device_queue(c.family, 0) },
-                pool: vk::CommandPool::null(),
-                cmd: vk::CommandBuffer::null(),
-                fence: vk::Fence::null(),
-            },
-            pipeline_layout: vk::PipelineLayout::null(),
-        };
-        let d = &shared.device;
-        let s = &shared;
-        let pool = vk::CommandPoolCreateInfo::default().queue_family_index(c.family);
-        // SAFETY: valid device and create infos for every call below.
-        p.submit.pool = s.check("vkCreateCommandPool", unsafe {
-            d.create_command_pool(&pool, None)
-        })?;
-        let alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(p.submit.pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        p.submit.cmd = s.check("vkAllocateCommandBuffers", unsafe {
-            d.allocate_command_buffers(&alloc)
-        })?[0];
-        p.submit.fence = s.check("vkCreateFence", unsafe {
-            d.create_fence(&vk::FenceCreateInfo::default(), None)
-        })?;
-        let push = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .offset(0)
-            .size(MAX_PARAMS_BYTES.min(c.info.max_push_constants_size))];
-        let pl = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push);
-        p.pipeline_layout = s.check("vkCreatePipelineLayout", unsafe {
-            d.create_pipeline_layout(&pl, None)
-        })?;
-
-        let (submit, pipeline_layout) = p.take();
-        Ok(Context {
-            shared: shared.clone(),
-            info: c.info,
-            pipeline_layout,
-            submit: Mutex::new(submit),
-            pipelines: Mutex::new(HashMap::new()),
-        })
-    }
-
-    /// The device's properties.
-    pub fn info(&self) -> &DeviceInfo {
-        &self.info
-    }
-
-    /// Whether a device loss latched the context as failed.
-    pub fn failed(&self) -> bool {
-        self.shared.failed.load(Ordering::Acquire)
-    }
-
-    fn lock_submit(&self) -> MutexGuard<'_, Submit> {
-        self.submit.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    // -----------------------------------------------------------------------
-    // Pipelines
-
-    /// The compute pipeline of `kernel` in `variant`, created at first use.
-    pub fn pipeline(
-        &self,
-        kernel: &str,
-        variant: Variant,
-        options: PipelineOptions,
-    ) -> Result<Arc<Pipeline>> {
-        self.shared.alive()?;
-        let shader = SHADERS
-            .iter()
-            .find(|s| s.name == kernel)
-            .ok_or_else(|| Error::Invalid(format!("no kernel {kernel}")))?;
-        let key = (shader.name, variant, options);
-        let mut cache = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(p) = cache.get(&key) {
-            return Ok(p.clone());
-        }
-        let p = Arc::new(self.create_pipeline(shader, variant, options)?);
-        cache.insert(key, p.clone());
-        Ok(p)
-    }
-
-    fn create_pipeline(
-        &self,
-        shader: &Shader,
-        variant: Variant,
-        options: PipelineOptions,
-    ) -> Result<Pipeline> {
-        let info = &self.info;
-        if variant == Variant::Int64 && !info.shader_int64 {
-            return Err(Error::Unsupported("shaderInt64 (variant A)".into()));
-        }
-        let wg = options.workgroup;
-        if wg == 0
-            || wg > info.max_compute_work_group_size[0]
-            || wg > info.max_compute_work_group_invocations
-        {
-            return Err(Error::Invalid(format!("workgroup width {wg}")));
-        }
-        // A device whose subgroup size cannot be chosen but is fixed at the
-        // requested one (Apple GPUs: 32) needs no size request.
-        let mut request_size = false;
-        if let Some(s) = options.subgroup {
-            let fixed = info.subgroup_size == s && info.max_subgroup_size == s;
-            if !info.compute_full_subgroups || !(info.subgroup_size_control || fixed) {
-                return Err(Error::Unsupported(format!(
-                    "a compute subgroup size of {s} (subgroupSizeControl, computeFullSubgroups)"
-                )));
-            }
-            if !s.is_power_of_two()
-                || s < info.min_subgroup_size
-                || s > info.max_subgroup_size
-                || !wg.is_multiple_of(s)
-            {
-                return Err(Error::Invalid(format!(
-                    "subgroup size {s} (device range {}..={}, workgroup {wg})",
-                    info.min_subgroup_size, info.max_subgroup_size
-                )));
-            }
-            request_size = info.subgroup_size_control;
-        }
-        let bytes = match variant {
-            Variant::Int64 => shader.int64,
-            Variant::Int32 => shader.int32,
-        };
-        let code = ash::util::read_spv(&mut Cursor::new(bytes))
-            .map_err(|e| Error::Invalid(format!("SPIR-V of {}: {e}", shader.name)))?;
-        let s = &self.shared;
-        let d = &s.device;
-        let module_info = vk::ShaderModuleCreateInfo::default().code(&code);
-        // SAFETY: valid device; the SPIR-V was validated by spirv-opt.
-        let module = s.check("vkCreateShaderModule", unsafe {
-            d.create_shader_module(&module_info, None)
-        })?;
-        let mut entries =
-            vec![vk::SpecializationMapEntry::default().constant_id(0).offset(0).size(4)];
-        let mut data = wg.to_ne_bytes().to_vec();
-        for (i, v) in options.spec.iter().enumerate() {
-            if *v != 0 {
-                entries.push(
-                    vk::SpecializationMapEntry::default()
-                        .constant_id(i as u32 + 1)
-                        .offset(data.len() as u32)
-                        .size(4),
-                );
-                data.extend_from_slice(&v.to_ne_bytes());
-            }
-        }
-        let spec = vk::SpecializationInfo::default().map_entries(&entries).data(&data);
-        let mut required = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
-            .required_subgroup_size(options.subgroup.unwrap_or(0));
-        let mut stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(module)
-            .name(c"main")
-            .specialization_info(&spec);
-        if options.subgroup.is_some() {
-            stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS);
-        }
-        if request_size {
-            stage = stage.push_next(&mut required);
-        }
-        let create = [vk::ComputePipelineCreateInfo::default()
-            .stage(stage)
-            .layout(self.pipeline_layout)];
-        // SAFETY: valid device, module and layout; the create info outlives
-        // the call.
-        let r = unsafe { d.create_compute_pipelines(vk::PipelineCache::null(), &create, None) };
-        // SAFETY: the module is no longer needed once the pipeline exists.
-        unsafe { d.destroy_shader_module(module, None) };
-        let pipeline = s.check("vkCreateComputePipelines", r.map_err(|(_, e)| e))?[0];
-        Ok(Pipeline {
-            shared: s.clone(),
-            pipeline,
-            name: shader.name,
-            variant,
-            options,
-        })
-    }
-
-    // -----------------------------------------------------------------------
-    // Buffers
-
-    /// The index of the first memory type of `bits` with every flag of each
-    /// preference in turn.
-    fn memory_types(&self, bits: u32, preferences: &[vk::MemoryPropertyFlags]) -> Vec<u32> {
-        let m = &self.shared.memory;
-        let mut out = Vec::new();
-        for want in preferences {
-            for i in 0..m.memory_type_count {
-                let flags = m.memory_types[i as usize].property_flags;
-                if bits & (1 << i) != 0 && flags.contains(*want) && !out.contains(&i) {
-                    out.push(i);
-                }
-            }
-        }
-        out
-    }
-
-    fn create_buffer(&self, len: usize, preferences: &[vk::MemoryPropertyFlags]) -> Result<Buffer> {
-        self.shared.alive()?;
-        if len as u64 > self.info.max_memory_allocation_size {
-            return Err(Error::OutOfMemory);
-        }
-        let s = &self.shared;
-        let d = &s.device;
-        let size = (len.max(4) as u64).next_multiple_of(4);
-        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
-            | vk::BufferUsageFlags::TRANSFER_SRC
-            | vk::BufferUsageFlags::TRANSFER_DST
-            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
-        let create = vk::BufferCreateInfo::default()
-            .size(size)
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        // SAFETY: valid device and create info.
-        let buffer = s.check("vkCreateBuffer", unsafe { d.create_buffer(&create, None) })?;
-        // SAFETY: valid buffer.
-        let req = unsafe { d.get_buffer_memory_requirements(buffer) };
-        let mut memory = Err(Error::OutOfMemory);
-        let mut host = false;
-        for t in self.memory_types(req.memory_type_bits, preferences) {
-            let mut flags = vk::MemoryAllocateFlagsInfo::default()
-                .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-            let alloc = vk::MemoryAllocateInfo::default()
-                .allocation_size(req.size)
-                .memory_type_index(t)
-                .push_next(&mut flags);
-            // SAFETY: valid device and allocate info.
-            memory = s.check("vkAllocateMemory", unsafe {
-                d.allocate_memory(&alloc, None)
-            });
-            if !matches!(memory, Err(Error::OutOfMemory)) {
-                host = s.memory.memory_types[t as usize].property_flags.contains(
-                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                );
-                break;
-            }
-        }
-        let memory = match memory {
-            Ok(m) => m,
-            Err(e) => {
-                // SAFETY: the buffer has no memory and is unused.
-                unsafe { d.destroy_buffer(buffer, None) };
-                return Err(e);
-            }
-        };
-        let mut b = Buffer {
-            shared: s.clone(),
-            buffer,
-            memory,
-            len,
-            mapped: None,
-            address: 0,
-        };
-        // SAFETY: the memory was allocated for this buffer's requirements.
-        s.check("vkBindBufferMemory", unsafe {
-            d.bind_buffer_memory(buffer, memory, 0)
-        })?;
-        if host {
-            // SAFETY: host-visible memory, not mapped yet.
-            let p = s.check("vkMapMemory", unsafe {
-                d.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-            })?;
-            b.mapped = NonNull::new(p.cast());
-        }
-        let i = vk::BufferDeviceAddressInfo::default().buffer(buffer);
-        // SAFETY: a buffer with SHADER_DEVICE_ADDRESS usage bound to memory
-        // allocated with DEVICE_ADDRESS.
-        b.address = unsafe { d.get_buffer_device_address(&i) };
-        Ok(b)
-    }
-
-    /// A device buffer of `len` bytes, unspecified contents. On a unified
-    /// memory device it is mapped for the host.
-    pub fn alloc(&self, len: usize) -> Result<Buffer> {
-        use vk::MemoryPropertyFlags as M;
-        if self.info.unified_memory {
-            self.create_buffer(
-                len,
-                &[
-                    M::DEVICE_LOCAL | M::HOST_VISIBLE | M::HOST_COHERENT,
-                    M::DEVICE_LOCAL,
-                ],
-            )
-        } else {
-            self.create_buffer(len, &[M::DEVICE_LOCAL])
-        }
-    }
-
-    /// A host-visible staging buffer of `len` bytes.
-    fn staging(&self, len: usize) -> Result<Buffer> {
-        use vk::MemoryPropertyFlags as M;
-        self.create_buffer(
-            len,
-            &[
-                M::HOST_VISIBLE | M::HOST_COHERENT | M::HOST_CACHED,
-                M::HOST_VISIBLE | M::HOST_COHERENT,
-            ],
-        )
-    }
-
-    /// A device buffer holding `data`.
-    pub fn upload<T: Pod>(&self, data: &[T]) -> Result<Buffer> {
-        let b = self.alloc(size_of_val(data))?;
-        self.write(&b, data)?;
-        Ok(b)
-    }
-
-    /// Writes `data` at the start of `buffer`.
-    pub fn write<T: Pod>(&self, buffer: &Buffer, data: &[T]) -> Result<()> {
-        let bytes = size_of_val(data);
-        if bytes > buffer.len {
-            return Err(Error::Invalid(format!(
-                "{bytes} bytes into a buffer of {}",
-                buffer.len
-            )));
-        }
-        if buffer.mapped.is_some() {
-            // SAFETY: `T: Pod`; the mapping holds `buffer.len` bytes.
-            unsafe { buffer.host_write(data) };
-            return Ok(());
-        }
-        let staging = self.staging(bytes)?;
-        // SAFETY: as above.
-        unsafe { staging.host_write(data) };
-        let mut cmds = self.commands()?;
-        cmds.copy(&staging, buffer, bytes)?;
-        cmds.submit()?;
-        Ok(())
-    }
-
-    /// The first `buffer.len() / size_of::<T>()` values of `buffer`.
-    pub fn read<T: Pod>(&self, buffer: &Buffer) -> Result<Vec<T>> {
-        let n = buffer.len / size_of::<T>().max(1);
-        let bytes = n * size_of::<T>();
-        let mut out: Vec<T> = Vec::with_capacity(n);
-        let copy = |src: &Buffer, out: &mut Vec<T>| {
-            if let Some(p) = src.mapped {
-                // SAFETY: the mapping holds at least `bytes` bytes and `out`
-                // has capacity for them; every bit pattern is a `T`.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(p.as_ptr(), out.as_mut_ptr().cast::<u8>(), bytes);
-                    out.set_len(n);
-                }
-            }
-        };
-        if buffer.mapped.is_some() {
-            copy(buffer, &mut out);
-            return Ok(out);
-        }
-        let staging = self.staging(bytes)?;
-        let mut cmds = self.commands()?;
-        cmds.copy(buffer, &staging, bytes)?;
-        cmds.submit()?;
-        copy(&staging, &mut out);
-        Ok(out)
-    }
-
-    // -----------------------------------------------------------------------
-    // Commands
-
-    /// Starts recording a command buffer. The context runs one at a time:
-    /// this waits for the [`Commands`] of another thread to be submitted or
-    /// dropped.
-    pub fn commands(&self) -> Result<Commands<'_>> {
-        self.shared.alive()?;
-        let submit = self.lock_submit();
-        let s = &self.shared;
-        let d = &s.device;
-        // SAFETY: the pool's command buffer is not in use: the last
-        // submission was waited for (or never submitted).
-        unsafe {
-            s.check(
-                "vkResetCommandPool",
-                d.reset_command_pool(submit.pool, vk::CommandPoolResetFlags::empty()),
-            )?;
-            let begin = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            s.check(
-                "vkBeginCommandBuffer",
-                d.begin_command_buffer(submit.cmd, &begin),
-            )?;
-        }
-        Ok(Commands {
-            ctx: self,
-            submit,
-            recorded: false,
-        })
-    }
+/// Makes the next zeroing of the dropped buffer `id` panic once; 0 stops it.
+/// Test support.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn set_zeroing_panic(id: u64) {
+    acc::set_zeroing_panic::<Vulkan>(id)
 }
 
-/// Holds the objects created by [`Context::finish`] until it succeeds.
-struct Partial<'a> {
-    shared: &'a Arc<Shared>,
-    submit: Submit,
-    pipeline_layout: vk::PipelineLayout,
+/// Writes a non-zero byte into an idle pool buffer; returns its id. Test
+/// support.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn plant_in_idle_pool() -> Option<u64> {
+    acc::plant_in_idle_pool::<Vulkan>()
 }
 
-impl Partial<'_> {
-    fn take(&mut self) -> (Submit, vk::PipelineLayout) {
-        let null = Submit {
-            queue: self.submit.queue,
-            pool: vk::CommandPool::null(),
-            cmd: vk::CommandBuffer::null(),
-            fence: vk::Fence::null(),
-        };
-        (
-            std::mem::replace(&mut self.submit, null),
-            std::mem::take(&mut self.pipeline_layout),
-        )
-    }
+/// The ids of the idle buffers of the pool and the staging pool. Test
+/// support.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn idle_pool_ids() -> Vec<u64> {
+    acc::idle_pool_ids::<Vulkan>()
 }
 
-/// Destroys the objects of `submit` and the layout (null handles are skipped
-/// by Vulkan).
-fn destroy(d: &ash::Device, submit: &Submit, pipeline_layout: vk::PipelineLayout) {
-    // SAFETY: the device is idle; every handle is null or owned here.
-    unsafe {
-        d.destroy_pipeline_layout(pipeline_layout, None);
-        d.destroy_fence(submit.fence, None);
-        d.destroy_command_pool(submit.pool, None);
-    }
+/// Whether every idle pool buffer reads zero. Test support.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn idle_pool_reads_zero() -> bool {
+    acc::idle_pool_reads_zero::<Vulkan>()
 }
 
-impl Drop for Partial<'_> {
-    fn drop(&mut self) {
-        destroy(&self.shared.device, &self.submit, self.pipeline_layout);
-    }
+/// The per-request buffers now: `(key, allocation bytes, reads zero, id)`.
+/// Takes the device. Test support.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn request_buffers() -> Vec<(&'static str, usize, bool, u64)> {
+    acc::request_buffers::<Vulkan>()
 }
 
-impl Drop for Context {
-    fn drop(&mut self) {
-        let d = &self.shared.device;
-        // SAFETY: valid device.
-        let _ = unsafe { d.device_wait_idle() };
-        self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        let submit = self.submit.get_mut().unwrap_or_else(|e| e.into_inner());
-        destroy(d, submit, self.pipeline_layout);
-    }
+/// Zeroes every per-request buffer after any device work and background
+/// zeroing, and closes the request; with `check`, reads every region back.
+pub fn end_request_report(check: bool) -> Result<crate::WipeStats, crate::WipeStats> {
+    acc::end_request_report::<Vulkan>(check)
 }
 
-/// The options of a pipeline.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PipelineOptions {
-    /// The workgroup width (specialization constant 0).
-    pub workgroup: u32,
-    /// A required subgroup size, with full subgroups (the workgroup width
-    /// must be a multiple of it): requested where the device lets compute
-    /// pipelines choose it, else accepted when the device's size is fixed
-    /// at it. `None`: the driver's choice.
-    pub subgroup: Option<u32>,
-    /// Specialization constants `1..=3`; 0 keeps the shader's default.
-    pub spec: [u32; SPEC_CONSTANTS],
+/// [`end_request_report`] without the read-back. `true` when done.
+pub fn end_request() -> bool {
+    acc::end_request::<Vulkan>()
 }
 
-impl PipelineOptions {
-    /// Workgroups of `workgroup` invocations, the other options default.
-    pub fn workgroup(workgroup: u32) -> PipelineOptions {
-        PipelineOptions {
-            workgroup,
-            ..Default::default()
-        }
-    }
+/// `(free, total)`: `total` is the device-local memory budget, `free` is
+/// that minus the memory in use plus the idle pool buffers, which count as
+/// free because an allocation that would not fit releases them first.
+pub fn mem_info() -> Option<(usize, usize)> {
+    acc::mem_info::<Vulkan>()
 }
 
-impl Default for PipelineOptions {
-    fn default() -> Self {
-        PipelineOptions {
-            workgroup: DEFAULT_WORKGROUP,
-            subgroup: None,
-            spec: [0; SPEC_CONSTANTS],
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// Context
 
-/// A compute pipeline of the context.
-pub struct Pipeline {
-    shared: Arc<Shared>,
-    pipeline: vk::Pipeline,
-    name: &'static str,
+/// The Vulkan backend: the process-wide device, its arithmetic variant and
+/// the buffers of large parameter blocks.
+pub struct Vulkan {
+    dev: Context,
     variant: Variant,
-    options: PipelineOptions,
+    neutral: DeviceInfo,
+    /// Idle host-visible buffers for parameter blocks read by address.
+    slabs: Mutex<Vec<device::Buffer>>,
 }
 
-impl Pipeline {
-    /// The kernel name.
-    pub fn name(&self) -> &'static str {
-        self.name
+impl std::fmt::Debug for Vulkan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Vulkan")
+            .field("device", &self.dev.info().name)
+            .field("variant", &self.variant)
+            .field("unified", &self.dev.info().unified_memory)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Vulkan {
+    /// The device.
+    pub fn device(&self) -> &Context {
+        &self.dev
     }
 
-    /// The arithmetic variant.
+    /// The arithmetic variant of every pipeline.
     pub fn variant(&self) -> Variant {
         self.variant
     }
 
-    /// The workgroup width.
-    pub fn workgroup(&self) -> u32 {
-        self.options.workgroup
+    /// A buffer for parameter blocks of at least `bytes` bytes: an idle one,
+    /// else a new one.
+    fn take_slab(&self, bytes: usize) -> Result<device::Buffer, Error> {
+        let mut idle = self.slabs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = idle.iter().position(|b| b.len() >= bytes) {
+            return Ok(idle.swap_remove(i));
+        }
+        drop(idle);
+        self.dev.staging(bytes.max(SLAB_BYTES)).map_err(err)
     }
 
-    /// The options the pipeline was made with.
-    pub fn options(&self) -> PipelineOptions {
-        self.options
-    }
-}
-
-impl fmt::Debug for Pipeline {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Pipeline")
-            .field("name", &self.name)
-            .field("variant", &self.variant)
-            .field("options", &self.options)
-            .finish()
-    }
-}
-
-impl Drop for Pipeline {
-    fn drop(&mut self) {
-        // SAFETY: no command buffer using the pipeline is pending: commands
-        // borrow it until their submission was waited for.
-        unsafe { self.shared.device.destroy_pipeline(self.pipeline, None) };
+    /// Returns the buffers of parameter blocks of a completed run.
+    fn put_slabs(&self, slabs: Vec<Slab>) {
+        let mut idle = self.slabs.lock().unwrap_or_else(|e| e.into_inner());
+        for s in slabs {
+            if idle.len() < 4 {
+                idle.push(s.buf);
+            }
+        }
     }
 }
 
-/// A buffer with its own memory and a device address.
-pub struct Buffer {
-    shared: Arc<Shared>,
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
-    len: usize,
-    mapped: Option<NonNull<u8>>,
-    address: u64,
+static CTX: OnceLock<Result<Vulkan, String>> = OnceLock::new();
+
+/// The backend, if it was made.
+fn backend() -> Option<&'static Vulkan> {
+    CTX.get().and_then(|r| r.as_ref().ok())
 }
 
-// SAFETY: the handles may be used from any thread; the mapping is only
-// written through `&self` by the context's copy functions, which the caller
-// orders with the device work.
-unsafe impl Send for Buffer {}
-// SAFETY: as above.
-unsafe impl Sync for Buffer {}
+/// The backend, made at the first call; `None` when it could not be made.
+fn probe_device() -> Option<&'static Vulkan> {
+    CTX.get_or_init(make_context).as_ref().ok()
+}
 
-impl Buffer {
-    /// The length in bytes.
-    pub fn len(&self) -> usize {
-        self.len
+/// The device's properties. `None`: no usable device. Makes the device (not
+/// the pipelines) at the first call.
+pub fn probe() -> Option<&'static device::VulkanInfo> {
+    probe_device().map(|v| v.dev.info())
+}
+
+/// Why the context could not be made, if it was tried and failed.
+pub fn context_error() -> Option<&'static str> {
+    match CTX.get() {
+        Some(Err(e)) => Some(e),
+        _ => None,
+    }
+}
+
+/// Whether the environment variable `name` is `1`.
+fn env_on(name: &str) -> bool {
+    std::env::var(name).as_deref() == Ok("1")
+}
+
+/// The arithmetic variant: [`ARITH_ENV`], else A where the device has
+/// `shaderInt64`.
+fn choose_variant(info: &device::VulkanInfo) -> Result<Variant, String> {
+    match std::env::var(ARITH_ENV).as_deref() {
+        Ok("64") if info.shader_int64 => Ok(Variant::Int64),
+        Ok("64") => Err(format!("{ARITH_ENV}=64 on a device without shaderInt64")),
+        Ok("32") => Ok(Variant::Int32),
+        Ok(v) => Err(format!("{ARITH_ENV}={v}: expected 64 or 32")),
+        Err(_) if info.shader_int64 => Ok(Variant::Int64),
+        Err(_) => Ok(Variant::Int32),
+    }
+}
+
+fn make_context() -> Result<Vulkan, String> {
+    let options = Options {
+        allow_cpu: env_on(ALLOW_CPU_ENV),
+        discrete: env_on(DISCRETE_ENV),
+    };
+    let dev = Context::open(options).map_err(|e| e.to_string())?;
+    let variant = choose_variant(dev.info())?;
+    let info = dev.info();
+    let neutral = DeviceInfo {
+        name: info.name.clone(),
+        unified_memory: info.unified_memory,
+        memory_budget: dev.budget().1,
+        max_buffer_length: info.max_buffer_len(),
+        max_threads_per_group: max_group(info) as u64,
+    };
+    Ok(Vulkan {
+        dev,
+        variant,
+        neutral,
+        slabs: Mutex::new(Vec::new()),
+    })
+}
+
+/// The most invocations of one workgroup.
+fn max_group(info: &device::VulkanInfo) -> usize {
+    info.max_compute_work_group_invocations.min(info.max_compute_work_group_size[0]) as usize
+}
+
+/// A device error as the shared code's.
+fn err(e: device::Error) -> Error {
+    match e {
+        device::Error::OutOfMemory => Error::Memory(e.to_string()),
+        device::Error::Loader(_) | device::Error::NoDevice | device::Error::NoSpirv => {
+            Error::NoDevice(e.to_string())
+        }
+        _ => Error::Device(e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Buffers
+
+/// A Vulkan buffer: mapped for the host on a unified device and for staging,
+/// device-local and unmapped otherwise.
+pub struct VulkanBuffer(device::Buffer);
+
+impl std::fmt::Debug for VulkanBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("VulkanBuffer").field(&self.0).finish()
+    }
+}
+
+impl VulkanBuffer {
+    /// The device buffer.
+    pub fn buffer(&self) -> &device::Buffer {
+        &self.0
+    }
+}
+
+/// The device of a buffer that has no mapping (one exists: it made it).
+fn device_of_buffers() -> Result<&'static Context, Error> {
+    backend()
+        .map(|v| &v.dev)
+        .ok_or_else(|| Error::NoDevice("no Vulkan context".into()))
+}
+
+impl RawBuffer for VulkanBuffer {
+    fn len(&self) -> usize {
+        self.0.len()
     }
 
-    /// Whether the buffer holds no byte.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
+    fn id(&self) -> u64 {
+        self.0.device_address()
     }
 
-    /// The device address of the first byte.
-    pub fn device_address(&self) -> u64 {
-        self.address
+    fn host_ptr(&self) -> Option<NonNull<u8>> {
+        self.0.mapped_ptr()
     }
 
-    /// Whether the buffer is mapped for the host.
-    pub fn is_mapped(&self) -> bool {
-        self.mapped.is_some()
+    fn zero_all(&self) -> Result<(), Error> {
+        if let Some(p) = self.0.mapped_ptr() {
+            acc::host_zero(p, self.0.len());
+            return Ok(());
+        }
+        device_of_buffers()?.fill(&self.0, 0, None, 0).map_err(err)
     }
 
-    /// Copies `data` into the mapping.
-    ///
-    /// # Safety
-    ///
-    /// The buffer is mapped and at least `size_of_val(data)` long, and no
-    /// device work touches it meanwhile.
-    unsafe fn host_write<T: Pod>(&self, data: &[T]) {
-        if let Some(p) = self.mapped {
-            // SAFETY: by the contract above.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr().cast::<u8>(),
-                    p.as_ptr(),
-                    size_of_val(data),
-                )
+    fn read_back_zero(&self) -> ReadBack {
+        if let Some(p) = self.0.mapped_ptr() {
+            return if acc::host_reads_zero(p, self.0.len()) {
+                ReadBack::Zero
+            } else {
+                ReadBack::NonZero
             };
         }
-    }
-}
-
-impl fmt::Debug for Buffer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Buffer")
-            .field("len", &self.len)
-            .field("mapped", &self.mapped.is_some())
-            .finish()
-    }
-}
-
-impl Drop for Buffer {
-    fn drop(&mut self) {
-        let _gate = self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: no pending command buffer uses the buffer (commands borrow
-        // it until their submission was waited for), and none is in flight;
-        // freeing mapped memory unmaps it.
-        unsafe {
-            self.shared.device.destroy_buffer(self.buffer, None);
-            self.shared.device.free_memory(self.memory, None);
+        let Ok(dev) = device_of_buffers() else {
+            return ReadBack::Unreadable;
+        };
+        let zero = dev.read_chunks(&self.0, |part| {
+            acc::host_reads_zero(NonNull::from(part).cast(), part.len())
+        });
+        match zero {
+            Ok(true) => ReadBack::Zero,
+            Ok(false) => ReadBack::NonZero,
+            Err(_) => ReadBack::Unreadable,
         }
     }
-}
 
-/// The push-constant block of one dispatch: buffer addresses first, then
-/// scalar words. It borrows every buffer whose address it holds, so the
-/// buffers outlive the [`Commands`] that record it.
-#[derive(Clone, Debug, Default)]
-pub struct Params<'a> {
-    words: Vec<u32>,
-    buffers: PhantomData<&'a Buffer>,
-}
-
-impl<'a> Params<'a> {
-    /// An empty block.
-    pub fn new() -> Params<'a> {
-        Params::default()
-    }
-
-    /// Appends the address of `buffer`'s first byte (8 bytes, at an offset
-    /// that must be a multiple of 8: addresses come first).
-    pub fn addr(self, buffer: &'a Buffer) -> Params<'a> {
-        self.addr_at(buffer, 0)
-    }
-
-    /// Appends the address of byte `offset` of `buffer`; an offset past the
-    /// end is recorded as the end (the kernel reads nothing there).
-    pub fn addr_at(mut self, buffer: &'a Buffer, offset: usize) -> Params<'a> {
-        debug_assert!(
-            self.words.len().is_multiple_of(2),
-            "an address after a scalar"
-        );
-        let a = buffer.address + offset.min(buffer.len) as u64;
-        self.words.extend([a as u32, (a >> 32) as u32]);
-        self
-    }
-
-    /// Appends one word.
-    pub fn u32(mut self, v: u32) -> Params<'a> {
-        self.words.push(v);
-        self
-    }
-
-    /// Appends words (a scalar is its eight little-endian 32-bit limbs).
-    pub fn words(mut self, v: &[u32]) -> Params<'a> {
-        self.words.extend_from_slice(v);
-        self
-    }
-
-    /// Appends 64-bit values as pairs of words, low word first (a scalar's
-    /// `[u64; 4]` limbs).
-    pub fn u64s(mut self, v: &[u64]) -> Params<'a> {
-        self.words.extend(v.iter().flat_map(|w| [*w as u32, (*w >> 32) as u32]));
-        self
-    }
-
-    /// The block as words.
-    pub fn as_words(&self) -> &[u32] {
-        &self.words
+    fn write_test_byte(&self) -> bool {
+        if let Some(p) = self.0.mapped_ptr() {
+            // SAFETY: the middle byte is inside the mapping; the caller has
+            // exclusive use of the buffer.
+            unsafe { std::ptr::write_volatile(p.as_ptr().add(self.0.len() / 2), 0xa5) };
+            return true;
+        }
+        let at = (self.0.len() / 2) & !3;
+        device_of_buffers().is_ok_and(|d| d.fill(&self.0, at, Some(4), 0xa5a5_a5a5).is_ok())
     }
 }
 
-/// The grid of a dispatch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Grid {
-    /// At least this many invocations: `ceil(n / workgroup)` workgroups; the
-    /// kernel guards its own element count.
-    Threads(u64),
-    /// Exactly this many workgroups.
-    Groups(u64),
+// ---------------------------------------------------------------------------
+// Dispatch
+
+/// The bytes of a buffer of parameter blocks.
+const SLAB_BYTES: usize = 4096;
+/// The alignment of a parameter block in its buffer (the kernels'
+/// `buffer_reference_align`).
+const SLAB_ALIGN: usize = 16;
+/// The workgroup width of [`Encoder::dispatch`] (at most).
+const DISPATCH_GROUP: usize = 256;
+/// The subgroup width of the MSM kernels.
+const MSM_SUBGROUP: u32 = 32;
+
+/// What a kernel takes besides its buffer addresses and parameter block in
+/// the push-constant block.
+#[derive(Clone, Copy, Debug, Default)]
+struct Shape {
+    /// The dispatch's element count follows the parameter block (the
+    /// elementwise NTT kernels, which Metal bounds by the grid).
+    count: bool,
+    /// The parameter block is read from a buffer whose address ends the
+    /// push-constant block.
+    params_by_address: bool,
+    /// Runs in subgroups of [`MSM_SUBGROUP`].
+    msm: bool,
+    /// Shared-memory block 0 is specialization constant 1, in words.
+    shared_words: bool,
 }
 
-/// A command buffer being recorded. It holds the context's submission lock
-/// and borrows every buffer and pipeline it records until [`submit`]
-/// returns; dropped without a submission, nothing runs.
-///
-/// [`submit`]: Commands::submit
-pub struct Commands<'a> {
-    ctx: &'a Context,
-    submit: MutexGuard<'a, Submit>,
-    recorded: bool,
-}
-
-impl fmt::Debug for Commands<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Commands").field("recorded", &self.recorded).finish()
+/// The [`Shape`] of `kernel`.
+fn shape(kernel: &str) -> Shape {
+    match kernel {
+        "ntt_pass" => Shape {
+            shared_words: true,
+            ..Shape::default()
+        },
+        "ntt_scale" | "ntt_scale_copy" | "ntt_distribute_zeta" | "ntt_mul_periodic" => Shape {
+            count: true,
+            ..Shape::default()
+        },
+        "quotient_numerator" => Shape {
+            params_by_address: true,
+            ..Shape::default()
+        },
+        k if k.starts_with("msm_") && !k.starts_with("msm_test") => Shape {
+            msm: true,
+            ..Shape::default()
+        },
+        _ => Shape::default(),
     }
 }
 
-/// `(x, y)` with `x * y == groups`, `x <= max_x`, `y <= max_y`: the 2D grid
-/// of exactly `groups` workgroups (`None` if there is none).
-fn fold(groups: u64, max_x: u32, max_y: u32) -> Option<(u32, u32)> {
-    if groups <= max_x as u64 {
-        return Some((groups as u32, 1));
-    }
-    let min_x = groups.div_ceil(max_y as u64);
-    (min_x..=max_x as u64)
-        .rev()
-        .find(|x| groups.is_multiple_of(*x))
-        .map(|x| (x as u32, (groups / x) as u32))
+/// A buffer of parameter blocks used by one run, filled up to `used`.
+struct Slab {
+    buf: device::Buffer,
+    used: usize,
 }
 
-impl<'a> Commands<'a> {
-    /// Records `pipeline` over `grid`, with `params` as its push constants.
-    /// A grid beyond `maxComputeWorkGroupCount[0]` workgroups is folded into
-    /// a second dimension of exactly as many workgroups (kernels index by
-    /// `global_index()` / `group_index()`). The dispatch sees the writes of
-    /// everything recorded before it.
-    pub fn dispatch(
+/// The command buffer being recorded in [`Vulkan::run`].
+pub struct VulkanCommand<'a> {
+    vk: &'a Vulkan,
+    cmds: Commands<'a>,
+    slabs: Vec<Slab>,
+}
+
+impl std::fmt::Debug for VulkanCommand<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VulkanCommand").finish_non_exhaustive()
+    }
+}
+
+/// The words of a parameter block.
+fn words(kernel: &str, params: &[u8]) -> Result<Vec<u32>, Error> {
+    if !params.len().is_multiple_of(4) {
+        return Err(Error::Device(format!(
+            "`{kernel}`: a parameter block of {} bytes",
+            params.len()
+        )));
+    }
+    Ok(params.as_chunks::<4>().0.iter().map(|w| u32::from_ne_bytes(*w)).collect())
+}
+
+impl<'a> VulkanCommand<'a> {
+    /// The device address of a copy of `params` in a buffer of the run.
+    fn park(&mut self, params: &[u8]) -> Result<u64, Error> {
+        let fits = |s: &Slab| s.used.next_multiple_of(SLAB_ALIGN) + params.len() <= s.buf.len();
+        if !self.slabs.last().is_some_and(fits) {
+            let buf = self.vk.take_slab(params.len())?;
+            self.slabs.push(Slab { buf, used: 0 });
+        }
+        let s = self.slabs.last_mut().expect("a slab was just pushed");
+        let at = s.used.next_multiple_of(SLAB_ALIGN);
+        let p = s
+            .buf
+            .mapped_ptr()
+            .ok_or_else(|| Error::Device("an unmapped parameter buffer".into()))?;
+        // SAFETY: `at + params.len()` is inside the mapping; no device work
+        // of this run has been submitted yet, and the buffer is not used by
+        // any other run.
+        unsafe { std::ptr::copy_nonoverlapping(params.as_ptr(), p.as_ptr().add(at), params.len()) };
+        s.used = at + params.len();
+        Ok(s.buf.device_address() + at as u64)
+    }
+
+    /// Records `kernel` over `grid` in workgroups of `group`.
+    fn encode(
         &mut self,
-        pipeline: &'a Pipeline,
-        params: &Params<'a>,
+        kernel: &str,
         grid: Grid,
-    ) -> Result<()> {
-        let info = &self.ctx.info;
-        let push = params.as_words();
-        let push_bytes = size_of_val(push) as u32;
-        if push_bytes > MAX_PARAMS_BYTES.min(info.max_push_constants_size) {
-            return Err(Error::Invalid(format!(
-                "{push_bytes} bytes of params for {}",
-                pipeline.name
+        group: usize,
+        args: &[Arg<'a>],
+        params: &[u8],
+        shared: &[usize],
+    ) -> Result<(), Error> {
+        let vk = self.vk;
+        let info = vk.dev.info();
+        let sh = shape(kernel);
+        let max = max_group(info);
+        if group == 0 || group > max {
+            return Err(Error::Device(format!(
+                "`{kernel}`: workgroup of {group} threads (device max {max})"
             )));
         }
-        let groups = match grid {
-            Grid::Threads(n) => n.div_ceil(pipeline.workgroup() as u64),
-            Grid::Groups(g) => g,
-        };
-        if groups == 0 {
-            return Ok(());
-        }
-        let [max_x, max_y, _] = info.max_compute_work_group_count;
-        let (gx, gy) = fold(groups, max_x, max_y).ok_or_else(|| {
-            Error::Invalid(format!(
-                "{groups} workgroups of {} fit no dispatch grid",
-                pipeline.name
-            ))
-        })?;
-        self.barrier();
-        let d = &self.ctx.shared.device;
-        let bytes: Vec<u8> = push.iter().flat_map(|w| w.to_ne_bytes()).collect();
-        let cmd = self.submit.cmd;
-        // SAFETY: the command buffer is recording; the pipeline and every
-        // buffer whose address is pushed outlive the submission (borrowed for
-        // 'a).
-        unsafe {
-            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline.pipeline);
-            if !bytes.is_empty() {
-                d.cmd_push_constants(
-                    cmd,
-                    self.ctx.pipeline_layout,
-                    vk::ShaderStageFlags::COMPUTE,
-                    0,
-                    &bytes,
-                );
+        let mut spec = [0u32; device::SPEC_CONSTANTS];
+        match (sh.shared_words, shared) {
+            (_, []) => {}
+            (true, [bytes]) => {
+                if *bytes > info.max_compute_shared_memory_size as usize || bytes % 4 != 0 {
+                    return Err(Error::Device(format!(
+                        "`{kernel}`: {bytes} bytes of shared memory (device max {})",
+                        info.max_compute_shared_memory_size
+                    )));
+                }
+                spec[0] = (*bytes / 4) as u32;
             }
-            d.cmd_dispatch(cmd, gx, gy, 1);
+            _ => {
+                return Err(Error::Device(format!(
+                    "`{kernel}` takes no shared-memory blocks {shared:?}"
+                )));
+            }
         }
-        self.recorded = true;
-        Ok(())
-    }
-
-    /// Makes the writes of every command recorded so far visible to the
-    /// commands recorded after it (a no-op before the first command).
-    fn barrier(&mut self) {
-        if !self.recorded {
-            return;
-        }
-        let stages = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
-        let b = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(
-                vk::AccessFlags::SHADER_READ
-                    | vk::AccessFlags::SHADER_WRITE
-                    | vk::AccessFlags::TRANSFER_READ
-                    | vk::AccessFlags::TRANSFER_WRITE,
-            )];
-        // SAFETY: the command buffer is recording.
-        unsafe {
-            self.ctx.shared.device.cmd_pipeline_barrier(
-                self.submit.cmd,
-                stages,
-                stages,
-                vk::DependencyFlags::empty(),
-                &b,
-                &[],
-                &[],
-            )
+        let options = PipelineOptions {
+            workgroup: group as u32,
+            subgroup: (sh.msm && group.is_multiple_of(MSM_SUBGROUP as usize))
+                .then_some(MSM_SUBGROUP),
+            spec,
         };
-    }
+        let pipeline = vk.dev.pipeline(kernel, vk.variant, options).map_err(err)?;
 
-    /// Records a copy of the first `bytes` bytes of `src` to `dst`.
-    pub fn copy(&mut self, src: &'a Buffer, dst: &'a Buffer, bytes: usize) -> Result<()> {
-        if bytes > src.len || bytes > dst.len {
-            return Err(Error::Invalid(format!("a copy of {bytes} bytes")));
+        let mut push = Params::new();
+        for a in args {
+            push = push.addr_at(a.raw().buffer(), a.offset());
         }
-        if bytes == 0 {
-            return Ok(());
+        if sh.params_by_address {
+            let at = self.park(params)?;
+            push = push.u64s(&[at]);
+        } else {
+            push = push.words(&words(kernel, params)?);
         }
-        self.barrier();
-        let region = [vk::BufferCopy::default().size(bytes as u64)];
-        // SAFETY: the command buffer is recording; both buffers hold `bytes`.
-        unsafe {
-            self.ctx
-                .shared
-                .device
-                .cmd_copy_buffer(self.submit.cmd, src.buffer, dst.buffer, &region)
-        };
-        self.recorded = true;
-        Ok(())
-    }
-
-    /// Submits the commands and waits for them. Returns the wall time from
-    /// the submission to the signalled fence.
-    pub fn submit(self) -> Result<Duration> {
-        let s = &self.ctx.shared;
-        let d = &s.device;
-        let cmd = self.submit.cmd;
-        let to_host = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ)];
-        // SAFETY: the command buffer is recording; queue and fence belong to
-        // the context and are used under the submission lock held by `self`.
-        unsafe {
-            d.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &to_host,
-                &[],
-                &[],
-            );
-            s.check("vkEndCommandBuffer", d.end_command_buffer(cmd))?;
-            s.check("vkResetFences", d.reset_fences(&[self.submit.fence]))?;
-            let cmds = [cmd];
-            let info = [vk::SubmitInfo::default().command_buffers(&cmds)];
-            let _gate = s.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-            let t0 = Instant::now();
-            s.check(
-                "vkQueueSubmit",
-                d.queue_submit(self.submit.queue, &info, self.submit.fence),
-            )?;
-            s.check(
-                "vkWaitForFences",
-                d.wait_for_fences(&[self.submit.fence], true, u64::MAX),
-            )?;
-            Ok(t0.elapsed())
+        if sh.count {
+            let n = match grid {
+                Grid::Threads(n) => u32::try_from(n).ok(),
+                Grid::Groups(_) => None,
+            };
+            let n = n.ok_or_else(|| Error::Device(format!("`{kernel}`: element count")))?;
+            push = push.u32(n);
         }
+        self.cmds.dispatch_shared(&pipeline, &push, grid).map_err(err)
     }
 }
 
-#[cfg(test)]
-mod fold_tests {
-    use super::fold;
+impl<'a> Encoder<'a, Vulkan> for VulkanCommand<'a> {
+    fn copy(
+        &mut self,
+        src: &'a VulkanBuffer,
+        dst: &'a VulkanBuffer,
+        bytes: usize,
+    ) -> Result<(), Error> {
+        self.cmds.copy(&src.0, &dst.0, bytes).map_err(err)
+    }
 
-    #[test]
-    fn grids_are_exact() {
-        assert_eq!(fold(5, 65535, 65535), Some((5, 1)));
-        assert_eq!(fold(1 << 18, 65535, 65535), Some((32768, 8)));
-        assert_eq!(fold(100_000, 65535, 65535), Some((50_000, 2)));
-        // 65537 is prime: no exact grid
-        assert_eq!(fold(3 * 65537, 65535, 65535), None);
+    fn dispatch(
+        &mut self,
+        kernel: &str,
+        threads: usize,
+        args: &[Arg<'a>],
+        params: &[u8],
+    ) -> Result<(), Error> {
+        let group = DISPATCH_GROUP.min(max_group(self.vk.dev.info()));
+        self.encode(
+            kernel,
+            Grid::Threads(threads as u64),
+            group,
+            args,
+            params,
+            &[],
+        )
+    }
+
+    fn dispatch_with(
+        &mut self,
+        kernel: &str,
+        threads: usize,
+        group: usize,
+        args: &[Arg<'a>],
+        params: &[u8],
+        shared: &[usize],
+    ) -> Result<(), Error> {
+        self.encode(
+            kernel,
+            Grid::Threads(threads as u64),
+            group,
+            args,
+            params,
+            shared,
+        )
+    }
+
+    fn dispatch_groups(
+        &mut self,
+        kernel: &str,
+        groups: usize,
+        group: usize,
+        args: &[Arg<'a>],
+        params: &[u8],
+        shared: &[usize],
+    ) -> Result<(), Error> {
+        self.encode(
+            kernel,
+            Grid::Groups(groups as u64),
+            group,
+            args,
+            params,
+            shared,
+        )
+    }
+}
+
+thread_local! {
+    /// Whether this thread is recording a [`Vulkan::run`].
+    static IN_RUN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks this thread as recording a run until dropped.
+struct Recording;
+
+impl Recording {
+    /// `None` when this thread already records one: the main command buffer
+    /// is locked by it.
+    fn start() -> Option<Recording> {
+        (!IN_RUN.replace(true)).then_some(Recording)
+    }
+}
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        IN_RUN.set(false);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The backend
+
+/// The host state of the Vulkan backend.
+static HOST: HostState<Vulkan> = HostState::new();
+
+impl Backend for Vulkan {
+    const NAME: &'static str = "vulkan";
+    const ENV_PREFIX: &'static str = "MIDNIGHT_VULKAN";
+    type Raw = VulkanBuffer;
+    type Cmd<'a> = VulkanCommand<'a>;
+    const TUNING: Tuning = crate::tuning::TUNING;
+
+    fn host() -> &'static HostState<Self> {
+        &HOST
+    }
+
+    fn probe() -> Option<&'static DeviceInfo> {
+        probe_device().map(|v| &v.neutral)
+    }
+
+    fn context() -> Result<&'static Self, Error> {
+        match CTX.get_or_init(make_context) {
+            Ok(v) if v.dev.failed() => Err(Error::NoDevice("the Vulkan device was lost".into())),
+            Ok(v) => Ok(v),
+            Err(e) => Err(Error::NoDevice(e.clone())),
+        }
+    }
+
+    fn unified(&self) -> bool {
+        self.dev.info().unified_memory
+    }
+
+    fn budget(&self) -> (u64, u64) {
+        self.dev.budget()
+    }
+
+    fn max_buffer_len(&self) -> u64 {
+        self.dev.info().max_buffer_len()
+    }
+
+    fn alloc_raw(&self, len: usize) -> Option<(VulkanBuffer, bool)> {
+        // new Vulkan memory is not known to be zero
+        self.dev.alloc(len).ok().map(|b| (VulkanBuffer(b), false))
+    }
+
+    fn alloc_staging(&self, len: usize) -> Option<(VulkanBuffer, bool)> {
+        self.dev.staging(len).ok().map(|b| (VulkanBuffer(b), false))
+    }
+
+    fn run<'a, R>(
+        &'a self,
+        f: impl FnOnce(&mut VulkanCommand<'a>) -> Result<R, Error>,
+    ) -> Result<(R, u64), Error> {
+        let Some(_recording) = Recording::start() else {
+            return Err(Error::Device(
+                "a command buffer was started while recording another".into(),
+            ));
+        };
+        let cmds = self.dev.commands().map_err(err)?;
+        let mut enc = VulkanCommand {
+            vk: self,
+            cmds,
+            slabs: Vec::new(),
+        };
+        let value = f(&mut enc);
+        // what was recorded runs even when `f` failed: its copies keep the
+        // shadows' states true
+        let VulkanCommand { cmds, slabs, .. } = enc;
+        let time = cmds.submit();
+        self.put_slabs(slabs);
+        let time = time.map_err(err)?;
+        Ok((value?, time.as_nanos().min(u64::MAX as u128) as u64))
+    }
+
+    fn max_group(&self, kernel: &str) -> Result<usize, Error> {
+        if !device::kernels().any(|k| k == kernel) {
+            return Err(Error::Device(format!("no kernel `{kernel}`")));
+        }
+        Ok(max_group(self.dev.info()))
+    }
+
+    fn subgroup_width(&self, kernel: &str) -> Result<usize, Error> {
+        if !device::kernels().any(|k| k == kernel) {
+            return Err(Error::Device(format!("no kernel `{kernel}`")));
+        }
+        let info = self.dev.info();
+        Ok(if shape(kernel).msm && info.takes_subgroup(MSM_SUBGROUP) {
+            MSM_SUBGROUP as usize
+        } else {
+            info.subgroup_size as usize
+        })
     }
 }

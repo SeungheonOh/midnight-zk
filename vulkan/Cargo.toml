@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 description = """
-Vulkan compute kernels for the midnight-proofs accelerator hooks: BLS12-381 field and G1 arithmetic and the device context
+Vulkan compute kernels for the midnight-proofs accelerator hooks: BLS12-381 field arithmetic, the device context, and the MSM, NTT and quotient entry points
 """
 license = "Apache-2.0"
 categories = ["cryptography"]
@@ -16,14 +16,18 @@ workspace = true
 
 [features]
 default = []
-# Test only: the test and measurement kernels, for this crate's tests.
-test-support = []
+# Test only: the test switches, test entry points, and the test and
+# measurement kernels, for this crate's tests and those of
+# `midnight-gpu-prover`.
+test-support = ["midnight-accel/test-support"]
 
 [dependencies]
+midnight-accel = { path = "../accel" }
 ash = { version = "0.38.0", default-features = false, features = ["loaded", "std", "debug"] }
 
 [dev-dependencies]
 midnight-vulkan = { path = ".", features = ["test-support"] }
+midnight-accel = { path = "../accel", features = ["testkit"] }
 blst = "0.3.15"
 ff = { workspace = true }
 group = { workspace = true }

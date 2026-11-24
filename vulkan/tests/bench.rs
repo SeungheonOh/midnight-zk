@@ -26,7 +26,10 @@ use std::time::Duration;
 use ff::Field;
 use group::{Curve, Group};
 use midnight_curves::{Fp, Fq, G1Affine, G1Projective};
-use midnight_vulkan::{Grid, Params, PipelineOptions, Variant, test_support::context};
+use midnight_vulkan::{
+    device::{Grid, Params, PipelineOptions, Variant},
+    test_support::context,
+};
 use rand_chacha::ChaCha8Rng;
 use rand_core::{RngCore, SeedableRng};
 
