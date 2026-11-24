@@ -105,7 +105,7 @@ pub fn device_share<B: Backend>(n: usize, table: bool) -> usize {
         return n;
     }
     let k = lg2_nearest(n);
-    let shares = B::TUNING.msm_shares;
+    let shares = B::tuning().msm_shares;
     let (lo, hi) = (shares[0].0, shares[shares.len() - 1].0);
     if k < lo {
         return n;

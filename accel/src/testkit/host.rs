@@ -402,7 +402,7 @@ pub fn per_class_thresholds<B: Backend>() {
         eprintln!("{min_k_var} is set: the defaults are not in force; skipped");
         return;
     }
-    let d = B::TUNING.thresholds;
+    let d = B::tuning().thresholds;
     assert_eq!(crate::thresholds::<B>(), d);
     assert!(!d.explicit);
     assert_eq!(d.msm_one_shot, None, "the one-shot MSM is off by default");

@@ -106,7 +106,7 @@ impl Geometry {
             return Err(Error::Device("msm: window too wide for the sort".into()));
         }
         simd_width_ok(c)?;
-        let t = &B::TUNING;
+        let t = B::tuning();
         Ok(Geometry {
             sort_block,
             ones_block,

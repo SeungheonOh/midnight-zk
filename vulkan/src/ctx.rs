@@ -258,6 +258,8 @@ pub struct Vulkan {
     dev: Context,
     variant: Variant,
     neutral: DeviceInfo,
+    /// The constants of the device's class.
+    tuning: &'static Tuning,
     /// Idle host-visible buffers for parameter blocks read by address.
     slabs: Mutex<Vec<device::Buffer>>,
 }
@@ -365,10 +367,12 @@ fn make_context() -> Result<Vulkan, String> {
         max_buffer_length: info.max_buffer_len(),
         max_threads_per_group: max_group(info) as u64,
     };
+    let tuning = crate::tuning::for_device(info);
     Ok(Vulkan {
         dev,
         variant,
         neutral,
+        tuning,
         slabs: Mutex::new(Vec::new()),
     })
 }
@@ -814,7 +818,15 @@ impl Backend for Vulkan {
     const ENV_PREFIX: &'static str = "MIDNIGHT_VULKAN";
     type Raw = VulkanBuffer;
     type Cmd<'a> = VulkanCommand<'a>;
-    const TUNING: Tuning = crate::tuning::TUNING;
+    /// The constants of the device's class ([`crate::tuning::for_device`]),
+    /// the unified-memory ones when no device is used.
+    fn tuning() -> &'static Tuning {
+        static OFF: OnceLock<bool> = OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var("MIDNIGHT_VULKAN").as_deref() == Ok("off")) {
+            return &crate::tuning::TUNING;
+        }
+        probe_device().map_or(&crate::tuning::TUNING, |v| v.tuning)
+    }
 
     fn host() -> &'static HostState<Self> {
         &HOST

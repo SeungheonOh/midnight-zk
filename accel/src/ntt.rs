@@ -463,7 +463,7 @@ fn run_job<B: Backend>(ctx: &Ctx<B>, job: &Job<'_, B>) -> Result<u64, Error> {
     let mut ns = 0;
     let mut q = 0;
     while q < passes {
-        let end = run_end(&params, q, n, B::TUNING.ntt_run_budget);
+        let end = run_end(&params, q, n, B::tuning().ntt_run_budget);
         let lo = scaled.as_ref();
         let first = q == 0;
         let last_cb = end == passes;

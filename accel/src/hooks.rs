@@ -106,7 +106,7 @@ fn explicit_min_k<B: Backend>() -> Option<u32> {
 /// The effective threshold of each class: the explicit one, else the
 /// backend's defaults ([`crate::Tuning::thresholds`]).
 pub fn thresholds<B: Backend>() -> Thresholds {
-    explicit_min_k::<B>().map_or(B::TUNING.thresholds, Thresholds::all)
+    explicit_min_k::<B>().map_or(B::tuning().thresholds, Thresholds::all)
 }
 
 /// The explicit threshold, else the smallest per-class default.
@@ -277,7 +277,7 @@ fn msm_g1_body<B: Backend>(
     if let Some(s) = sized {
         *s = sized_by_lookup(&lookup, n, &t);
     }
-    let tuning = &B::TUNING;
+    let tuning = B::tuning();
     let (table, need) = match lookup {
         msm::Lookup::Table(tb) => (
             Some(tb),

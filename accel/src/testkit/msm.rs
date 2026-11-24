@@ -305,7 +305,7 @@ pub fn mask_is_the_cuda_vector<B: Backend>() {
 /// not: `(split between CPU and device, window bits, chunks)`.
 fn expected<B: Backend>(n: usize, table: bool) -> (bool, u32, u32) {
     let m = device_share::<B>(n, table);
-    let p = plan(m, &B::TUNING);
+    let p = plan(m, B::tuning());
     (m < n, p.wbits, p.batch as u32)
 }
 
@@ -439,7 +439,7 @@ pub fn abs_boundary_scalars_match_cpu<B: Backend>() {
         (top + Fq::ONE) * p2(224) - Fq::ONE, // top limb of s and r - s equal
         top * p2(224),                       // top limbs next to each other
     ];
-    let n = (1usize << 14).min(B::TUNING.msm_hot_bucket_limit as usize);
+    let n = (1usize << 14).min(B::tuning().msm_hot_bucket_limit as usize);
     let bases = &points_cache()[..n];
     let mask = mask_fq(n);
     for split in [false, true] {
@@ -502,7 +502,7 @@ pub fn wide_windows_and_chunks_match_cpu<B: Backend>() {
 /// `s_i = c - mask_i` puts every point of a window in one bucket: exact up
 /// to the hot-bucket limit, a `device-error` decline above it.
 pub fn hot_bucket_is_exact_or_declined<B: Backend>() {
-    let lim = B::TUNING.msm_hot_bucket_limit.ilog2();
+    let lim = B::tuning().msm_hot_bucket_limit.ilog2();
     let _g = setup::<B>(Some(lim.min(14)), true);
     let c = Fq::random(ChaCha8Rng::seed_from_u64(4242));
     for (k, served) in [(lim, true), (lim + 1, false)] {
@@ -566,7 +566,7 @@ pub fn sparse_msm_declines_below_min_k<B: Backend>() {
     assert_eq!(t.msm_one_shot, None);
     let n = 1usize << 16;
     let bases = &points_cache()[..n];
-    let need = B::TUNING.msm_sparse_fixed + n / B::TUNING.msm_sparse_div;
+    let need = B::tuning().msm_sparse_fixed + n / B::tuning().msm_sparse_div;
     let declined = |s: &[Fq], b: &[G1Affine]| try_device_msm::<B>(s, b).is_none();
     let served = |s: &[Fq], b: &[G1Affine]| {
         assert!(

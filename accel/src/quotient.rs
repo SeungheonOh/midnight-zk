@@ -143,7 +143,7 @@ fn state<B: Backend>() -> &'static QuotientState {
 /// The GPU time one command buffer of the numerator aims at.
 fn target<B: Backend>() -> u64 {
     match state::<B>().target.load(Relaxed) {
-        0 => B::TUNING.quotient_target_nanos.max(1),
+        0 => B::tuning().quotient_target_nanos.max(1),
         t => t,
     }
 }
@@ -172,7 +172,7 @@ pub fn threads<B: Backend>() -> u32 {
     let t = std::env::var(format!("{}_QUOTIENT_THREADS", B::ENV_PREFIX))
         .ok()
         .and_then(|e| e.trim().parse::<u64>().ok())
-        .map_or(B::TUNING.quotient_threads, normalize_threads);
+        .map_or(B::tuning().quotient_threads, normalize_threads);
     let _ = q.threads.compare_exchange(0, t, Relaxed, Relaxed);
     q.threads.load(Relaxed)
 }

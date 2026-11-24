@@ -280,7 +280,7 @@ pub fn pool_limit<B: Backend>() -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(|m| m.saturating_mul(1 << 20))
         .unwrap_or_else(|| {
-            B::probe().map_or(0, |i| i.memory_budget / B::TUNING.pool_divisor.max(1))
+            B::probe().map_or(0, |i| i.memory_budget / B::tuning().pool_divisor.max(1))
         })
         .min(POOL_LIMIT_UNREAD - 1);
     let _ = h.pool_limit.compare_exchange(POOL_LIMIT_UNREAD, l, Relaxed, Relaxed);
@@ -1872,26 +1872,30 @@ mod tests {
 
     static HOST: HostState<Mock> = HostState::new();
 
+    const MOCK_TUNING: Tuning = Tuning {
+        thresholds: Thresholds::all(1),
+        msm_windows: &[(13, 11, 1)],
+        msm_shares: &[(13, 64, 64)],
+        msm_chunk_adds: 1 << 25,
+        msm_sort_groups: 8,
+        msm_ones_groups: 32,
+        msm_hot_bucket_limit: 1 << 16,
+        msm_sparse_div: 5,
+        msm_sparse_fixed: 1 << 12,
+        ntt_run_budget: 1 << 30,
+        quotient_target_nanos: 1 << 28,
+        quotient_threads: 1 << 16,
+        pool_divisor: 4,
+    };
+
     impl Backend for Mock {
         const NAME: &'static str = "mock";
         const ENV_PREFIX: &'static str = "MIDNIGHT_ACCEL_MOCK";
         type Raw = MockBuf;
         type Cmd<'a> = MockCmd;
-        const TUNING: Tuning = Tuning {
-            thresholds: Thresholds::all(1),
-            msm_windows: &[(13, 11, 1)],
-            msm_shares: &[(13, 64, 64)],
-            msm_chunk_adds: 1 << 25,
-            msm_sort_groups: 8,
-            msm_ones_groups: 32,
-            msm_hot_bucket_limit: 1 << 16,
-            msm_sparse_div: 5,
-            msm_sparse_fixed: 1 << 12,
-            ntt_run_budget: 1 << 30,
-            quotient_target_nanos: 1 << 28,
-            quotient_threads: 1 << 16,
-            pool_divisor: 4,
-        };
+        fn tuning() -> &'static Tuning {
+            &MOCK_TUNING
+        }
 
         fn host() -> &'static HostState<Self> {
             &HOST

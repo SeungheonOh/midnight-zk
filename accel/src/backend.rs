@@ -105,9 +105,11 @@ pub trait Backend: Sized + Send + Sync + 'static {
     type Raw: RawBuffer;
     /// The encoder of one command buffer ([`Backend::run`]).
     type Cmd<'a>: Encoder<'a, Self>;
-    /// The backend's measured constants. A constant rather than a method of
-    /// the context: the thresholds are read before the device is.
-    const TUNING: Tuning;
+    /// The backend's measured constants for the device it would use. Not a
+    /// method of the context: the thresholds are read before the context is
+    /// made. A backend whose devices differ in kind may choose by the device
+    /// ([`Backend::probe`]).
+    fn tuning() -> &'static Tuning;
 
     /// The host state of this backend: one static per backend.
     fn host() -> &'static HostState<Self>;

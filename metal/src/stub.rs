@@ -81,7 +81,10 @@ impl Backend for Metal {
     const ENV_PREFIX: &'static str = "MIDNIGHT_METAL";
     type Raw = NoBuffer;
     type Cmd<'a> = Metal;
-    const TUNING: Tuning = crate::tuning::TUNING;
+    #[inline]
+    fn tuning() -> &'static Tuning {
+        &crate::tuning::TUNING
+    }
 
     fn host() -> &'static HostState<Self> {
         &HOST

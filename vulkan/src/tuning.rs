@@ -82,3 +82,72 @@ pub(crate) const TUNING: Tuning = Tuning {
     // a quarter of the device-local memory budget
     pool_divisor: 4,
 };
+
+/// The constants of discrete GPUs (device memory the host does not map).
+pub(crate) const DISCRETE: Tuning = Tuning { ..TUNING };
+
+/// The constants of `info`'s device class: [`DISCRETE`] for a GPU whose
+/// memory the host does not map, else [`TUNING`] (Apple GPUs through
+/// MoltenVK, integrated GPUs, CPU implementations).
+pub(crate) fn for_device(info: &crate::device::VulkanInfo) -> &'static Tuning {
+    let base = if info.unified_memory { &TUNING } else { &DISCRETE };
+    tmp_override(base)
+}
+
+// TEMPORARY exploration knobs
+fn tmp_override(base: &'static Tuning) -> &'static Tuning {
+    let get = |k: &str| std::env::var(k).ok();
+    if get("VKT").is_none() {
+        return base;
+    }
+    let mut t = *base;
+    let parse3 = |s: &str| -> &'static [(u32, u32, usize)] {
+        let v: Vec<(u32, u32, usize)> = s
+            .split(';')
+            .map(|e| {
+                let p: Vec<usize> = e.split(',').map(|x| x.parse().unwrap()).collect();
+                (p[0] as u32, p[1] as u32, p[2])
+            })
+            .collect();
+        Box::leak(v.into_boxed_slice())
+    };
+    if let Some(s) = get("VKT_WINDOWS") {
+        t.msm_windows = parse3(&s);
+    }
+    if let Some(s) = get("VKT_SHARES") {
+        let v: Vec<(u32, usize, usize)> = s
+            .split(';')
+            .map(|e| {
+                let p: Vec<usize> = e.split(',').map(|x| x.parse().unwrap()).collect();
+                (p[0] as u32, p[1], p[2])
+            })
+            .collect();
+        t.msm_shares = Box::leak(v.into_boxed_slice());
+    }
+    if let Some(s) = get("VKT_CHUNK") {
+        t.msm_chunk_adds = s.parse().unwrap();
+    }
+    if let Some(s) = get("VKT_SORTG") {
+        t.msm_sort_groups = s.parse().unwrap();
+    }
+    if let Some(s) = get("VKT_ONESG") {
+        t.msm_ones_groups = s.parse().unwrap();
+    }
+    if let Some(s) = get("VKT_NTTB") {
+        t.ntt_run_budget = s.parse().unwrap();
+    }
+    if let Some(s) = get("VKT_QT") {
+        t.quotient_threads = s.parse().unwrap();
+    }
+    if let Some(s) = get("VKT_QNS") {
+        t.quotient_target_nanos = s.parse().unwrap();
+    }
+    if let Some(s) = get("VKT_TH") {
+        let p: Vec<u32> = s.split(',').map(|x| x.parse().unwrap()).collect();
+        t.thresholds.fft = p[0];
+        t.thresholds.ifft = p[1];
+        t.thresholds.msm_table = p[2];
+        t.thresholds.quotient = p[3];
+    }
+    Box::leak(Box::new(t))
+}

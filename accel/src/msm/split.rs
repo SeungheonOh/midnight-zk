@@ -133,7 +133,7 @@ fn masked<B: Backend>(
     mut trace: Trace<'_>,
 ) -> Result<Served, Error> {
     let n = scalars.len();
-    let pl = plan(n, &B::TUNING);
+    let pl = plan(n, B::tuning());
     let c = s.ctx();
     let geo = Geometry::of(c, &pl)?;
     let bufs = bind_buffers(s, &pl, &geo, scalars, points)?;
