@@ -12,11 +12,15 @@
 // limitations under the License.
 
 //! Helpers shared by the integration tests: the host limbs of
-//! midnight-curves values.
+//! midnight-curves values and XYZZ records.
 
 #![allow(dead_code)]
 
+use blst::{blst_fp, blst_fp_mul};
 use midnight_curves::{Fq, G1Affine, G1Projective};
+
+/// An XYZZ record: `X`, `Y`, `ZZZ`, `ZZ` in `Fp` limbs.
+pub type Xyzz = [u64; 24];
 
 /// The scalar-field modulus `r`, little-endian limbs.
 pub const FR_MODULUS: [u64; 4] = [
@@ -53,4 +57,34 @@ pub fn scalar(a: &Fq) -> [u64; 4] {
     // SAFETY: `Fq` is a transparent `blst_fr`, `[u64; 4]` (size checked
     // above).
     unsafe { std::mem::transmute_copy(a) }
+}
+
+pub fn fp(l: &[u64]) -> blst_fp {
+    blst_fp {
+        l: l.try_into().unwrap(),
+    }
+}
+
+pub fn fmul(a: &blst_fp, b: &blst_fp) -> blst_fp {
+    let mut r = blst_fp::default();
+    // SAFETY: valid field elements.
+    unsafe { blst_fp_mul(&mut r, a, b) };
+    r
+}
+
+pub fn fsqr(a: &blst_fp) -> blst_fp {
+    fmul(a, a)
+}
+
+/// An XYZZ record as a point, checking `ZZ^3 = ZZZ^2`.
+pub fn xyzz_point(r: &Xyzz) -> G1Projective {
+    let (x, y, zzz, zz) = (fp(&r[..6]), fp(&r[6..12]), fp(&r[12..18]), fp(&r[18..]));
+    let zero = |f: &blst_fp| f.l.iter().all(|&w| w == 0);
+    assert_eq!(zero(&zz), zero(&zzz), "ZZ and ZZZ disagree on infinity");
+    assert_eq!(fmul(&fsqr(&zz), &zz).l, fsqr(&zzz).l, "ZZ^3 != ZZZ^2");
+    let mut j = [0u64; 18];
+    j[..6].copy_from_slice(&fmul(&x, &zz).l);
+    j[6..12].copy_from_slice(&fmul(&y, &zzz).l);
+    j[12..].copy_from_slice(&zz.l);
+    from_jacobian(j)
 }

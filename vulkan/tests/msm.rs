@@ -15,8 +15,8 @@
 
 mod common;
 
-use blst::{blst_fp, blst_fp_mul};
-use common::{affine, from_jacobian};
+use blst::blst_fp;
+use common::{Xyzz, affine, fmul, fp, fsqr, xyzz_point};
 use group::{Curve, Group, prime::PrimeCurveAffine};
 use midnight_curves::{G1Affine, G1Projective};
 use midnight_vulkan::{
@@ -26,29 +26,10 @@ use midnight_vulkan::{
 use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
 
-type Xyzz = [u64; 24];
-
 // Operation codes of `msm_test_g1` (shaders/msm_test_g1.comp).
 const OP_MADD: u32 = 0;
 const OP_ADD: u32 = 1;
 const OP_FROM_AFFINE: u32 = 2;
-
-fn fp(l: &[u64]) -> blst_fp {
-    blst_fp {
-        l: l.try_into().unwrap(),
-    }
-}
-
-fn fmul(a: &blst_fp, b: &blst_fp) -> blst_fp {
-    let mut r = blst_fp::default();
-    // SAFETY: valid field elements.
-    unsafe { blst_fp_mul(&mut r, a, b) };
-    r
-}
-
-fn fsqr(a: &blst_fp) -> blst_fp {
-    fmul(a, a)
-}
 
 /// `(x z^2, y z^3, z^3, z^2)`; infinity is all zero.
 fn xyzz_of(a: &G1Affine, z: &blst_fp) -> Xyzz {
@@ -64,19 +45,6 @@ fn xyzz_of(a: &G1Affine, z: &blst_fp) -> Xyzz {
     r[12..18].copy_from_slice(&zzz.l);
     r[18..].copy_from_slice(&zz.l);
     r
-}
-
-/// An XYZZ record as a point, checking `ZZ^3 = ZZZ^2`.
-fn point_of(r: &Xyzz) -> G1Projective {
-    let (x, y, zzz, zz) = (fp(&r[..6]), fp(&r[6..12]), fp(&r[12..18]), fp(&r[18..]));
-    let zero = |f: &blst_fp| f.l.iter().all(|&w| w == 0);
-    assert_eq!(zero(&zz), zero(&zzz), "ZZ and ZZZ disagree on infinity");
-    assert_eq!(fmul(&fsqr(&zz), &zz).l, fsqr(&zzz).l, "ZZ^3 != ZZZ^2");
-    let mut j = [0u64; 18];
-    j[..6].copy_from_slice(&fmul(&x, &zz).l);
-    j[6..12].copy_from_slice(&fmul(&y, &zzz).l);
-    j[12..].copy_from_slice(&zz.l);
-    from_jacobian(j)
 }
 
 fn g1_kernel(
@@ -134,7 +102,7 @@ fn g1_kernels_match_blst() {
                     p.to_curve() + q
                 };
                 assert!(
-                    point_of(&got[i]) == want,
+                    xyzz_point(&got[i]) == want,
                     "{variant:?} op {op}, negated {neg}, pair {i}"
                 );
                 if op == OP_ADD && *p != inf && q == -p.to_curve() {

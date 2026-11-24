@@ -1,0 +1,74 @@
+#version 460
+// This file is part of MIDNIGHT-ZK.
+// Copyright (C) Midnight Foundation
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// You may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// http://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Throughput kernels of the arithmetic: `bench_fr_mul` (BENCH_FR_MUL),
+// `bench_fp_mul` (BENCH_FP_MUL) and `bench_g1_madd` (BENCH_G1_MADD). Each
+// invocation chains `iters` operations on its own values, so the result
+// depends on every one of them.
+
+#extension GL_GOOGLE_include_directive : require
+
+layout(push_constant) uniform Params {
+    uint n;
+    uint iters;
+    // BENCH_G1_MADD: the number of table points minus one (a power of two
+    // minus one)
+    uint mask;
+} params;
+
+#if defined(BENCH_FR_MUL) || defined(BENCH_FP_MUL)
+
+#if defined(BENCH_FR_MUL)
+#include "fr.glsl"
+#define E Fr
+#define F(name) CAT(fr, name)
+#else
+#include "fp.glsl"
+#define E Fp
+#define F(name) CAT(fp, name)
+#endif
+
+layout(std430, set = 0, binding = 0) readonly buffer InA { E a[]; };
+layout(std430, set = 0, binding = 1) readonly buffer InB { E b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Out { E outv[]; };
+
+// out[i] = a[i] * b[i]^iters.
+void main() {
+    uint i = global_index();
+    if (i >= params.n) return;
+    E x = a[i];
+    E y = b[i];
+    for (uint k = 0u; k < params.iters; k++) x = F(_mul)(x, y);
+    outv[i] = x;
+}
+
+#elif defined(BENCH_G1_MADD)
+
+#include "g1.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer Table { G1Affine table[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Out { G1Xyzz outv[]; };
+
+// out[i] = sum of table[(i + k) & mask] for k in 0..=iters.
+void main() {
+    uint i = global_index();
+    if (i >= params.n) return;
+    G1Xyzz acc = g1_from_affine(table[i & params.mask]);
+    for (uint k = 1u; k <= params.iters; k++) g1_madd(acc, table[(i + k) & params.mask], false);
+    outv[i] = acc;
+}
+
+#else
+#error "BENCH_FR_MUL, BENCH_FP_MUL or BENCH_G1_MADD must be defined (build.rs)"
+#endif

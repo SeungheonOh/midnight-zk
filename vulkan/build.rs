@@ -89,6 +89,34 @@ const KERNELS: &[Kernel] = &[
         keep: &[],
         test: true,
     },
+    Kernel {
+        name: "bench_fr_mul",
+        source: "bench.comp",
+        defines: &["BENCH_FR_MUL"],
+        keep: &[],
+        test: true,
+    },
+    Kernel {
+        name: "bench_fp_mul",
+        source: "bench.comp",
+        defines: &["BENCH_FP_MUL"],
+        keep: &[],
+        test: true,
+    },
+    Kernel {
+        name: "bench_g1_madd",
+        source: "bench.comp",
+        defines: &["BENCH_G1_MADD"],
+        keep: &["g1_mul"],
+        test: true,
+    },
+    Kernel {
+        name: "bench_g1_madd_inline",
+        source: "bench.comp",
+        defines: &["BENCH_G1_MADD"],
+        keep: &[],
+        test: true,
+    },
 ];
 
 /// The arithmetic variants: (file suffix, `MONT_INT64`).
