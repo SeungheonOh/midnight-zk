@@ -216,21 +216,22 @@ fn write_parallel<T: ctx::Pod + Sync + Send, B: Backend>(
     data: &[T],
 ) -> Result<(), Error> {
     const PART: usize = 1 << 20;
-    let short = || Error::Memory("msm scratch".into());
-    let dst = buf.as_mut_slice::<T>().get_mut(..data.len()).ok_or_else(short)?;
-    if size_of_val(data) <= PART {
-        dst.copy_from_slice(data);
-        return Ok(());
-    }
-    let base = dst.as_mut_ptr() as usize;
-    par_parts(data.len(), 4, PART / size_of::<T>().max(1), |a, b| {
-        // SAFETY: `dst` holds `data.len()` elements and the parts `[a, b)`
-        // are disjoint and within it; `dst` is borrowed exclusively for the
-        // call.
-        unsafe {
-            std::ptr::copy_nonoverlapping(data[a..b].as_ptr(), (base as *mut T).add(a), b - a)
+    buf.host_write(|all: &mut [T]| {
+        let dst = all.get_mut(..data.len()).ok_or_else(|| Error::Memory("msm scratch".into()))?;
+        if size_of_val(data) <= PART {
+            dst.copy_from_slice(data);
+            return Ok(());
         }
-    })
-    .map(|_| ())
-    .ok_or_else(|| Error::Device("msm: a host copy failed".into()))
+        let base = dst.as_mut_ptr() as usize;
+        par_parts(data.len(), 4, PART / size_of::<T>().max(1), |a, b| {
+            // SAFETY: `dst` holds `data.len()` elements and the parts `[a, b)`
+            // are disjoint and within it; `dst` is borrowed exclusively for
+            // the call.
+            unsafe {
+                std::ptr::copy_nonoverlapping(data[a..b].as_ptr(), (base as *mut T).add(a), b - a)
+            }
+        })
+        .map(|_| ())
+        .ok_or_else(|| Error::Device("msm: a host copy failed".into()))
+    })?
 }

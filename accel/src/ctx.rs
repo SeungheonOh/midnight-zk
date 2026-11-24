@@ -45,9 +45,9 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     ptr::NonNull,
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, OnceLock,
         atomic::{
-            AtomicBool,
+            AtomicBool, AtomicU8,
             Ordering::{Relaxed, SeqCst},
         },
     },
@@ -345,6 +345,14 @@ pub fn release_pool<B: Backend>() -> u64 {
         p.bytes = 0;
         std::mem::take(&mut p.free)
     };
+    let staging = {
+        let mut p = B::host().staging.lock().unwrap_or_else(|e| e.into_inner());
+        p.bytes = 0;
+        std::mem::take(&mut p.free)
+    };
+    for b in staging {
+        b.on_release();
+    }
     release_raw::<B>(bufs)
 }
 
@@ -564,16 +572,47 @@ pub fn host_reads_zero(p: NonNull<u8>, len: usize) -> bool {
 // ---------------------------------------------------------------------------
 // Buffers
 
+/// A shadow: the shadow is the device buffer itself, or both hold the same
+/// bytes.
+const SYNCED: u8 = 0;
+/// A shadow: the host wrote it; the next run that binds the buffer copies it
+/// in.
+const HOST_AHEAD: u8 = 1;
+/// A shadow: a run may have written the device buffer since; the shadow is
+/// stale until a download.
+const DEVICE_AHEAD: u8 = 2;
+
+/// The host copy of a device buffer the host cannot map: a staging buffer of
+/// the backend, of the device buffer's allocation length. It holds the same
+/// witness data, so it is zeroed with its buffer and pooled like it.
+struct Shadow<B: Backend> {
+    raw: ManuallyDrop<B::Raw>,
+    /// [`SYNCED`], [`HOST_AHEAD`] or [`DEVICE_AHEAD`].
+    state: AtomicU8,
+    /// Serialises downloads into the shadow.
+    sync: Mutex<()>,
+}
+
 /// A device buffer, zeroed when dropped.
+///
+/// The host reads and writes the contents through [`Buffer::host_read`] and
+/// [`Buffer::host_write`]. When the backend maps the buffer into host memory
+/// these access it in place. Otherwise they access a shadow, a staging buffer
+/// made at the first host access: a written shadow is copied in by the next
+/// [`Ctx::run`] that binds the buffer, and a buffer marked with
+/// [`Command::download`] has its shadow refreshed after the run (a read
+/// without that mark downloads first, in a run of its own).
 pub struct Buffer<B: Backend> {
     raw: ManuallyDrop<B::Raw>,
     bytes: usize,
     /// Goes back to the pool when dropped; cleared when its zeroing failed or
     /// it failed the erasure check, so it is released instead.
     pooled: bool,
-    /// May hold a non-zero byte: written by the host or bound to a kernel
-    /// since last zeroed.
+    /// May hold a non-zero byte (the buffer or its shadow): written by the
+    /// host or bound to a kernel since last zeroed.
     dirty: AtomicBool,
+    /// The host copy; never made for a buffer with a host mapping.
+    shadow: OnceLock<Shadow<B>>,
 }
 
 impl<B: Backend> std::fmt::Debug for Buffer<B> {
@@ -583,6 +622,17 @@ impl<B: Backend> std::fmt::Debug for Buffer<B> {
 }
 
 impl<B: Backend> Buffer<B> {
+    /// A buffer over `raw`, known zero.
+    fn new(raw: B::Raw, bytes: usize, pooled: bool) -> Self {
+        Buffer {
+            raw: ManuallyDrop::new(raw),
+            bytes,
+            pooled,
+            dirty: AtomicBool::new(false),
+            shadow: OnceLock::new(),
+        }
+    }
+
     /// The length in bytes.
     pub fn len_bytes(&self) -> usize {
         self.bytes
@@ -598,29 +648,102 @@ impl<B: Backend> Buffer<B> {
         self.raw.id()
     }
 
-    /// The host address of the contents.
-    fn ptr(&self) -> *mut u8 {
-        self.raw.host_ptr().expect("a device buffer without a host mapping").as_ptr()
-    }
-
     /// Records that the buffer may now hold a non-zero byte.
     pub(crate) fn touch(&self) {
         self.dirty.store(true, Relaxed);
     }
 
-    /// The contents as a slice of `T`.
-    pub fn as_slice<T: Pod>(&self) -> &[T] {
-        // SAFETY: the mapping is aligned for any `Pod`, valid for `bytes`
-        // bytes, and no GPU work writes it while `&self` is held outside
-        // `Ctx::run`.
-        unsafe { std::slice::from_raw_parts(self.ptr().cast(), self.bytes / size_of::<T>()) }
+    /// The shadow, made (zeroed, from the staging pool) at the first call. A
+    /// buffer that may hold data starts with a stale shadow.
+    fn shadow(&self) -> Result<&Shadow<B>, Error> {
+        if let Some(sh) = self.shadow.get() {
+            return Ok(sh);
+        }
+        let raw = staging_take::<B>(self.raw.len())?;
+        let state = if self.dirty.load(Relaxed) {
+            DEVICE_AHEAD
+        } else {
+            SYNCED
+        };
+        let made = Shadow {
+            raw: ManuallyDrop::new(raw),
+            state: AtomicU8::new(state),
+            sync: Mutex::new(()),
+        };
+        if let Err(lost) = self.shadow.set(made) {
+            staging_put::<B>(ManuallyDrop::into_inner(lost.raw));
+        }
+        Ok(self.shadow.get().expect("the shadow was just set"))
     }
 
-    /// The contents as a mutable slice of `T`.
-    pub fn as_mut_slice<T: Pod>(&mut self) -> &mut [T] {
+    /// [`Buffer::host_view`] for writing: marks the buffer written and its
+    /// shadow ahead of the device.
+    fn host_view_mut(&mut self) -> Result<NonNull<u8>, Error> {
+        let p = self.host_view()?;
         self.touch();
-        // SAFETY: as `as_slice`, and `&mut self` is exclusive.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr().cast(), self.bytes / size_of::<T>()) }
+        if let Some(sh) = self.shadow.get() {
+            sh.state.store(HOST_AHEAD, SeqCst);
+        }
+        Ok(p)
+    }
+
+    /// The host address of the contents, current with the device: the
+    /// mapping, else the shadow after a download when it is stale.
+    fn host_view(&self) -> Result<NonNull<u8>, Error> {
+        if let Some(p) = self.raw.host_ptr() {
+            return Ok(p);
+        }
+        let sh = self.shadow()?;
+        if sh.state.load(SeqCst) == DEVICE_AHEAD {
+            let _sync = sh.sync.lock().unwrap_or_else(|e| e.into_inner());
+            if sh.state.load(SeqCst) == DEVICE_AHEAD {
+                context::<B>()?.run(|cmd| cmd.download(self))?;
+            }
+        }
+        sh.raw
+            .host_ptr()
+            .ok_or_else(|| Error::Device("a staging buffer without a host mapping".into()))
+    }
+
+    /// `f` over the contents as `T`s (the shadow on a device the host does
+    /// not map; a stale shadow is downloaded first).
+    #[inline]
+    pub fn host_read<T: Pod, R>(&self, f: impl FnOnce(&[T]) -> R) -> Result<R, Error> {
+        let p = self.host_view()?;
+        // SAFETY: the view is aligned for any `Pod`, valid for `bytes` bytes,
+        // and no GPU work writes it while `&self` is held outside `Ctx::run`.
+        let s =
+            unsafe { std::slice::from_raw_parts(p.as_ptr().cast(), self.bytes / size_of::<T>()) };
+        Ok(f(s))
+    }
+
+    /// `f` over the contents as mutable `T`s; the next run that binds the
+    /// buffer sees the writes (on a device the host does not map, the shadow
+    /// is copied in then).
+    #[inline]
+    pub fn host_write<T: Pod, R>(&mut self, f: impl FnOnce(&mut [T]) -> R) -> Result<R, Error> {
+        let p = self.host_view_mut()?;
+        // SAFETY: as `host_read`, and `&mut self` is exclusive.
+        let s = unsafe {
+            std::slice::from_raw_parts_mut(p.as_ptr().cast(), self.bytes / size_of::<T>())
+        };
+        Ok(f(s))
+    }
+
+    /// The contents as a slice of `T` ([`Buffer::host_read`]). Panics when the
+    /// host view cannot be made.
+    pub fn as_slice<T: Pod>(&self) -> &[T] {
+        let p = self.host_view().expect("a host view of a device buffer");
+        // SAFETY: as `host_read`.
+        unsafe { std::slice::from_raw_parts(p.as_ptr().cast(), self.bytes / size_of::<T>()) }
+    }
+
+    /// The contents as a mutable slice of `T` ([`Buffer::host_write`]).
+    /// Panics when the host view cannot be made.
+    pub fn as_mut_slice<T: Pod>(&mut self) -> &mut [T] {
+        let p = self.host_view_mut().expect("a host view of a device buffer");
+        // SAFETY: as `host_write`; the slice borrows `self` mutably.
+        unsafe { std::slice::from_raw_parts_mut(p.as_ptr().cast(), self.bytes / size_of::<T>()) }
     }
 
     /// Copies `data` to the start of the buffer. Panics if it does not fit.
@@ -633,17 +756,34 @@ impl<B: Backend> Buffer<B> {
         out.copy_from_slice(&self.as_slice::<T>()[..out.len()]);
     }
 
-    /// Zeroes the whole allocation (which may exceed [`Buffer::len_bytes`]).
-    /// Does not panic. A zeroing the backend reports failed is counted as an
-    /// erasure fault and the buffer is released instead of pooled.
+    /// `f` over the whole allocation's bytes, which may exceed
+    /// [`Buffer::len_bytes`]. Test support.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn host_read_alloc<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Result<R, Error> {
+        let p = self.host_view()?;
+        // SAFETY: the view is valid for the allocation's length.
+        Ok(f(unsafe {
+            std::slice::from_raw_parts(p.as_ptr(), self.raw.len())
+        }))
+    }
+
+    /// Zeroes the whole allocation (which may exceed [`Buffer::len_bytes`])
+    /// and its shadow. Does not panic. A zeroing the backend reports failed is
+    /// counted as an erasure fault and the buffer is released instead of
+    /// pooled.
     pub fn zero(&mut self) {
         // exclusive: `&mut self`
-        match self.raw.zero_all() {
-            Ok(()) => self.dirty.store(false, Relaxed),
-            Err(_) => {
-                self.pooled = false;
-                B::host().erase_faults.fetch_add(1, Relaxed);
-            }
+        let mut ok = self.raw.zero_all().is_ok();
+        if let Some(sh) = self.shadow.get() {
+            ok &= sh.raw.zero_all().is_ok();
+            sh.state.store(SYNCED, SeqCst);
+        }
+        if ok {
+            self.dirty.store(false, Relaxed);
+        } else {
+            self.pooled = false;
+            B::host().erase_faults.fetch_add(1, Relaxed);
         }
     }
 
@@ -661,11 +801,14 @@ impl<B: Backend> Buffer<B> {
             self.zero()
         }));
         if r.is_err() {
-            match self.raw.host_ptr() {
-                // SAFETY: valid for `len()` bytes, exclusive (`&mut self`).
-                Some(p) => unsafe { std::ptr::write_bytes(p.as_ptr(), 0, self.raw.len()) },
-                None => {
-                    let _ = self.raw.zero_all();
+            let shadow = self.shadow.get().map(|sh| &*sh.raw);
+            for raw in std::iter::once(&*self.raw).chain(shadow) {
+                match raw.host_ptr() {
+                    // SAFETY: valid for `len()` bytes, exclusive (`&mut self`).
+                    Some(p) => unsafe { std::ptr::write_bytes(p.as_ptr(), 0, raw.len()) },
+                    None => {
+                        let _ = raw.zero_all();
+                    }
                 }
             }
             std::sync::atomic::compiler_fence(SeqCst);
@@ -679,11 +822,30 @@ impl<B: Backend> Buffer<B> {
     pub fn alloc_bytes(&self) -> usize {
         self.raw.len()
     }
+
+    /// Reads back the buffer and its shadow: zero only when both are.
+    fn read_back_zero(&self) -> ReadBack {
+        let r = self.raw.read_back_zero();
+        match self.shadow.get().map(|sh| sh.raw.read_back_zero()) {
+            Some(ReadBack::Zero) | None => r,
+            Some(ReadBack::NonZero) if r == ReadBack::Zero => ReadBack::NonZero,
+            Some(ReadBack::Unreadable) => ReadBack::Unreadable,
+            Some(_) => r,
+        }
+    }
 }
 
 impl<B: Backend> Drop for Buffer<B> {
     fn drop(&mut self) {
         self.erase();
+        if let Some(sh) = self.shadow.take() {
+            let raw = ManuallyDrop::into_inner(sh.raw);
+            if self.pooled {
+                staging_put::<B>(raw);
+            } else {
+                raw.on_release();
+            }
+        }
         // SAFETY: taken once, here; `self.raw` is not used afterwards.
         let raw = unsafe { ManuallyDrop::take(&mut self.raw) };
         if self.pooled {
@@ -699,6 +861,58 @@ impl<B: Backend> Drop for Buffer<B> {
     }
 }
 
+/// A zeroed staging buffer of at least `len` bytes: from the staging pool,
+/// else new from the backend.
+fn staging_take<B: Backend>(len: usize) -> Result<B::Raw, Error> {
+    let took = {
+        let mut p = B::host().staging.lock().unwrap_or_else(|e| e.into_inner());
+        let max = len.saturating_add(len / 4);
+        let found = p
+            .free
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| (len..=max).contains(&b.len()))
+            .min_by_key(|(_, b)| b.len())
+            .map(|(i, _)| i);
+        found.map(|i| {
+            let b = p.free.swap_remove(i);
+            p.bytes -= b.len() as u64;
+            b
+        })
+    };
+    if let Some(b) = took {
+        return Ok(b);
+    }
+    let (raw, zeroed) = context::<B>()?
+        .alloc_staging(len)
+        .ok_or_else(|| Error::Memory(format!("staging buffer of {len} bytes")))?;
+    if !zeroed && let Err(e) = raw.zero_all() {
+        raw.on_release();
+        return Err(e);
+    }
+    Ok(raw)
+}
+
+/// Puts a zeroed staging buffer into the staging pool, or releases it above
+/// [`pool_limit`].
+fn staging_put<B: Backend>(raw: B::Raw) {
+    let len = raw.len() as u64;
+    let limit = pool_limit::<B>();
+    let back = {
+        let mut p = B::host().staging.lock().unwrap_or_else(|e| e.into_inner());
+        if p.bytes + len <= limit {
+            p.bytes += len;
+            p.free.push(raw);
+            None
+        } else {
+            Some(raw)
+        }
+    };
+    if let Some(b) = back {
+        b.on_release();
+    }
+}
+
 impl<B: Backend> Ctx<B> {
     /// A new [`Buffer`] over a fresh allocation, counted; a buffer not known
     /// to be zero-filled is zeroed first.
@@ -709,12 +923,7 @@ impl<B: Backend> Ctx<B> {
             return Err(e);
         }
         count_alloc::<B>(raw.len() as u64);
-        Ok(Buffer {
-            raw: ManuallyDrop::new(raw),
-            bytes,
-            pooled: false,
-            dirty: AtomicBool::new(false),
-        })
+        Ok(Buffer::new(raw, bytes, false))
     }
 
     /// The allocation length for `bytes`; `Err` above the device's largest
@@ -764,12 +973,7 @@ impl<B: Backend> Ctx<B> {
             took = pool_take::<B>(len);
         }
         let mut b = match took {
-            Some(raw) => Buffer {
-                raw: ManuallyDrop::new(raw),
-                bytes,
-                pooled: true,
-                dirty: AtomicBool::new(false),
-            },
+            Some(raw) => Buffer::new(raw, bytes, true),
             None => self.alloc(bytes)?,
         };
         b.pooled = true;
@@ -779,13 +983,9 @@ impl<B: Backend> Ctx<B> {
     /// A buffer holding a copy of `data`; bytes past the data read zero.
     pub fn upload<T: Pod>(&self, data: &[T]) -> Result<Buffer<B>, Error> {
         let bytes = size_of_val(data);
-        let b = self.alloc(bytes)?;
+        let mut b = self.alloc(bytes)?;
         if bytes > 0 {
-            b.touch();
-            // SAFETY: `data` is valid for `bytes` bytes, the new buffer for
-            // at least `bytes` bytes (its allocation is `max(bytes, 16)`),
-            // nothing else uses it yet, and the two do not overlap.
-            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().cast::<u8>(), b.ptr(), bytes) };
+            b.host_write(|d: &mut [u8]| d[..bytes].copy_from_slice(bytes_of_slice(data)))?;
         }
         Ok(b)
     }
@@ -793,12 +993,34 @@ impl<B: Backend> Ctx<B> {
     /// Encodes the dispatches of `f` into one command buffer, submits it and
     /// waits ([`Backend::run`]). Returns `f`'s value and the GPU time in
     /// nanoseconds.
+    ///
+    /// A buffer the host wrote through its shadow is copied in before its
+    /// first dispatch; a buffer marked with [`Command::download`] has its
+    /// shadow refreshed after the run.
     pub fn run<'a, R>(
         &'a self,
         f: impl FnOnce(&mut Command<'_, 'a, B>) -> Result<R, Error>,
     ) -> Result<(R, u64), Error> {
-        self.0.run(|enc| f(&mut Command { enc }))
+        let ((r, down), ns) = self.0.run(|enc| {
+            let mut cmd = Command {
+                enc,
+                down: Vec::new(),
+            };
+            let r = f(&mut cmd)?;
+            cmd.encode_downloads()?;
+            Ok((r, cmd.down))
+        })?;
+        for (_, sh) in down {
+            sh.state.store(SYNCED, SeqCst);
+        }
+        Ok((r, ns))
     }
+}
+
+/// The bytes of a slice of plain values.
+fn bytes_of_slice<T: Pod>(v: &[T]) -> &[u8] {
+    // SAFETY: Pod values are valid to view as their bytes.
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), size_of_val(v)) }
 }
 
 // ---------------------------------------------------------------------------
@@ -848,6 +1070,8 @@ impl<'a, B: Backend> Arg<'a, B> {
 /// writes of the earlier ones.
 pub struct Command<'c, 'a, B: Backend> {
     enc: &'c mut B::Cmd<'a>,
+    /// The buffers whose shadows are refreshed at the end of the run.
+    down: Vec<(&'a B::Raw, &'a Shadow<B>)>,
 }
 
 impl<B: Backend> std::fmt::Debug for Command<'_, '_, B> {
@@ -857,8 +1081,9 @@ impl<B: Backend> std::fmt::Debug for Command<'_, '_, B> {
 }
 
 impl<'a, B: Backend> Command<'_, 'a, B> {
-    /// Marks the buffers written and checks their offsets.
-    fn bind(&self, args: &[Arg<'a, B>]) -> Result<(), Error> {
+    /// Marks the buffers written, checks their offsets, and copies in the
+    /// shadows the host wrote.
+    fn bind(&mut self, args: &[Arg<'a, B>]) -> Result<(), Error> {
         for (i, a) in args.iter().enumerate() {
             let b = a.buffer();
             b.touch();
@@ -868,6 +1093,43 @@ impl<'a, B: Backend> Command<'_, 'a, B> {
                     a.offset()
                 )));
             }
+            if let Some(sh) = b.shadow.get() {
+                if sh.state.load(SeqCst) == HOST_AHEAD {
+                    self.enc.copy(&sh.raw, &b.raw, b.raw.len())?;
+                }
+                sh.state.store(DEVICE_AHEAD, SeqCst);
+            }
+        }
+        Ok(())
+    }
+
+    /// Marks `buf` to be read by the host after the run: on a device the host
+    /// does not map, its shadow is refreshed at the end of the run. Nothing on
+    /// a mapped buffer.
+    pub fn download(&mut self, buf: &'a Buffer<B>) -> Result<(), Error> {
+        if buf.raw.host_ptr().is_some() {
+            return Ok(());
+        }
+        let sh = buf.shadow()?;
+        buf.touch();
+        if !self.down.iter().any(|d| std::ptr::eq(d.1, sh)) {
+            self.down.push((&buf.raw, sh));
+        }
+        Ok(())
+    }
+
+    /// Encodes the copies of the marked buffers into their shadows. A shadow
+    /// the host wrote and no dispatch bound stays as it is.
+    fn encode_downloads(&mut self) -> Result<(), Error> {
+        let mut i = 0;
+        while i < self.down.len() {
+            let (raw, sh) = self.down[i];
+            if sh.state.load(SeqCst) == HOST_AHEAD {
+                self.down.swap_remove(i);
+                continue;
+            }
+            self.enc.copy(raw, &sh.raw, sh.raw.len())?;
+            i += 1;
         }
         Ok(())
     }
@@ -1224,7 +1486,7 @@ pub fn request_buffers<B: Backend>() -> Vec<(&'static str, usize, bool, u64)> {
         (
             k,
             b.alloc_bytes(),
-            b.raw.read_back_zero() == ReadBack::Zero,
+            b.read_back_zero() == ReadBack::Zero,
             b.id(),
         )
     };
@@ -1253,8 +1515,12 @@ pub enum ReadBack {
 
 /// Reads back a region's whole allocation and counts the result in `w`.
 fn read_back<R: RawBuffer>(raw: &R, w: &mut WipeStats) -> ReadBack {
+    count_read_back(raw.read_back_zero(), w)
+}
+
+/// Counts the read-back `r` of a region in `w`.
+fn count_read_back(r: ReadBack, w: &mut WipeStats) -> ReadBack {
     w.checked_regions += 1;
-    let r = raw.read_back_zero();
     match r {
         ReadBack::Unreadable => w.check_failures += 1,
         ReadBack::NonZero => w.nonzero_regions += 1,
@@ -1267,40 +1533,49 @@ fn read_back<R: RawBuffer>(raw: &R, w: &mut WipeStats) -> ReadBack {
 /// zeroed and read back again; it, and one that cannot be read back, is
 /// taken out of the pool and released.
 fn check_idle_pool<B: Backend>(w: &mut WipeStats) {
-    let bad: Vec<_> = {
-        let mut p = pool::<B>();
-        let mut bad = Vec::new();
-        let mut i = 0;
-        while i < p.free.len() {
-            let raw = &p.free[i];
-            let len = raw.len() as u64;
-            w.regions += 1;
-            w.bytes += len;
-            w.pool_regions += 1;
-            w.pool_bytes += len;
-            let fault = match read_back(raw, w) {
-                ReadBack::Zero => false,
-                ReadBack::Unreadable => true,
-                ReadBack::NonZero => {
-                    // idle under the pool's lock: exclusive
-                    let _ = raw.zero_all();
-                    let _again = raw.read_back_zero();
-                    true
-                }
-            };
-            if fault {
-                let b = p.free.swap_remove(i);
-                p.bytes -= len;
-                bad.push(b);
-            } else {
-                i += 1;
-            }
-        }
-        bad
-    };
+    let bad = check_pool(&mut pool::<B>(), w);
     // not `release_raw`: its debug read-back would fail on a buffer that is
     // not readable
     release_unchecked::<B>(bad);
+    let bad = check_pool(
+        &mut B::host().staging.lock().unwrap_or_else(|e| e.into_inner()),
+        w,
+    );
+    for b in bad {
+        b.on_release();
+    }
+}
+
+/// Reads back every idle buffer of `p`; returns the ones taken out.
+fn check_pool<R: RawBuffer>(p: &mut Pool<R>, w: &mut WipeStats) -> Vec<R> {
+    let mut bad = Vec::new();
+    let mut i = 0;
+    while i < p.free.len() {
+        let raw = &p.free[i];
+        let len = raw.len() as u64;
+        w.regions += 1;
+        w.bytes += len;
+        w.pool_regions += 1;
+        w.pool_bytes += len;
+        let fault = match read_back(raw, w) {
+            ReadBack::Zero => false,
+            ReadBack::Unreadable => true,
+            ReadBack::NonZero => {
+                // idle under the pool's lock: exclusive
+                let _ = raw.zero_all();
+                let _again = raw.read_back_zero();
+                true
+            }
+        };
+        if fault {
+            let b = p.free.swap_remove(i);
+            p.bytes -= len;
+            bad.push(b);
+        } else {
+            i += 1;
+        }
+    }
+    bad
 }
 
 /// Zeroes every per-request buffer (`state` is the device lock) after
@@ -1328,10 +1603,10 @@ fn wipe_locked<B: Backend>(state: &mut Option<State<B>>, check: bool, w: &mut Wi
         w.bytes += b.alloc_bytes() as u64;
         // exclusive: the region is owned here
         test_switch::plant_after_zeroing::<B>(check, i, &b.raw);
-        if check && read_back(&*b.raw, w) != ReadBack::Zero {
+        if check && count_read_back(b.read_back_zero(), w) != ReadBack::Zero {
             // zeroed again unconditionally, read back again, released
             b.zero();
-            let _again = b.raw.read_back_zero();
+            let _again = b.read_back_zero();
             b.pooled = false;
         }
         // zero (and not dirty): pooled, or released when it failed
@@ -1395,4 +1670,277 @@ pub fn mem_info<B: Backend>() -> Option<(usize, usize)> {
         (total + idle).saturating_sub(used).min(total) as usize,
         total as usize,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    //! The shadows of a backend whose device memory the host does not map,
+    //! on a backend that keeps "device" buffers in host memory behind a
+    //! missing host pointer.
+
+    use std::{
+        alloc::{Layout, alloc_zeroed, dealloc},
+        sync::atomic::AtomicU64,
+    };
+
+    use super::*;
+    use crate::{DeviceInfo, Encoder, HostState, Thresholds, Tuning};
+
+    /// Memory of a [`Mock`] buffer; a device buffer has no host pointer.
+    struct MockBuf {
+        mem: NonNull<u8>,
+        len: usize,
+        host: bool,
+        id: u64,
+    }
+
+    // SAFETY: plain memory, accessed under the shared code's rules.
+    unsafe impl Send for MockBuf {}
+    // SAFETY: as above.
+    unsafe impl Sync for MockBuf {}
+
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    impl MockBuf {
+        fn new(len: usize, host: bool) -> Self {
+            let layout = Layout::from_size_align(len, 64).unwrap();
+            // SAFETY: a non-zero size.
+            let mem = NonNull::new(unsafe { alloc_zeroed(layout) }).unwrap();
+            MockBuf {
+                mem,
+                len,
+                host,
+                id: NEXT.fetch_add(1, Relaxed),
+            }
+        }
+
+        /// The memory as bytes.
+        ///
+        /// # Safety
+        /// The buffer outlives the slice, and no other reference to the memory
+        /// is live.
+        unsafe fn bytes<'m>(&self) -> &'m mut [u8] {
+            // SAFETY: valid for `len` bytes; exclusive by the caller's contract.
+            unsafe { std::slice::from_raw_parts_mut(self.mem.as_ptr(), self.len) }
+        }
+    }
+
+    impl Drop for MockBuf {
+        fn drop(&mut self) {
+            // SAFETY: allocated in `new` with this layout.
+            unsafe {
+                dealloc(
+                    self.mem.as_ptr(),
+                    Layout::from_size_align(self.len, 64).unwrap(),
+                )
+            }
+        }
+    }
+
+    impl RawBuffer for MockBuf {
+        fn len(&self) -> usize {
+            self.len
+        }
+
+        fn id(&self) -> u64 {
+            self.id
+        }
+
+        fn host_ptr(&self) -> Option<NonNull<u8>> {
+            self.host.then_some(self.mem)
+        }
+
+        fn zero_all(&self) -> Result<(), Error> {
+            // SAFETY: the shared code has exclusive use while it zeroes.
+            unsafe { self.bytes() }.fill(0);
+            Ok(())
+        }
+
+        fn read_back_zero(&self) -> ReadBack {
+            // SAFETY: the shared code has exclusive use while it reads back.
+            if unsafe { self.bytes() }.iter().all(|b| *b == 0) {
+                ReadBack::Zero
+            } else {
+                ReadBack::NonZero
+            }
+        }
+    }
+
+    /// A backend with discrete memory and one kernel, `double`: every `u64`
+    /// of its buffer times two, run at encoding.
+    struct Mock;
+
+    struct MockCmd;
+
+    impl<'a> Encoder<'a, Mock> for MockCmd {
+        fn dispatch(
+            &mut self,
+            kernel: &str,
+            _: usize,
+            bufs: &[Arg<'a, Mock>],
+            _: &[u8],
+        ) -> Result<(), Error> {
+            assert_eq!(kernel, "double");
+            // SAFETY: the kernel runs at encoding; nothing else uses the buffer.
+            for w in unsafe { bufs[0].raw().bytes() }.chunks_mut(8) {
+                let v = u64::from_le_bytes(w.try_into().unwrap());
+                w.copy_from_slice(&(2 * v).to_le_bytes());
+            }
+            Ok(())
+        }
+
+        fn dispatch_with(
+            &mut self,
+            _: &str,
+            _: usize,
+            _: usize,
+            _: &[Arg<'a, Mock>],
+            _: &[u8],
+            _: &[usize],
+        ) -> Result<(), Error> {
+            unreachable!()
+        }
+
+        fn dispatch_groups(
+            &mut self,
+            _: &str,
+            _: usize,
+            _: usize,
+            _: &[Arg<'a, Mock>],
+            _: &[u8],
+            _: &[usize],
+        ) -> Result<(), Error> {
+            unreachable!()
+        }
+
+        fn copy(&mut self, src: &'a MockBuf, dst: &'a MockBuf, bytes: usize) -> Result<(), Error> {
+            // SAFETY: two distinct buffers, used by nothing else meanwhile.
+            unsafe { dst.bytes()[..bytes].copy_from_slice(&src.bytes()[..bytes]) };
+            Ok(())
+        }
+    }
+
+    static HOST: HostState<Mock> = HostState::new();
+
+    impl Backend for Mock {
+        const NAME: &'static str = "mock";
+        const ENV_PREFIX: &'static str = "MIDNIGHT_ACCEL_MOCK";
+        type Raw = MockBuf;
+        type Cmd<'a> = MockCmd;
+        const TUNING: Tuning = Tuning {
+            thresholds: Thresholds::all(1),
+            msm_windows: &[(13, 11, 1)],
+            msm_shares: &[(13, 64, 64)],
+            msm_chunk_adds: 1 << 25,
+            msm_sort_groups: 8,
+            msm_ones_groups: 32,
+            msm_hot_bucket_limit: 1 << 16,
+            msm_sparse_div: 5,
+            msm_sparse_fixed: 1 << 12,
+            ntt_run_budget: 1 << 30,
+            quotient_target_nanos: 1 << 28,
+            quotient_threads: 1 << 16,
+            pool_divisor: 4,
+        };
+
+        fn host() -> &'static HostState<Self> {
+            &HOST
+        }
+
+        fn probe() -> Option<&'static DeviceInfo> {
+            static INFO: OnceLock<DeviceInfo> = OnceLock::new();
+            Some(INFO.get_or_init(|| DeviceInfo {
+                name: "mock".into(),
+                unified_memory: false,
+                memory_budget: 1 << 30,
+                max_buffer_length: 1 << 30,
+                max_threads_per_group: 256,
+            }))
+        }
+
+        fn context() -> Result<&'static Self, Error> {
+            Ok(&Mock)
+        }
+
+        fn unified(&self) -> bool {
+            false
+        }
+
+        fn budget(&self) -> (u64, u64) {
+            (0, 1 << 30)
+        }
+
+        fn max_buffer_len(&self) -> u64 {
+            1 << 30
+        }
+
+        fn alloc_raw(&self, len: usize) -> Option<(MockBuf, bool)> {
+            Some((MockBuf::new(len, false), true))
+        }
+
+        fn alloc_staging(&self, len: usize) -> Option<(MockBuf, bool)> {
+            Some((MockBuf::new(len, true), true))
+        }
+
+        fn run<'a, R>(
+            &'a self,
+            f: impl FnOnce(&mut Self::Cmd<'a>) -> Result<R, Error>,
+        ) -> Result<(R, u64), Error> {
+            f(&mut MockCmd).map(|r| (r, 0))
+        }
+
+        fn max_group(&self, _: &str) -> Result<usize, Error> {
+            Ok(256)
+        }
+
+        fn subgroup_width(&self, _: &str) -> Result<usize, Error> {
+            Ok(32)
+        }
+    }
+
+    /// Writes reach the device at the next run that binds the buffer, reads
+    /// see the device's writes (downloaded in the run when marked, else before
+    /// the read), and a partial host write keeps the device's other bytes.
+    #[test]
+    fn shadows_follow_the_device() {
+        let c = context::<Mock>().unwrap();
+        let data: Vec<u64> = (1..=8).collect();
+        let mut b = c.upload(&data).unwrap();
+        let double =
+            |b: &Buffer<Mock>| c.run(|cmd| cmd.dispatch("double", 8, &[Arg::Buffer(b)], &()));
+        c.run(|cmd| {
+            cmd.dispatch("double", 8, &[Arg::Buffer(&b)], &())?;
+            cmd.download(&b)
+        })
+        .unwrap();
+        let got = |b: &Buffer<Mock>| b.host_read(|v: &[u64]| v.to_vec()).unwrap();
+        assert_eq!(got(&b), data.iter().map(|v| 2 * v).collect::<Vec<_>>());
+        double(&b).unwrap();
+        assert_eq!(got(&b), data.iter().map(|v| 4 * v).collect::<Vec<_>>());
+        double(&b).unwrap();
+        b.host_write(|v: &mut [u64]| v[0] = 100).unwrap();
+        double(&b).unwrap();
+        let mut want: Vec<u64> = data.iter().map(|v| 16 * v).collect();
+        want[0] = 200;
+        assert_eq!(got(&b), want);
+        // a marked buffer the host wrote and no dispatch bound keeps the write
+        b.host_write(|v: &mut [u64]| v[1] = 7).unwrap();
+        c.run(|cmd| cmd.download(&b)).unwrap();
+        assert_eq!(got(&b)[1], 7);
+    }
+
+    /// A buffer and its shadow are zeroed together and both pools stay zero.
+    #[test]
+    fn shadows_are_zeroed_with_their_buffer() {
+        let c = context::<Mock>().unwrap();
+        let mut b = c.alloc_pooled(4096).unwrap();
+        b.host_write(|v: &mut [u8]| v.fill(0x5a)).unwrap();
+        c.run(|cmd| cmd.dispatch("double", 1, &[Arg::Buffer(&b)], &())).unwrap();
+        assert_eq!(b.read_back_zero(), ReadBack::NonZero);
+        drop(b);
+        let w = end_request_report::<Mock>(true).expect("every idle buffer reads zero");
+        assert!(w.pool_regions >= 2, "{w:?}");
+        let b = c.alloc_pooled(4096).unwrap();
+        assert!(b.host_read(|v: &[u8]| v.iter().all(|x| *x == 0)).unwrap());
+    }
 }

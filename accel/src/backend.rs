@@ -126,6 +126,15 @@ pub trait Backend: Sized + Send + Sync + 'static {
     /// A new device buffer of `len` bytes (`len >= 16`), and whether it is
     /// known to be zero-filled. `None`: the allocation failed.
     fn alloc_raw(&self, len: usize) -> Option<(Self::Raw, bool)>;
+    /// A new host-visible staging buffer of `len` bytes (its
+    /// [`RawBuffer::host_ptr`] is `Some`), and whether it is known to be
+    /// zero-filled: the shadow of a device buffer the host does not map.
+    /// Never called when every buffer of [`Backend::alloc_raw`] has a host
+    /// pointer.
+    fn alloc_staging(&self, len: usize) -> Option<(Self::Raw, bool)> {
+        let _ = len;
+        None
+    }
     /// Encodes the dispatches of `f` into one command buffer, submits it and
     /// waits. Returns `f`'s value and the GPU time in nanoseconds. An error
     /// from `f` is returned only after the encoded work completed, so no
@@ -180,9 +189,20 @@ pub trait RawBuffer: Send + Sync + 'static {
     fn on_release(&self) {}
 }
 
-/// The encoder of one command buffer. Dispatches run in order, each seeing the
-/// writes of the earlier ones.
+/// The encoder of one command buffer. Dispatches and copies run in order,
+/// each seeing the writes of the earlier ones.
 pub trait Encoder<'a, B: Backend> {
+    /// Copies the first `bytes` bytes of `src` to `dst`, ordered with the
+    /// dispatches around it: a staging upload before the first dispatch that
+    /// binds `dst`, or a download after the last dispatch. Never called when
+    /// every device buffer has a host pointer.
+    fn copy(&mut self, src: &'a B::Raw, dst: &'a B::Raw, bytes: usize) -> Result<(), Error> {
+        let _ = (src, dst, bytes);
+        Err(Error::Device(format!(
+            "the {} backend has no buffer copies",
+            B::NAME
+        )))
+    }
     /// `threads` threads in workgroups of the backend's choice (at most 256);
     /// the last group may be partial, so kernels check their index.
     fn dispatch(

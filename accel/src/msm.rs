@@ -77,10 +77,10 @@ pub mod split;
 
 pub use effective::{effective_need, effective_size_reaches};
 pub(crate) use registry::MsmState;
+use registry::Table;
 #[cfg(any(test, feature = "test-support"))]
 pub use registry::one_shot_g1_checks;
 pub use registry::{SrsHandle, msm_counts, register_srs, srs_handles, srs_stale};
-use registry::{Store, Table};
 use secret::{Secret, scrub_stack};
 use split::{Points, split};
 
@@ -210,7 +210,7 @@ fn table_path<B: Backend>(
     B::host().msm.tables_served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     trace!(trace, |st| st.table = true);
     let store = par::read(&t.store);
-    let Store::Device(points) = &*store else {
+    let Some(points) = store.device() else {
         return Err(Error::Device("msm: the table was not uploaded".into()).into());
     };
     let r = split(

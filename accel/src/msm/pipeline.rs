@@ -457,11 +457,14 @@ fn run_chunk<B: Backend>(
         enc_digits(cmd, b, &p, h_off, num)?;
         enc_sort(cmd, b, &p, pl, g)?;
         enc_accumulate(cmd, b, &p, pl, g, h_off)?;
-        enc_integrate(cmd, b, &p, pl, g)
+        enc_integrate(cmd, b, &p, pl, g)?;
+        cmd.download(b.hot)?;
+        cmd.download(b.buckets)?;
+        cmd.download(b.ones)
     })?;
     // a bucket above the bound skipped accumulation: decline with the generic
     // message of any failed command buffer
-    if b.hot.as_slice::<u32>().first().is_none_or(|&h| h != 0) {
+    if b.hot.host_read(|h: &[u32]| h.first().is_none_or(|&h| h != 0))? {
         return Err(Error::Device("msm: a command buffer failed".into()));
     }
     let partials = copy_partials(b, pl, g).ok_or_else(|| Error::Memory("msm scratch".into()))?;
@@ -473,19 +476,21 @@ fn run_chunk<B: Backend>(
 fn copy_partials<B: Backend>(b: &Bufs<'_, B>, pl: &Plan, g: &Geometry) -> Option<Partials> {
     let per_row = 2 * g.nthr;
     let row_len = 1usize << pl.bits;
-    let bk = b.buckets.as_slice::<Xyzz>();
     let mut rows = SecretVec::with_capacity(pl.nwins as usize * per_row);
-    let mut ok = true;
-    for y in 0..pl.nwins as usize {
-        ok &= bk
-            .get(y * row_len..y * row_len + per_row)
-            .is_some_and(|r| rows.extend_within(r));
-    }
+    let mut ok = b
+        .buckets
+        .host_read(|bk: &[Xyzz]| {
+            (0..pl.nwins as usize).fold(true, |ok, y| {
+                ok & bk
+                    .get(y * row_len..y * row_len + per_row)
+                    .is_some_and(|r| rows.extend_within(r))
+            })
+        })
+        .ok()?;
     let mut ones = SecretVec::with_capacity(g.ones_slots());
     ok &= b
         .ones
-        .as_slice::<Xyzz>()
-        .get(..g.ones_slots())
-        .is_some_and(|o| ones.extend_within(o));
+        .host_read(|o: &[Xyzz]| o.get(..g.ones_slots()).is_some_and(|o| ones.extend_within(o)))
+        .ok()?;
     ok.then_some((rows, ones))
 }

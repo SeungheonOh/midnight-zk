@@ -698,7 +698,7 @@ fn device_run<B: Backend>(
     // the coset; the first proof polynomial is copied first, as the device
     // waits for it
     if let Some(first) = tab.proof.first()
-        && !copy_checked(src_a.as_mut_slice::<Scalar>(), first)
+        && !src_a.host_write(|d: &mut [Scalar]| copy_checked(d, first)).map_err(err)?
     {
         return Err(Reason::Unreduced);
     }
@@ -779,7 +779,7 @@ fn device_run<B: Backend>(
 
     if let Some(v) = numerator {
         v.clear();
-        v.extend_from_slice(&nu.as_slice::<Scalar>()[..en]);
+        nu.host_read(|d: &[Scalar]| v.extend_from_slice(&d[..en])).map_err(err)?;
         ctx::release_later::<B>(vec![nu]);
         return Ok((gpu, stages));
     }
@@ -796,18 +796,19 @@ fn device_run<B: Backend>(
         &j.zeta_out,
         &tinv,
         t_inv.len().ilog2(),
+        true,
     )
     .map_err(err)?;
 
     // Write `out` last: a panic becomes a decline, which must leave `out`
-    // unchanged, so everything that can fail or panic happens first. What
-    // follows the copy cannot fail: `ctx::par_copy` and `ctx::release_later`
-    // never panic, and the rest only stores counters and takes poison-tolerant
-    // locks.
+    // unchanged, so everything that can fail or panic happens first. The host
+    // view of `nu` fails, if at all, before the copy. What follows the copy
+    // cannot fail: `ctx::par_copy` and `ctx::release_later` never panic, and
+    // the rest only stores counters and takes poison-tolerant locks.
     drop(tinv);
     debug_assert!(plan.lent.is_none());
-    let src = &nu.as_slice::<Scalar>()[..out.len()];
-    ctx::par_copy(out, src);
+    nu.host_read(|src: &[Scalar]| ctx::par_copy(out, &src[..out.len()]))
+        .map_err(err)?;
     ctx::release_later::<B>(vec![nu]);
     Ok((gpu, stages))
 }
@@ -840,16 +841,10 @@ fn copy_and_hash_keys<B: Backend>(
     en: usize,
 ) -> KeyWork {
     let host: Vec<&[Scalar]> = check.iter().filter(|&&i| !fills[i]).map(|&i| keys[i]).collect();
-    let (host_digests, reduced, filled) = std::thread::scope(|sc| {
-        let dh = sc.spawn(|| keys::digest_many(&host));
-        // `key_tmp` holds one coset per `Temp` place, the lent copy one per
-        // slot (`keys::plan` places only slots below its `npolys`, and the
-        // copy is `npolys` cosets long)
-        let tmp = key_tmp.as_mut_slice::<Scalar>();
-        // `fills` implies a lent copy, allocated by `device_run`; without one
-        // the slot's digest is missing and the call declines
-        let mut slots =
-            lent.as_mut().and_then(|l| l.buf.as_mut()).map(|b| b.as_mut_slice::<Scalar>());
+    // the copies into `tmp`, one coset per `Temp` place, and into the lent
+    // copy's `slots`, one per slot (`keys::plan` places only slots below its
+    // `npolys`, and the copy is `npolys` cosets long)
+    let copy = |tmp: &mut [Scalar], mut slots: Option<&mut [Scalar]>| {
         let (mut ti, mut reduced, mut filled) = (0, true, Vec::new());
         for (i, (p, pl)) in keys.iter().zip(places).enumerate() {
             match pl {
@@ -870,8 +865,28 @@ fn copy_and_hash_keys<B: Backend>(
                 break;
             }
         }
-        (dh.join().unwrap_or_default(), reduced, filled)
+        (reduced, filled)
+    };
+    let (host_digests, copied) = std::thread::scope(|sc| {
+        let dh = sc.spawn(|| keys::digest_many(&host));
+        // `fills` implies a lent copy, allocated by `device_run`; without one
+        // the slot's digest is missing and the call declines
+        let copied = key_tmp.host_write(|tmp: &mut [Scalar]| {
+            match lent.as_mut().and_then(|l| l.buf.as_mut()) {
+                Some(b) => b.host_write(|slots: &mut [Scalar]| copy(tmp, Some(slots))),
+                None => Ok(copy(tmp, None)),
+            }
+        });
+        (dh.join().unwrap_or_default(), copied.and_then(|r| r))
     });
+    // a host view that could not be made: no digest, the call declines
+    let Ok((reduced, filled)) = copied else {
+        return KeyWork {
+            digests: Vec::new(),
+            reduced: true,
+            filled: Vec::new(),
+        };
+    };
     if !reduced {
         return KeyWork {
             digests: Vec::new(),
@@ -879,13 +894,16 @@ fn copy_and_hash_keys<B: Backend>(
             filled,
         };
     }
+    // the slots are hashed over the bytes the device gets: the buffer, or the
+    // shadow the next run copies in
     let slot_digests = match lent.as_ref().and_then(|l| l.buf.as_ref()) {
-        Some(b) => {
-            let b = b.as_slice::<Scalar>();
-            let in_slots: Vec<&[Scalar]> =
-                filled.iter().map(|s| &b[s * en..(s + 1) * en]).collect();
-            keys::digest_many(&in_slots)
-        }
+        Some(b) => b
+            .host_read(|b: &[Scalar]| {
+                let in_slots: Vec<&[Scalar]> =
+                    filled.iter().map(|s| &b[s * en..(s + 1) * en]).collect();
+                keys::digest_many(&in_slots)
+            })
+            .unwrap_or_default(),
         None => Vec::new(),
     };
     // in the order of `check` (both lists follow it)
@@ -922,9 +940,22 @@ fn proof_cosets<B: Backend>(
         };
         let following = proof.get(i + 1).copied();
         let (r, copied) = std::thread::scope(|sc| {
-            let h = following.map(|f| sc.spawn(move || copy_checked(next.as_mut_slice(), f)));
-            let r =
-                ntt::coeff_to_extended_dev_at(c, cur, cosets, i * ebytes, tmp, k, ext_k, &j.zeta);
+            let h = following.map(|f| {
+                sc.spawn(move || {
+                    next.host_write(|d: &mut [Scalar]| copy_checked(d, f)).unwrap_or(false)
+                })
+            });
+            let r = ntt::coeff_to_extended_dev_at(
+                c,
+                cur,
+                cosets,
+                i * ebytes,
+                tmp,
+                k,
+                ext_k,
+                &j.zeta,
+                false,
+            );
             (r, h.is_none_or(|h| h.join().unwrap_or(false)))
         });
         ns += r.map_err(err)?;
@@ -950,13 +981,17 @@ fn upload_again<B: Backend>(
         return Err(Reason::Memory);
     }
     let mut kt = c.alloc_pooled(bytes).map_err(err)?;
-    let ks = kt.as_mut_slice::<Scalar>();
-    let temps = keys.iter().zip(places).filter(|(_, pl)| **pl == Place::Temp);
-    // `kt` holds one coset per `Temp` place
-    for (ti, (p, _)) in temps.enumerate() {
-        if !copy_checked(&mut ks[ti * en..(ti + 1) * en], p) {
-            return Err(Reason::Unreduced);
-        }
+    let reduced = kt
+        .host_write(|ks: &mut [Scalar]| {
+            let temps = keys.iter().zip(places).filter(|(_, pl)| **pl == Place::Temp);
+            // `kt` holds one coset per `Temp` place
+            temps
+                .enumerate()
+                .all(|(ti, (p, _))| copy_checked(&mut ks[ti * en..(ti + 1) * en], p))
+        })
+        .map_err(err)?;
+    if !reduced {
+        return Err(Reason::Unreduced);
     }
     Ok(kt)
 }

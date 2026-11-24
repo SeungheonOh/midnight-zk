@@ -296,6 +296,9 @@ struct Job<'b, B: Backend> {
     pre_mul: Option<(&'b Buffer<B>, u32)>,
     /// After the last pass, `dst[i] *= [1, z1, z2][i mod 3]`.
     post_zeta: Option<[Scalar; 2]>,
+    /// Whether the host reads `dst` afterwards ([`Command::download`] in the
+    /// last command buffer).
+    read_back: bool,
 }
 
 /// `b` holds at least `elems` scalars.
@@ -504,6 +507,9 @@ fn run_job<B: Backend>(ctx: &Ctx<B>, job: &Job<'_, B>) -> Result<u64, Error> {
                     // the data is at offset 0 here (checked by `check_job`)
                     encode_distribute_zeta(cmd, job.dst, n, z)?;
                 }
+                if last_cb && job.read_back {
+                    cmd.download(job.dst)?;
+                }
                 Ok(())
             })?
             .1;
@@ -513,7 +519,7 @@ fn run_job<B: Backend>(ctx: &Ctx<B>, job: &Job<'_, B>) -> Result<u64, Error> {
 }
 
 // ---------------------------------------------------------------------------
-// Building blocks (device buffers, nothing read back)
+// Building blocks (device buffers)
 //
 // The caller holds the device for the whole sequence. The data must already
 // be reduced, and so must every scalar argument (else `Error::Unreduced`
@@ -523,7 +529,8 @@ fn run_job<B: Backend>(ctx: &Ctx<B>, job: &Job<'_, B>) -> Result<u64, Error> {
 /// The NTT of the first `2^log_n` elements of `a`, in place, natural order,
 /// at `w_n` or `w_n^-1`, then times `scale` if given. `tmp` is scratch of at
 /// least [`scratch_bytes`]`(log_n)` bytes (unused, and may be `a`, for
-/// `log_n <= 10`). Returns the GPU time.
+/// `log_n <= 10`). `read_back`: the host reads `a` afterwards. Returns the GPU
+/// time.
 pub fn ntt_dev<B: Backend>(
     ctx: &Ctx<B>,
     a: &Buffer<B>,
@@ -531,6 +538,7 @@ pub fn ntt_dev<B: Backend>(
     log_n: u32,
     dir: Dir,
     scale: Option<&Scalar>,
+    read_back: bool,
 ) -> Result<u64, Error> {
     run_job(
         ctx,
@@ -545,6 +553,7 @@ pub fn ntt_dev<B: Backend>(
             coset: None,
             pre_mul: None,
             post_zeta: None,
+            read_back,
         },
     )
 }
@@ -553,7 +562,8 @@ pub fn ntt_dev<B: Backend>(
 /// byte offset `dst_off` (a multiple of 32, so a coset lands in place in a
 /// larger buffer): the forward NTT of `src[i] * [1, zeta[0], zeta[1]][i mod 3]`
 /// for `i < 2^k`, zero-padded. The distribution and padding happen in the
-/// first pass. `zeta` is `[g_coset, g_coset_inv]`. Returns the GPU time.
+/// first pass. `zeta` is `[g_coset, g_coset_inv]`. `read_back`: the host
+/// reads `dst` afterwards. Returns the GPU time.
 #[allow(clippy::too_many_arguments)]
 pub fn coeff_to_extended_dev_at<B: Backend>(
     ctx: &Ctx<B>,
@@ -564,6 +574,7 @@ pub fn coeff_to_extended_dev_at<B: Backend>(
     k: u32,
     ext_k: u32,
     zeta: &[Scalar; 2],
+    read_back: bool,
 ) -> Result<u64, Error> {
     if k < 1 || k > ext_k || ext_k > MAX_LOG_N {
         return Err(Error::Device(format!(
@@ -588,13 +599,14 @@ pub fn coeff_to_extended_dev_at<B: Backend>(
             coset: Some((1usize << k, *zeta)),
             pre_mul: None,
             post_zeta: None,
+            read_back,
         },
     )
 }
 
 /// `extended_to_coeff` in place on `a[..2^ext_k]`: the inverse NTT times
-/// `divisor`, then [`encode_distribute_zeta`] with `zeta_out`. Returns the GPU
-/// time.
+/// `divisor`, then [`encode_distribute_zeta`] with `zeta_out`, for the host to
+/// read `a`. Returns the GPU time.
 #[cfg(any(test, feature = "test-support"))]
 pub fn extended_to_coeff_dev<B: Backend>(
     ctx: &Ctx<B>,
@@ -617,13 +629,15 @@ pub fn extended_to_coeff_dev<B: Backend>(
             coset: None,
             pre_mul: None,
             post_zeta: Some(*zeta_out),
+            read_back: true,
         },
     )
 }
 
 /// [`encode_mul_periodic`] by `t` (the division by the vanishing polynomial),
 /// then `extended_to_coeff` as [`extended_to_coeff_dev`], fused into the same
-/// command buffers. `t` must be reduced too. Returns the GPU time.
+/// command buffers. `t` must be reduced too. `read_back`: the host reads `a`
+/// afterwards. Returns the GPU time.
 #[allow(clippy::too_many_arguments)]
 pub fn divide_extended_to_coeff_dev<B: Backend>(
     ctx: &Ctx<B>,
@@ -634,6 +648,7 @@ pub fn divide_extended_to_coeff_dev<B: Backend>(
     zeta_out: &[Scalar; 2],
     t: &Buffer<B>,
     log_tn: u32,
+    read_back: bool,
 ) -> Result<u64, Error> {
     run_job(
         ctx,
@@ -648,6 +663,7 @@ pub fn divide_extended_to_coeff_dev<B: Backend>(
             coset: None,
             pre_mul: Some((t, log_tn)),
             post_zeta: Some(*zeta_out),
+            read_back,
         },
     )
 }
@@ -741,7 +757,8 @@ fn transform_host<B: Backend>(
     let ctx = ctx::context::<B>()?;
     let bytes = std::mem::size_of_val(a);
     let mut data = ctx::take_request_buffer::<B>("ntt-data", bytes)?;
-    ctx::par_copy(&mut data.buf_mut().as_mut_slice::<Scalar>()[..a.len()], a);
+    data.buf_mut()
+        .host_write(|d: &mut [Scalar]| ctx::par_copy(&mut d[..a.len()], a))?;
     let tmp = if scratch_bytes(log_n) > 0 {
         Some(ctx::take_request_buffer::<B>("ntt-scratch", bytes)?)
     } else {
@@ -759,9 +776,10 @@ fn transform_host<B: Backend>(
             log_n,
             dir,
             scale,
+            true,
         )?
     };
-    ctx::par_copy(a, &data.buf().as_slice::<Scalar>()[..a.len()]);
+    data.buf().host_read(|d: &[Scalar]| ctx::par_copy(a, &d[..a.len()]))?;
     data.give_back();
     if let Some(t) = tmp {
         t.give_back();
@@ -840,8 +858,8 @@ pub mod test_support {
             let src = ctx.upload(coeffs)?;
             let dst = ctx.alloc(SCALAR_BYTES << ext_k)?;
             let tmp = scratch(ctx, ext_k)?;
-            coeff_to_extended_dev_at(ctx, &src, &dst, 0, &tmp, k, ext_k, &zeta)?;
-            Ok(dst.as_slice::<Scalar>()[..1usize << ext_k].to_vec())
+            coeff_to_extended_dev_at(ctx, &src, &dst, 0, &tmp, k, ext_k, &zeta, true)?;
+            dst.host_read(|d: &[Scalar]| d[..1usize << ext_k].to_vec())
         })
     }
 
@@ -860,7 +878,7 @@ pub mod test_support {
             let a = ctx.upload(values)?;
             let tmp = scratch(ctx, ext_k)?;
             extended_to_coeff_dev(ctx, &a, &tmp, ext_k, &divisor, &zeta_out)?;
-            Ok(a.as_slice::<Scalar>()[..values.len()].to_vec())
+            a.host_read(|d: &[Scalar]| d[..values.len()].to_vec())
         })
     }
 
@@ -875,8 +893,8 @@ pub mod test_support {
         on_device::<B, _>(|ctx| {
             let a = ctx.upload(values)?;
             let tmp = scratch(ctx, log_n)?;
-            ntt_dev(ctx, &a, &tmp, log_n, dir, scale.as_ref())?;
-            Ok(a.as_slice::<Scalar>()[..values.len()].to_vec())
+            ntt_dev(ctx, &a, &tmp, log_n, dir, scale.as_ref(), true)?;
+            a.host_read(|d: &[Scalar]| d[..values.len()].to_vec())
         })
     }
 
@@ -898,9 +916,10 @@ pub mod test_support {
             ctx.run(|cmd| {
                 encode_distribute_zeta(cmd, &a, n, &zeta)?;
                 encode_scale(cmd, &a, n, &c)?;
-                encode_mul_periodic(cmd, &a, n, &t, table.len().ilog2())
+                encode_mul_periodic(cmd, &a, n, &t, table.len().ilog2())?;
+                cmd.download(&a)
             })?;
-            Ok(a.as_slice::<Scalar>()[..n].to_vec())
+            a.host_read(|d: &[Scalar]| d[..n].to_vec())
         })
     }
 

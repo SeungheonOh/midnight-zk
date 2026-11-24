@@ -41,6 +41,9 @@ use crate::{
 pub struct HostState<B: Backend> {
     /// The pool of zeroed buffers.
     pub(crate) pool: Mutex<Pool<B::Raw>>,
+    /// The pool of zeroed staging buffers (shadows of buffers the host does
+    /// not map); not counted as device bytes.
+    pub(crate) staging: Mutex<Pool<B::Raw>>,
     /// The pool's limit in bytes, or the unread marker.
     pub(crate) pool_limit: AtomicU64,
     /// The tickets of background zeroing.
@@ -93,6 +96,7 @@ impl<B: Backend> HostState<B> {
     pub const fn new() -> Self {
         HostState {
             pool: Mutex::new(Pool::new()),
+            staging: Mutex::new(Pool::new()),
             pool_limit: AtomicU64::new(POOL_LIMIT_UNREAD),
             releases: Mutex::new(Releases::new()),
             released: Condvar::new(),
