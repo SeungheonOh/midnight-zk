@@ -38,6 +38,13 @@ const uint FP_ONE[12] = uint[12](0x0002fffdu, 0x76090000u, 0xc40c0002u, 0xebf400
                                  0x53c758bau, 0x5f489857u, 0x70525745u, 0x77ce5853u,
                                  0xa256ec6du, 0x5c071a97u, 0xfa80e493u, 0x15f65ec3u);
 
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer FpRef {
+    Fp v;
+};
+
+// Element i of the `Fp` array at `base`.
+#define FP_AT(base, i) FpRef(addr_at(base, i, 48u)).v
+
 #define MONT_T Fp
 #define MONT_N 12
 #define MONT_INV 0xfffcfffdu

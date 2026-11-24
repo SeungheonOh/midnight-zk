@@ -18,9 +18,8 @@
 
 #include "msm.glsl"
 
-layout(std430, set = 0, binding = 0) writeonly buffer Out { Fr outv[]; };
-
 layout(push_constant) uniform Params {
+    uvec2 out_;
     uint i0;
     uint n;
 } params;
@@ -31,5 +30,5 @@ void main() {
     if (i >= params.n) return;
     uint c;
     uint lo = uaddCarry(params.i0, i, c);
-    outv[i] = mask_elem(uvec2(lo, c));
+    FR_AT(params.out_, i) = mask_elem(uvec2(lo, c));
 }

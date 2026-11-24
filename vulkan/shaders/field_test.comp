@@ -20,10 +20,12 @@
 #if defined(FIELD_FR)
 #include "fr.glsl"
 #define E Fr
+#define E_AT FR_AT
 #define F(name) CAT(fr, name)
 #elif defined(FIELD_FP)
 #include "fp.glsl"
 #define E Fp
+#define E_AT FP_AT
 #define F(name) CAT(fp, name)
 #else
 #error "FIELD_FR or FIELD_FP must be defined (build.rs)"
@@ -40,11 +42,10 @@ const uint OP_IS_REDUCED = 6u;
 const uint OP_ONE = 7u;
 const uint OP_EQ = 8u;
 
-layout(std430, set = 0, binding = 0) readonly buffer InA { E a[]; };
-layout(std430, set = 0, binding = 1) readonly buffer InB { E b[]; };
-layout(std430, set = 0, binding = 2) writeonly buffer Out { E outv[]; };
-
 layout(push_constant) uniform Params {
+    uvec2 a;
+    uvec2 b;
+    uvec2 out_;
     uint op;
     uint n;
 } params;
@@ -74,5 +75,5 @@ E apply(uint op, E x, E y) {
 void main() {
     uint i = global_index();
     if (i >= params.n) return;
-    outv[i] = apply(params.op, a[i], b[i]);
+    E_AT(params.out_, i) = apply(params.op, E_AT(params.a, i), E_AT(params.b, i));
 }

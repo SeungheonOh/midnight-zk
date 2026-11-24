@@ -35,7 +35,8 @@
 pub mod ctx;
 
 pub use ctx::{
-    Buffer, Commands, Context, DeviceInfo, Error, Pipeline, PipelineOptions, Pod, Result, Variant,
+    Buffer, Commands, Context, DeviceInfo, Error, Grid, Params, Pipeline, PipelineOptions, Pod,
+    Result, Variant,
 };
 
 /// Helpers of the crate's tests (feature `test-support`).
@@ -44,7 +45,7 @@ pub use ctx::{
 pub mod test_support {
     use std::{sync::OnceLock, time::Duration};
 
-    use crate::{Buffer, Context, PipelineOptions, Result, Variant};
+    use crate::{Context, Grid, Params, PipelineOptions, Result, Variant};
 
     /// The process-wide test context; panics when there is no device.
     pub fn context() -> &'static Context {
@@ -55,20 +56,36 @@ pub mod test_support {
         }
     }
 
+    /// Runs `kernel` once over `grid` with `options`.
+    pub fn run_with(
+        kernel: &str,
+        variant: Variant,
+        options: PipelineOptions,
+        params: &Params<'_>,
+        grid: Grid,
+    ) -> Result<Duration> {
+        let c = context();
+        let p = c.pipeline(kernel, variant, options)?;
+        let mut cmds = c.commands()?;
+        cmds.dispatch(&p, params, grid)?;
+        cmds.submit()
+    }
+
     /// Runs `kernel` once over `threads` invocations with the default
     /// pipeline options.
     pub fn run(
         kernel: &str,
         variant: Variant,
-        buffers: &[&Buffer],
-        params: &[u32],
+        params: &Params<'_>,
         threads: u64,
     ) -> Result<Duration> {
-        let c = context();
-        let p = c.pipeline(kernel, variant, PipelineOptions::default())?;
-        let mut cmds = c.commands()?;
-        cmds.dispatch(&p, buffers, params, threads)?;
-        cmds.submit()
+        run_with(
+            kernel,
+            variant,
+            PipelineOptions::default(),
+            params,
+            Grid::Threads(threads),
+        )
     }
 }
 

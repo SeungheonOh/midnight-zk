@@ -20,7 +20,7 @@ use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 
 use crate::{
-    Error, PipelineOptions, Variant,
+    Error, Grid, Params, PipelineOptions, Variant,
     test_support::{context, run},
 };
 
@@ -70,7 +70,8 @@ fn run_op<const N: usize>(
     let (ba, bb) = (c.upload(a).unwrap(), c.upload(b).unwrap());
     let out = c.alloc(size_of_val(a)).unwrap();
     let n = a.len() as u32;
-    run(kernel, variant, &[&ba, &bb, &out], &[op, n], n as u64).unwrap();
+    let params = Params::new().addr(&ba).addr(&bb).addr(&out).u32(op).u32(n);
+    run(kernel, variant, &params, n as u64).unwrap();
     c.read(&out).unwrap()
 }
 
@@ -252,27 +253,24 @@ fn dispatch_grid_and_errors() {
     let c = context();
     let info = c.info();
     let wg = 64u32;
-    // just above one row of workgroups, so the grid has a second row
-    let n = (info.max_compute_work_group_count[0] as u64 * wg as u64 + 3).min(1 << 26) as u32;
-    let p = c
-        .pipeline(
-            "diag_iota",
-            Variant::Int32,
-            PipelineOptions {
-                workgroup: wg,
-                subgroup: None,
-            },
-        )
-        .unwrap();
+    // just above one row of workgroups where the device's limit is small, so
+    // the grid has a second row
+    let n = (info.max_compute_work_group_count[0] as u64 * wg as u64 * 2).min(1 << 26) as u32;
+    let p = c.pipeline("diag_iota", Variant::Int32, PipelineOptions::workgroup(wg)).unwrap();
     let out = c.alloc(n as usize * 4 + 64).unwrap();
     c.write(&out, &vec![u32::MAX; n as usize + 16]).unwrap();
     let mut cmds = c.commands().unwrap();
-    cmds.dispatch(&p, &[&out], &[n], n as u64).unwrap();
+    cmds.dispatch(
+        &p,
+        &Params::new().addr(&out).u32(n - 3),
+        Grid::Threads(n as u64),
+    )
+    .unwrap();
     cmds.submit().unwrap();
     let got: Vec<u32> = c.read(&out).unwrap();
-    assert!(got[..n as usize].iter().enumerate().all(|(i, v)| *v == i as u32));
+    assert!(got[..n as usize - 3].iter().enumerate().all(|(i, v)| *v == i as u32));
     assert!(
-        got[n as usize..].iter().all(|v| *v == u32::MAX),
+        got[n as usize - 3..].iter().all(|v| *v == u32::MAX),
         "a write past n"
     );
 
@@ -280,36 +278,24 @@ fn dispatch_grid_and_errors() {
         .pipeline("no_such_kernel", Variant::Int32, PipelineOptions::default())
         .unwrap_err();
     assert!(matches!(e, Error::Invalid(_)), "{e}");
-    let e = c
-        .pipeline(
-            "diag_iota",
-            Variant::Int32,
-            PipelineOptions {
-                workgroup: info.max_compute_work_group_size[0] + 1,
-                subgroup: None,
-            },
-        )
-        .unwrap_err();
+    let wide = PipelineOptions::workgroup(info.max_compute_work_group_size[0] + 1);
+    let e = c.pipeline("diag_iota", Variant::Int32, wide).unwrap_err();
     assert!(matches!(e, Error::Invalid(_)), "{e}");
     // the subgroup width the MSM kernels pin
     let pinned = PipelineOptions {
-        workgroup: 64,
         subgroup: Some(32),
+        ..PipelineOptions::workgroup(64)
     };
     let p32 = c.pipeline("diag_iota", Variant::Int32, pinned).unwrap();
     let mut cmds = c.commands().unwrap();
-    cmds.dispatch(&p32, &[&out], &[100], 100).unwrap();
+    cmds.dispatch(&p32, &Params::new().addr(&out).u32(100), Grid::Threads(100))
+        .unwrap();
     cmds.submit().unwrap();
-    let e = c
-        .pipeline(
-            "diag_iota",
-            Variant::Int32,
-            PipelineOptions {
-                workgroup: 64,
-                subgroup: Some(3),
-            },
-        )
-        .unwrap_err();
+    let odd = PipelineOptions {
+        subgroup: Some(3),
+        ..PipelineOptions::workgroup(64)
+    };
+    let e = c.pipeline("diag_iota", Variant::Int32, odd).unwrap_err();
     assert!(
         matches!(e, Error::Invalid(_) | Error::Unsupported(_)),
         "{e}"
@@ -317,7 +303,7 @@ fn dispatch_grid_and_errors() {
     let e = c.alloc(usize::MAX / 2).unwrap_err();
     assert_eq!(e, Error::OutOfMemory);
     let mut cmds = c.commands().unwrap();
-    let e = cmds.dispatch(&p, &[&out], &[0; 33], 1).unwrap_err();
+    let e = cmds.dispatch(&p, &Params::new().words(&[0; 33]), Grid::Threads(1)).unwrap_err();
     assert!(matches!(e, Error::Invalid(_)), "{e}");
     drop(cmds);
     assert!(!c.failed());

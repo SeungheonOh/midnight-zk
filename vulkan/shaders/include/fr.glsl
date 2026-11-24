@@ -36,6 +36,13 @@ const uint FR_P[8] = uint[8](0x00000001u, 0xffffffffu, 0xfffe5bfeu, 0x53bda402u,
 const uint FR_ONE[8] = uint[8](0xfffffffeu, 0x00000001u, 0x00034802u, 0x5884b7fau,
                                0xecbc4ff5u, 0x998c4fefu, 0xacc5056fu, 0x1824b159u);
 
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer FrRef {
+    Fr v;
+};
+
+// Element i of the `Fr` array at `base`.
+#define FR_AT(base, i) FrRef(addr_at(base, i, 32u)).v
+
 #define MONT_T Fr
 #define MONT_N 8
 #define MONT_INV 0xffffffffu

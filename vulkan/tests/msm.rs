@@ -20,7 +20,7 @@ use common::{Xyzz, affine, fmul, fp, fsqr, xyzz_point};
 use group::{Curve, Group, prime::PrimeCurveAffine};
 use midnight_curves::{G1Affine, G1Projective};
 use midnight_vulkan::{
-    Variant,
+    Params, Variant,
     test_support::{context, run},
 };
 use rand_chacha::ChaCha8Rng;
@@ -64,8 +64,8 @@ fn g1_kernel(
         c.upload(flags).unwrap(),
         c.alloc(size_of_val(a)).unwrap(),
     ];
-    let refs: Vec<_> = bufs.iter().collect();
-    run("msm_test_g1", variant, &refs, &[op, n], n as u64).unwrap();
+    let params = bufs.iter().fold(Params::new(), |p, b| p.addr(b)).u32(op).u32(n);
+    run("msm_test_g1", variant, &params, n as u64).unwrap();
     c.read(&bufs[4]).unwrap()
 }
 
@@ -132,7 +132,13 @@ fn cuda_mask_vector(i0: u64, n: usize) -> Vec<[u64; 4]> {
 fn mask_kernel(variant: Variant, i0: u32, n: u32) -> Vec<[u64; 4]> {
     let c = context();
     let out = c.alloc(n as usize * 32).unwrap();
-    run("msm_test_mask", variant, &[&out], &[i0, n], n as u64).unwrap();
+    run(
+        "msm_test_mask",
+        variant,
+        &Params::new().addr(&out).u32(i0).u32(n),
+        n as u64,
+    )
+    .unwrap();
     c.read(&out).unwrap()
 }
 

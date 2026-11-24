@@ -26,7 +26,7 @@ use std::time::Duration;
 use ff::Field;
 use group::{Curve, Group};
 use midnight_curves::{Fp, Fq, G1Affine, G1Projective};
-use midnight_vulkan::{PipelineOptions, Variant, test_support::context};
+use midnight_vulkan::{Grid, Params, PipelineOptions, Variant, test_support::context};
 use rand_chacha::ChaCha8Rng;
 use rand_core::{RngCore, SeedableRng};
 
@@ -54,20 +54,14 @@ fn field<F: Copy, const N: usize>(a: &[u64; N]) -> F {
 }
 
 /// The best GPU wall time of `REPS` runs of `kernel`.
-fn time(
-    kernel: &str,
-    variant: Variant,
-    buffers: &[&midnight_vulkan::Buffer],
-    params: &[u32],
-    threads: u64,
-) -> Duration {
+fn time(kernel: &str, variant: Variant, params: &Params<'_>, threads: u64) -> Duration {
     let c = context();
     let p = c.pipeline(kernel, variant, PipelineOptions::default()).unwrap();
     // a first run compiles and warms the pipeline
     let mut best = Duration::MAX;
     for _ in 0..=REPS {
         let mut cmds = c.commands().unwrap();
-        cmds.dispatch(&p, buffers, params, threads).unwrap();
+        cmds.dispatch(&p, params, Grid::Threads(threads)).unwrap();
         best = best.min(cmds.submit().unwrap());
     }
     best
@@ -93,13 +87,8 @@ where
     let (ba, bb) = (c.upload(&a).unwrap(), c.upload(&b).unwrap());
     let out = c.alloc(size_of_val(a.as_slice())).unwrap();
     for variant in Variant::ALL {
-        let t = time(
-            kernel,
-            variant,
-            &[&ba, &bb, &out],
-            &[n as u32, iters, 0],
-            n as u64,
-        );
+        let params = Params::new().addr(&ba).addr(&bb).addr(&out).u32(n as u32).u32(iters).u32(0);
+        let t = time(kernel, variant, &params, n as u64);
         let got: Vec<[u64; N]> = c.read(&out).unwrap();
         for i in 0..64 {
             let want = field::<F, N>(&a[i]) * field::<F, N>(&b[i]).pow_vartime([iters as u64]);
@@ -126,11 +115,12 @@ fn bench_madd(kernel: &str, iters: u32) {
     let bt = c.upload(&limbs).unwrap();
     let out = c.alloc(n * 192).unwrap();
     for variant in Variant::ALL {
+        // the third address is unused
+        let params = Params::new().addr(&bt).addr(&out).addr(&out);
         let t = time(
             kernel,
             variant,
-            &[&bt, &out],
-            &[n as u32, iters, m as u32 - 1],
+            &params.u32(n as u32).u32(iters).u32(m as u32 - 1),
             n as u64,
         );
         let got: Vec<[u64; 24]> = c.read(&out).unwrap();

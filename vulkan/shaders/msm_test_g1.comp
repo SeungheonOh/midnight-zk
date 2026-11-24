@@ -23,13 +23,12 @@ const uint OP_MADD = 0u;       // a + b_affine, or a - b_affine with the flag
 const uint OP_ADD = 1u;        // a + b
 const uint OP_FROM_AFFINE = 2u; // b_affine as XYZZ, negated with the flag
 
-layout(std430, set = 0, binding = 0) readonly buffer InA { G1Xyzz a[]; };
-layout(std430, set = 0, binding = 1) readonly buffer InB { G1Xyzz b[]; };
-layout(std430, set = 0, binding = 2) readonly buffer InBAffine { G1Affine b_affine[]; };
-layout(std430, set = 0, binding = 3) readonly buffer Flags { uint flags[]; };
-layout(std430, set = 0, binding = 4) writeonly buffer Out { G1Xyzz outv[]; };
-
 layout(push_constant) uniform Params {
+    uvec2 a;
+    uvec2 b;
+    uvec2 b_affine;
+    uvec2 flags;
+    uvec2 out_;
     uint op;
     uint n;
 } params;
@@ -37,15 +36,15 @@ layout(push_constant) uniform Params {
 void main() {
     uint i = global_index();
     if (i >= params.n) return;
-    G1Xyzz r = a[i];
-    bool flag = flags[i] != 0u;
+    G1Xyzz r = XYZZ_AT(params.a, i);
+    bool flag = U32_AT(params.flags, i) != 0u;
     switch (params.op) {
-    case OP_MADD: g1_madd(r, b_affine[i], flag); break;
-    case OP_ADD: g1_add(r, b[i]); break;
+    case OP_MADD: g1_madd(r, AFFINE_AT(params.b_affine, i), flag); break;
+    case OP_ADD: g1_add(r, XYZZ_AT(params.b, i)); break;
     default:
-        r = g1_from_affine(b_affine[i]);
+        r = g1_from_affine(AFFINE_AT(params.b_affine, i));
         g1_cneg(r, flag);
         break;
     }
-    outv[i] = r;
+    XYZZ_AT(params.out_, i) = r;
 }

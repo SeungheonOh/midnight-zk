@@ -19,7 +19,11 @@
 
 #extension GL_GOOGLE_include_directive : require
 
+// BENCH_*_MUL: (a, b, out); BENCH_G1_MADD: (table, out, unused).
 layout(push_constant) uniform Params {
+    uvec2 buf0;
+    uvec2 buf1;
+    uvec2 buf2;
     uint n;
     uint iters;
     // BENCH_G1_MADD: the number of table points minus one (a power of two
@@ -32,41 +36,38 @@ layout(push_constant) uniform Params {
 #if defined(BENCH_FR_MUL)
 #include "fr.glsl"
 #define E Fr
+#define E_AT FR_AT
 #define F(name) CAT(fr, name)
 #else
 #include "fp.glsl"
 #define E Fp
+#define E_AT FP_AT
 #define F(name) CAT(fp, name)
 #endif
-
-layout(std430, set = 0, binding = 0) readonly buffer InA { E a[]; };
-layout(std430, set = 0, binding = 1) readonly buffer InB { E b[]; };
-layout(std430, set = 0, binding = 2) writeonly buffer Out { E outv[]; };
 
 // out[i] = a[i] * b[i]^iters.
 void main() {
     uint i = global_index();
     if (i >= params.n) return;
-    E x = a[i];
-    E y = b[i];
+    E x = E_AT(params.buf0, i);
+    E y = E_AT(params.buf1, i);
     for (uint k = 0u; k < params.iters; k++) x = F(_mul)(x, y);
-    outv[i] = x;
+    E_AT(params.buf2, i) = x;
 }
 
 #elif defined(BENCH_G1_MADD)
 
 #include "g1.glsl"
 
-layout(std430, set = 0, binding = 0) readonly buffer Table { G1Affine table[]; };
-layout(std430, set = 0, binding = 1) writeonly buffer Out { G1Xyzz outv[]; };
 
 // out[i] = sum of table[(i + k) & mask] for k in 0..=iters.
 void main() {
     uint i = global_index();
     if (i >= params.n) return;
-    G1Xyzz acc = g1_from_affine(table[i & params.mask]);
-    for (uint k = 1u; k <= params.iters; k++) g1_madd(acc, table[(i + k) & params.mask], false);
-    outv[i] = acc;
+    G1Xyzz acc = g1_from_affine(AFFINE_AT(params.buf0, i & params.mask));
+    for (uint k = 1u; k <= params.iters; k++)
+        g1_madd(acc, AFFINE_AT(params.buf0, (i + k) & params.mask), false);
+    XYZZ_AT(params.buf1, i) = acc;
 }
 
 #else

@@ -18,9 +18,8 @@
 
 #include "common.glsl"
 
-layout(std430, set = 0, binding = 0) writeonly buffer Out { uint outv[]; };
-
 layout(push_constant) uniform Params {
+    uvec2 out_;
     uint n;
 } params;
 
@@ -28,5 +27,5 @@ layout(push_constant) uniform Params {
 void main() {
     uint i = global_index();
     if (i >= params.n) return;
-    outv[i] = i;
+    U32_AT(params.out_, i) = i;
 }

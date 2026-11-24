@@ -25,9 +25,12 @@
 //!    the `[[unroll]]` loops.
 //!
 //! The SPIR-V is embedded with `include_bytes!` through
-//! `$OUT_DIR/shaders.rs`. A variant B module declaring the `Int64`
-//! capability is a build error. Kernels marked `test` are compiled only with
-//! the feature `test-support`.
+//! `$OUT_DIR/shaders.rs`, and the cfg `midnight_vulkan_spirv` is set. A
+//! variant B module declaring the `Int64` capability is a build error.
+//! Kernels marked `test` are compiled only with the feature `test-support`.
+//!
+//! Without the tools the crate builds with no SPIR-V (a cargo warning, the cfg
+//! unset), and the device context declines every device.
 //!
 //! Environment:
 //! - `MIDNIGHT_VULKAN_GLSL`: the GLSL compiler (`glslangValidator` or
@@ -35,6 +38,7 @@
 //!   `PATH`.
 //! - `MIDNIGHT_VULKAN_SPIRV_OPT`: `spirv-opt`; default: `spirv-opt` on
 //!   `PATH`.
+//! - `MIDNIGHT_VULKAN_REQUIRE_SPIRV=1`: missing tools are a build error.
 use std::{
     env,
     fmt::Write as _,
@@ -146,78 +150,93 @@ fn main() {
             }
         }
     }
-    for v in ["MIDNIGHT_VULKAN_GLSL", "MIDNIGHT_VULKAN_SPIRV_OPT", "PATH"] {
+    for v in [
+        "MIDNIGHT_VULKAN_GLSL",
+        "MIDNIGHT_VULKAN_SPIRV_OPT",
+        "MIDNIGHT_VULKAN_REQUIRE_SPIRV",
+        "PATH",
+    ] {
         println!("cargo:rerun-if-env-changed={v}");
     }
+    println!("cargo:rustc-check-cfg=cfg(midnight_vulkan_spirv)");
 
     let test_support = env::var_os("CARGO_FEATURE_TEST_SUPPORT").is_some();
     let kernels: Vec<&Kernel> = KERNELS.iter().filter(|k| test_support || !k.test).collect();
     let mut rs = String::from("pub(crate) static SHADERS: &[Shader] = &[\n");
-    if !kernels.is_empty() {
-        let frontend = frontend();
-        let opt = tool("MIDNIGHT_VULKAN_SPIRV_OPT", &["spirv-opt"]).unwrap_or_else(|| {
-            panic!("midnight-vulkan: spirv-opt was not found; {INSTALL}, or set MIDNIGHT_VULKAN_SPIRV_OPT")
-        });
-        std::thread::scope(|s| {
-            let jobs: Vec<_> = kernels
-                .iter()
-                .flat_map(|k| VARIANTS.iter().map(move |v| (*k, *v)))
-                .map(|(k, v)| {
-                    let (frontend, opt, out, shaders, include) =
-                        (&frontend, &opt, &out, &shaders, &include);
-                    s.spawn(move || compile(k, v, frontend, opt, shaders, include, out))
-                })
-                .collect();
-            let errors: Vec<String> =
-                jobs.into_iter().filter_map(|j| j.join().unwrap().err()).collect();
-            if !errors.is_empty() {
-                panic!(
-                    "midnight-vulkan: shader build failed:\n{}",
-                    errors.join("\n")
-                );
+    match tools() {
+        Ok((frontend, opt)) => {
+            std::thread::scope(|s| {
+                let jobs: Vec<_> = kernels
+                    .iter()
+                    .flat_map(|k| VARIANTS.iter().map(move |v| (*k, *v)))
+                    .map(|(k, v)| {
+                        let (frontend, opt, out, shaders, include) =
+                            (&frontend, &opt, &out, &shaders, &include);
+                        s.spawn(move || compile(k, v, frontend, opt, shaders, include, out))
+                    })
+                    .collect();
+                let errors: Vec<String> =
+                    jobs.into_iter().filter_map(|j| j.join().unwrap().err()).collect();
+                if !errors.is_empty() {
+                    panic!(
+                        "midnight-vulkan: shader build failed:\n{}",
+                        errors.join("\n")
+                    );
+                }
+            });
+            for k in &kernels {
+                let path = |suffix: &str| out.join(format!("{}.{suffix}.spv", k.name));
+                writeln!(
+                    rs,
+                    "    Shader {{ name: {:?}, int64: include_bytes!({:?}), int32: include_bytes!({:?}) }},",
+                    k.name,
+                    path("int64"),
+                    path("int32"),
+                )
+                .unwrap();
             }
-        });
-        for k in &kernels {
-            let path = |suffix: &str| out.join(format!("{}.{suffix}.spv", k.name));
-            writeln!(
-                rs,
-                "    Shader {{ name: {:?}, int64: include_bytes!({:?}), int32: include_bytes!({:?}) }},",
-                k.name,
-                path("int64"),
-                path("int32"),
-            )
-            .unwrap();
+            println!("cargo:rustc-cfg=midnight_vulkan_spirv");
+        }
+        Err(why) => {
+            if env::var("MIDNIGHT_VULKAN_REQUIRE_SPIRV").as_deref() == Ok("1") {
+                panic!("midnight-vulkan: {why} (MIDNIGHT_VULKAN_REQUIRE_SPIRV=1)");
+            }
+            println!(
+                "cargo:warning=midnight-vulkan: {why}; building without SPIR-V, the Vulkan backend \
+                 declines every device"
+            );
         }
     }
     rs.push_str("];\n");
     std::fs::write(out.join("shaders.rs"), rs).unwrap();
 }
 
-/// The GLSL compiler: `MIDNIGHT_VULKAN_GLSL`, or `glslangValidator`, or
-/// `glslc` on `PATH`.
-fn frontend() -> Frontend {
-    let path = tool("MIDNIGHT_VULKAN_GLSL", &["glslangValidator", "glslc"]).unwrap_or_else(|| {
-        panic!(
-            "midnight-vulkan: no GLSL compiler was found (glslangValidator or glslc); {INSTALL}, \
-             or set MIDNIGHT_VULKAN_GLSL"
+/// The GLSL compiler (`MIDNIGHT_VULKAN_GLSL`, or `glslangValidator` or
+/// `glslc` on `PATH`) and `spirv-opt`, or why they are missing.
+fn tools() -> Result<(Frontend, PathBuf), String> {
+    let path = tool("MIDNIGHT_VULKAN_GLSL", &["glslangValidator", "glslc"]).ok_or_else(|| {
+        format!(
+            "no GLSL compiler was found (glslangValidator or glslc); {INSTALL}, or set \
+             MIDNIGHT_VULKAN_GLSL"
         )
-    });
+    })?;
+    let opt = tool("MIDNIGHT_VULKAN_SPIRV_OPT", &["spirv-opt"]).ok_or_else(|| {
+        format!("spirv-opt was not found; {INSTALL}, or set MIDNIGHT_VULKAN_SPIRV_OPT")
+    })?;
     let stem = path.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-    if stem.starts_with("glslc") {
+    let frontend = if stem.starts_with("glslc") {
         Frontend::Glslc(path)
     } else {
         Frontend::Glslang(path)
-    }
+    };
+    Ok((frontend, opt))
 }
 
 /// `$var` if set, else the first of `names` found on `PATH`.
 fn tool(var: &str, names: &[&str]) -> Option<PathBuf> {
     if let Some(p) = env::var_os(var) {
         let p = PathBuf::from(p);
-        if !p.is_file() {
-            panic!("midnight-vulkan: {var}={} is not a file", p.display());
-        }
-        return Some(p);
+        return p.is_file().then_some(p);
     }
     let dirs: Vec<PathBuf> =
         env::var_os("PATH").map(|p| env::split_paths(&p).collect()).unwrap_or_default();

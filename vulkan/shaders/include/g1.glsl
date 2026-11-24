@@ -42,6 +42,18 @@ struct G1Xyzz {
     Fp ZZ;
 };
 
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer AffineRef {
+    G1Affine v;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer XyzzRef {
+    G1Xyzz v;
+};
+
+// Element i of the `G1Affine` / `G1Xyzz` array at `base`.
+#define AFFINE_AT(base, i) AffineRef(addr_at(base, i, 96u)).v
+#define XYZZ_AT(base, i) XyzzRef(addr_at(base, i, 192u)).v
+
 // The field multiplication of the curve formulas. build.rs keeps it out of
 // line (SPIR-V `DontInline`) in the kernels that list it: one copy of its
 // unrolled body then serves every multiplication of a formula. A driver may

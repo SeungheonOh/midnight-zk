@@ -48,19 +48,6 @@ uvec2 splitmix(uvec2 k) {
 
 #else
 
-uvec2 add64(uvec2 a, uvec2 b) {
-    uint c;
-    uint lo = uaddCarry(a.x, b.x, c);
-    return uvec2(lo, a.y + b.y + c);
-}
-
-// a * b mod 2^64.
-uvec2 mul64(uvec2 a, uvec2 b) {
-    uint hi, lo;
-    umulExtended(a.x, b.x, hi, lo);
-    return uvec2(lo, hi + a.x * b.y + a.y * b.x);
-}
-
 // a ^ (a >> s) for 0 < s < 32.
 uvec2 xorshr64(uvec2 a, uint s) {
     return a ^ uvec2((a.x >> s) | (a.y << (32u - s)), a.y >> s);
