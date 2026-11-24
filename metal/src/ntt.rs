@@ -480,7 +480,7 @@ static MASKS: [u32; 32] = {
 /// Encodes `a[i] *= [1, zeta[0], zeta[1]][i mod 3]` for `i < n`. `zeta` must be
 /// reduced.
 pub(crate) fn encode_distribute_zeta<'a>(
-    cmd: &mut Command<'a>,
+    cmd: &mut Command<'_, 'a>,
     a: &'a Buffer,
     n: usize,
     zeta: &'a [Scalar; 2],
@@ -500,7 +500,7 @@ pub(crate) fn encode_distribute_zeta<'a>(
 /// Encodes `a[i] *= c` for `i < n`. `c` must be reduced.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn encode_scale<'a>(
-    cmd: &mut Command<'a>,
+    cmd: &mut Command<'_, 'a>,
     a: &'a Buffer,
     n: usize,
     c: &'a Scalar,
@@ -515,7 +515,7 @@ pub(crate) fn encode_scale<'a>(
 /// Encodes `a[i] *= t[i mod 2^log_tn]` for `i < n`, as
 /// `divide_by_vanishing_poly` does with its power-of-two table.
 pub(crate) fn encode_mul_periodic<'a>(
-    cmd: &mut Command<'a>,
+    cmd: &mut Command<'_, 'a>,
     a: &'a Buffer,
     n: usize,
     t: &'a Buffer,

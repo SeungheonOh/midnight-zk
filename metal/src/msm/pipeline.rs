@@ -18,6 +18,7 @@
 use std::{mem::size_of, sync::Mutex};
 
 use blst::blst_p1;
+use midnight_accel::Backend;
 
 use super::{
     Xyzz,
@@ -235,7 +236,7 @@ fn chunk_params(pl: &Plan, mode: u32, h_off: usize, num: usize) -> ChunkParams {
 }
 
 fn enc_digits<'a>(
-    cmd: &mut Command<'a>,
+    cmd: &mut Command<'_, 'a>,
     b: &Bufs<'a>,
     p: &'a ChunkParams,
     h_off: usize,
@@ -257,7 +258,7 @@ fn enc_digits<'a>(
 }
 
 fn enc_sort<'a>(
-    cmd: &mut Command<'a>,
+    cmd: &mut Command<'_, 'a>,
     b: &Bufs<'a>,
     p: &'a ChunkParams,
     pl: &Plan,
@@ -314,7 +315,7 @@ fn enc_sort<'a>(
 
 /// The hot-bucket guard, `msm_ones` and `msm_accumulate`.
 fn enc_accumulate<'a>(
-    cmd: &mut Command<'a>,
+    cmd: &mut Command<'_, 'a>,
     b: &Bufs<'a>,
     p: &'a ChunkParams,
     pl: &Plan,
@@ -359,7 +360,7 @@ fn enc_accumulate<'a>(
 }
 
 fn enc_integrate<'a>(
-    cmd: &mut Command<'a>,
+    cmd: &mut Command<'_, 'a>,
     b: &Bufs<'a>,
     p: &'a ChunkParams,
     pl: &Plan,

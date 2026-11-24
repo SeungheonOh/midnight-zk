@@ -18,14 +18,19 @@
 #![deny(missing_debug_implementations)]
 
 pub mod account;
+pub mod backend;
 pub mod ctx;
 pub mod field;
+pub mod host;
 #[doc(hidden)]
 pub mod msm;
 #[doc(hidden)]
 pub mod ntt;
 #[doc(hidden)]
 pub mod quotient;
+
+pub use backend::{Backend, DeviceInfo, Encoder, RawBuffer};
+pub use host::HostState;
 
 /// A scalar: `blst_fr`, four little-endian limbs, Montgomery form, reduced
 /// modulo [`field::FR_MODULUS`].

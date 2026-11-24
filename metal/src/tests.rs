@@ -531,7 +531,7 @@ fn erase_report_reads_back_every_region() {
     let planted = ctx::last_planted();
     assert_ne!(planted, 0);
     assert!(
-        !ctx::idle_pool_addresses().contains(&planted),
+        !ctx::idle_pool_ids().contains(&planted),
         "the failed region is not in the pool"
     );
     assert!(ctx::idle_pool_reads_zero());
@@ -549,7 +549,7 @@ fn erase_report_reads_back_the_idle_pool() {
     let mut b = c.alloc_pooled(1 << 20).unwrap();
     b.as_mut_slice::<u8>().fill(0x42);
     drop(b);
-    let idle = ctx::idle_pool_addresses().len() as u64;
+    let idle = ctx::idle_pool_ids().len() as u64;
     assert!(idle >= 1);
     let w = crate::end_request_report(true).expect("the idle pool reads zero");
     assert_eq!(
@@ -563,7 +563,7 @@ fn erase_report_reads_back_the_idle_pool() {
     let w = crate::end_request_report(true).expect_err("a non-zero idle buffer");
     assert_eq!((w.nonzero_regions, w.check_failures), (1, 0));
     assert_eq!(w.pool_regions, idle);
-    assert!(!ctx::idle_pool_addresses().contains(&planted));
+    assert!(!ctx::idle_pool_ids().contains(&planted));
     assert!(crate::pool_bytes() < pooled, "the buffer left the pool");
     assert!(ctx::idle_pool_reads_zero());
     assert!(crate::end_request_report(true).is_ok());
@@ -641,12 +641,12 @@ fn a_panicking_zeroing_is_completed_and_reported() {
     let c = ctx::context().unwrap();
     let mut b = c.alloc_pooled(1 << 20).unwrap();
     b.as_mut_slice::<u8>().fill(0x66);
-    let at = b.as_slice::<u8>().as_ptr() as usize;
+    let at = b.id();
     ctx::set_zeroing_panic(at);
     ctx::release_later(vec![b]);
     ctx::settle_releases();
     ctx::set_zeroing_panic(0);
-    assert!(!ctx::idle_pool_addresses().contains(&at), "not pooled");
+    assert!(!ctx::idle_pool_ids().contains(&at), "not pooled");
     assert!(ctx::idle_pool_reads_zero());
     let w = crate::end_request_report(false).expect_err("the fault is reported");
     assert_eq!(w.erasure_failures, 1);
@@ -744,7 +744,7 @@ fn hooks_outside_a_request_wipe_before_they_return() {
     assert!(crate::fft(scalars_mut(&mut a), w, log_n));
     let second = ctx::request_buffers();
     let addr =
-        |rows: &[(&str, usize, bool, usize)]| rows.iter().find(|r| r.0 == "ntt-data").map(|r| r.3);
+        |rows: &[(&str, usize, bool, u64)]| rows.iter().find(|r| r.0 == "ntt-data").map(|r| r.3);
     assert_eq!(addr(&first), addr(&second), "the same buffer, reused");
     assert!(crate::msm_g1(scalars(&input[..1 << 10]), affine(&points)).is_some());
     assert!(
@@ -821,6 +821,7 @@ fn a_backend_panic_is_a_counted_decline() {
 /// transform of that size.
 #[test]
 fn ntt_pass_takes_the_planned_threadgroups() {
+    use midnight_accel::Backend;
     require_device();
     let max = ctx::context().unwrap().max_group("ntt_pass").unwrap();
     for log_n in 1..=crate::MAX_LOG_N {
