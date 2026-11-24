@@ -281,16 +281,24 @@ fn dispatch_grid_and_errors() {
     let wide = PipelineOptions::workgroup(info.max_compute_work_group_size[0] + 1);
     let e = c.pipeline("diag_iota", Variant::Int32, wide).unwrap_err();
     assert!(matches!(e, Error::Invalid(_)), "{e}");
-    // the subgroup width the MSM kernels pin
+    // the subgroup width the MSM kernels pin, where the device takes it
     let pinned = PipelineOptions {
         subgroup: Some(32),
         ..PipelineOptions::workgroup(64)
     };
-    let p32 = c.pipeline("diag_iota", Variant::Int32, pinned).unwrap();
-    let mut cmds = c.commands().unwrap();
-    cmds.dispatch(&p32, &Params::new().addr(&out).u32(100), Grid::Threads(100))
-        .unwrap();
-    cmds.submit().unwrap();
+    match c.pipeline("diag_iota", Variant::Int32, pinned) {
+        Ok(p32) => {
+            assert!(info.takes_subgroup(32));
+            let mut cmds = c.commands().unwrap();
+            cmds.dispatch(&p32, &Params::new().addr(&out).u32(100), Grid::Threads(100))
+                .unwrap();
+            cmds.submit().unwrap();
+        }
+        Err(e) => assert!(
+            !info.takes_subgroup(32) && matches!(e, Error::Invalid(_) | Error::Unsupported(_)),
+            "{e}"
+        ),
+    }
     let odd = PipelineOptions {
         subgroup: Some(3),
         ..PipelineOptions::workgroup(64)

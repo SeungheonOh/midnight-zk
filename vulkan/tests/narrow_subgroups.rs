@@ -14,15 +14,35 @@
 //! The MSM with `msm_ones` reducing its runs of 32 invocations over
 //! subgroup lanes narrower than 32 and through shared memory: the path of a
 //! device whose subgroups are narrower than Metal's SIMD-groups (lavapipe,
-//! some integrated GPUs), forced on this device.
+//! some integrated GPUs), forced on this device; and in subgroups of 64
+//! where the device can pin them (AMD's wave64). The lanes do not depend on
+//! the MSM size: one size runs every input of the shared MSM test.
 
-use midnight_vulkan::ctx::{Vulkan, set_ones_lanes};
+use midnight_vulkan::ctx::{Vulkan, set_ones_lanes, set_ones_width};
 
 #[test]
 fn msm_is_exact_with_narrow_subgroup_lanes() {
     for lanes in [16, 8, 4] {
-        set_ones_lanes(Some(lanes));
-        midnight_accel::testkit::msm::msm_matches_cpu::<Vulkan>();
+        // a device narrower than `lanes` reduces over fewer lanes anyway
+        if !set_ones_lanes(Some(lanes)) {
+            eprintln!("{lanes} lanes are above the subgroup width: skipped");
+            continue;
+        }
+        midnight_accel::testkit::msm::msm_matches_cpu_one_size::<Vulkan>();
     }
     set_ones_lanes(None);
+}
+
+#[test]
+fn msm_is_exact_in_subgroups_of_64() {
+    if !set_ones_width(Some(64)) {
+        eprintln!("the device cannot pin subgroups of 64: skipped");
+        return;
+    }
+    for lanes in [None, Some(16)] {
+        assert!(set_ones_lanes(lanes));
+        midnight_accel::testkit::msm::msm_matches_cpu_one_size::<Vulkan>();
+    }
+    set_ones_lanes(None);
+    set_ones_width(None);
 }

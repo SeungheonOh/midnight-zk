@@ -488,6 +488,10 @@ const MSM_RUN: u32 = 32;
 /// a pipeline require it, else the device's fixed width when it is a power
 /// of two. `None`: neither.
 fn ones_subgroup(info: &device::VulkanInfo) -> Option<u32> {
+    let forced = ONES_WIDTH.load(std::sync::atomic::Ordering::Relaxed);
+    if forced != 0 {
+        return info.takes_subgroup(forced).then_some(forced);
+    }
     if info.takes_subgroup(MSM_RUN) {
         return Some(MSM_RUN);
     }
@@ -495,18 +499,41 @@ fn ones_subgroup(info: &device::VulkanInfo) -> Option<u32> {
     (fixed.is_power_of_two() && info.takes_subgroup(fixed)).then_some(fixed)
 }
 
+/// The subgroup width `msm_ones` runs with instead of [`ones_subgroup`]'s
+/// choice (0: that choice). Test support.
+static ONES_WIDTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Makes `msm_ones` run in subgroups of `width` invocations, which the
+/// device must let a pipeline require: the path of a device whose subgroups
+/// are wider than 32; `None`: the default. Returns whether the device takes
+/// the width. Test support.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn set_ones_width(width: Option<u32>) -> bool {
+    let ok = width.is_none_or(|w| probe().is_some_and(|i| i.takes_subgroup(w)));
+    if ok {
+        ONES_WIDTH.store(width.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+    }
+    ok
+}
+
 /// The subgroup lanes `msm_ones` reduces with shuffles, below its subgroup
 /// width (0: the subgroup width up to [`MSM_RUN`]). Test support.
 static ONES_LANES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Makes `msm_ones` reduce with shuffles over `lanes` invocations (a power
-/// of two up to its subgroup width) and the rest through shared memory, the
-/// path of a device with narrow subgroups; `None`: the default. Test
-/// support.
+/// of two up to its subgroup width and 32) and the rest through shared
+/// memory, the path of a device with narrow subgroups; `None`: the default.
+/// Returns whether the device's width takes `lanes`. Test support.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-pub fn set_ones_lanes(lanes: Option<u32>) {
-    ONES_LANES.store(lanes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+pub fn set_ones_lanes(lanes: Option<u32>) -> bool {
+    let width = probe().and_then(ones_subgroup).unwrap_or(0);
+    let ok = lanes.is_none_or(|l| l.is_power_of_two() && l <= width.min(MSM_RUN));
+    if ok {
+        ONES_LANES.store(lanes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+    }
+    ok
 }
 
 /// What a kernel takes besides its buffer addresses and parameter block in

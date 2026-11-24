@@ -311,15 +311,9 @@ fn expected<B: Backend>(n: usize, table: bool) -> (bool, u32, u32) {
 
 /// Special inputs are spread over all indices so both shares of a split
 /// hold them, and `odd[i] = odd[i / 2]` repeats points across the shares.
-fn differential<B: Backend>(split: bool) {
+fn differential<B: Backend>(split: bool, sizes: &[u32]) {
     let _g = setup::<B>(Some(0), split);
     crate::reset_stats::<B>();
-    // one size per window width class of the one-shot path on Apple silicon
-    let sizes: &[u32] = if split || cfg!(debug_assertions) {
-        &[14, 16]
-    } else {
-        &[14, 16, 20]
-    };
     for &k in sizes {
         let n = 1usize << k;
         let bases = &points_cache()[..n];
@@ -382,8 +376,20 @@ fn differential<B: Backend>(split: bool) {
 }
 
 pub fn msm_matches_cpu<B: Backend>() {
-    differential::<B>(true);
-    differential::<B>(false);
+    differential::<B>(true, &[14, 16]);
+    // one size per window width class of the one-shot path on Apple silicon
+    let sizes: &[u32] = if cfg!(debug_assertions) {
+        &[14, 16]
+    } else {
+        &[14, 16, 20]
+    };
+    differential::<B>(false, sizes);
+}
+
+/// The inputs of [`msm_matches_cpu`] at 2^14 points, all on the device: for
+/// a kernel path a test switch forces, which does not depend on the size.
+pub fn msm_matches_cpu_one_size<B: Backend>() {
+    differential::<B>(false, &[14]);
 }
 
 /// Every worker of a small pool waits on the device lock while the holder's
