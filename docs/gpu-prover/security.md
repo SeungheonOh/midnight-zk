@@ -120,6 +120,25 @@ reduces the region and returns the count of non-zero words. Whole chunks are
 not read back, so a region that was not zeroed does not reach host memory
 through the check.
 
+The Metal and Vulkan backends (`midnight-metal`, `midnight-vulkan`, on the
+shared host code of `midnight-accel`) wipe the same way: every per-request
+buffer is zeroed at the end of the request, before it returns to the pool of
+zeroed buffers or is freed, and a hook call outside a request zeroes its
+buffers before it returns. New Vulkan memory is not known to be zero, so it
+is zeroed before its first use. Their zero-check reads each region back to
+the host instead of reducing it on the device:
+
+- On Metal and on an integrated Vulkan GPU, device buffers are host memory,
+  and the check reads them in place.
+- On a discrete Vulkan GPU, device buffers are device memory. The host
+  reaches them through staging buffers in host memory, one per device buffer
+  that the host reads or writes. A staging buffer holds the same witness
+  values as its device buffer, so it is zeroed with it and pooled like it.
+  Device buffers are zeroed on the GPU (`vkCmdFillBuffer`), and the call
+  waits for the fill. The check copies each region through a staging buffer,
+  which is zeroed before it is freed. A region that was not zeroed therefore
+  reaches host memory during the check (residual risk 2).
+
 ## 6. Sockets, files and permissions
 
 - The daemon socket has mode 0600. The daemon serves only peers whose uid
@@ -198,9 +217,10 @@ Scope of the zero-knowledge rule (a named assumption):
 - Proving on a machine that the user does not own is outside this assumption
   and needs a separate analysis.
 
-The Metal backend and the record. `midnight-metal` declines a sparse MSM (one
-with few non-zero scalars) to the stock CPU MSM, so how many MSMs the device
-serves depends on the witness. The record does not show that split:
+The Metal and Vulkan backends and the record. `midnight-metal` and
+`midnight-vulkan` decline a sparse MSM (one with few non-zero scalars) to the
+stock CPU MSM, so how many MSMs the device serves depends on the witness. The
+record does not show that split:
 
 - It reports one MSM total, `msm.count` and `msm.seconds`, over every MSM hook
   invocation, served or declined. There is no MSM entry in `device_calls`,
@@ -212,10 +232,11 @@ serves depends on the witness. The record does not show that split:
 - With the default thresholds the device takes an MSM only when a registered
   table serves its bases. Any other MSM declines `unregistered-bases` before
   reading a scalar, because the one-shot path's per-call G1 membership check
-  costs more than the CPU MSM. Only `MIDNIGHT_METAL_MIN_K` opens that path.
-  The decline depends on public facts only.
+  costs more than the CPU MSM. Only `MIDNIGHT_METAL_MIN_K` (Vulkan:
+  `MIDNIGHT_VULKAN_MIN_K`) opens that path. The decline depends on public
+  facts only.
 - The split by path stays inside the process (`midnight_metal::stats` and
-  `declines`). Proof time still depends on sparsity, as with the CPU MSM:
+  `declines`, `midnight_vulkan::stats` and `declines`). Proof time still depends on sparsity, as with the CPU MSM:
   timing is out of scope (below).
 
 Out of scope:
@@ -293,6 +314,9 @@ a network address.
 - A `test-seed` build writes a marker string at start. The script
   `gpu-prover/container/check-no-test-seed.sh` refuses an image that holds the
   marker or a file named `*seeded*`.
+- `MIDNIGHT_VULKAN_ALLOW_CPU=1` (take a CPU implementation such as lavapipe)
+  and `MIDNIGHT_VULKAN_DISCRETE=1` (run the discrete-GPU path on an
+  integrated GPU) are for CI and tests. A deployment never sets them.
 
 ## 11. Batch request boundary
 
