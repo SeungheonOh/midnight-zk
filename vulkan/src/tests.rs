@@ -291,6 +291,29 @@ fn dispatch_grid_and_errors() {
         )
         .unwrap_err();
     assert!(matches!(e, Error::Invalid(_)), "{e}");
+    // the subgroup width the MSM kernels pin
+    let pinned = PipelineOptions {
+        workgroup: 64,
+        subgroup: Some(32),
+    };
+    let p32 = c.pipeline("diag_iota", Variant::Int32, pinned).unwrap();
+    let mut cmds = c.commands().unwrap();
+    cmds.dispatch(&p32, &[&out], &[100], 100).unwrap();
+    cmds.submit().unwrap();
+    let e = c
+        .pipeline(
+            "diag_iota",
+            Variant::Int32,
+            PipelineOptions {
+                workgroup: 64,
+                subgroup: Some(3),
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(e, Error::Invalid(_) | Error::Unsupported(_)),
+        "{e}"
+    );
     let e = c.alloc(usize::MAX / 2).unwrap_err();
     assert_eq!(e, Error::OutOfMemory);
     let mut cmds = c.commands().unwrap();

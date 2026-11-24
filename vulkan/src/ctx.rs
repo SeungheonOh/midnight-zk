@@ -311,8 +311,9 @@ struct Candidate {
 }
 
 impl Context {
-    /// Loads the Vulkan loader ([`LOADER_ENV`]) and opens the preferred device: a discrete
-    /// GPU, else an integrated one; CPU implementations are skipped.
+    /// Loads the Vulkan loader ([`LOADER_ENV`]) and opens the preferred
+    /// device: a discrete GPU, else an integrated one; CPU implementations
+    /// are skipped.
     pub fn new() -> Result<Context> {
         // SAFETY: loading the Vulkan loader runs its initialisers, which is
         // the documented use of the library.
@@ -648,11 +649,15 @@ impl Context {
         {
             return Err(Error::Invalid(format!("workgroup width {wg}")));
         }
+        // A device whose subgroup size cannot be chosen but is fixed at the
+        // requested one (Apple GPUs: 32) needs no size request.
+        let mut request_size = false;
         if let Some(s) = options.subgroup {
-            if !info.subgroup_size_control || !info.compute_full_subgroups {
-                return Err(Error::Unsupported(
-                    "subgroupSizeControl, computeFullSubgroups".into(),
-                ));
+            let fixed = info.subgroup_size == s && info.max_subgroup_size == s;
+            if !info.compute_full_subgroups || !(info.subgroup_size_control || fixed) {
+                return Err(Error::Unsupported(format!(
+                    "a compute subgroup size of {s} (subgroupSizeControl, computeFullSubgroups)"
+                )));
             }
             if !s.is_power_of_two()
                 || s < info.min_subgroup_size
@@ -664,6 +669,7 @@ impl Context {
                     info.min_subgroup_size, info.max_subgroup_size
                 )));
             }
+            request_size = info.subgroup_size_control;
         }
         let bytes = match variant {
             Variant::Int64 => shader.int64,
@@ -689,9 +695,10 @@ impl Context {
             .name(c"main")
             .specialization_info(&spec);
         if options.subgroup.is_some() {
-            stage = stage
-                .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
-                .push_next(&mut required);
+            stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS);
+        }
+        if request_size {
+            stage = stage.push_next(&mut required);
         }
         let create = [vk::ComputePipelineCreateInfo::default()
             .stage(stage)
@@ -1003,7 +1010,9 @@ pub struct PipelineOptions {
     /// The workgroup width (specialization constant 0).
     pub workgroup: u32,
     /// A required subgroup size, with full subgroups (the workgroup width
-    /// must be a multiple of it); `None`: the driver's choice.
+    /// must be a multiple of it): requested where the device lets compute
+    /// pipelines choose it, else accepted when the device's size is fixed
+    /// at it. `None`: the driver's choice.
     pub subgroup: Option<u32>,
 }
 
