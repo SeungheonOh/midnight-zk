@@ -99,7 +99,8 @@ struct Params {
     uint l0;                 // handles
     uint l_last;
     uint l_active;
-    uint pad[5];
+    uint nwords;             // words of the tables
+    uint pad[4];
     Fr y;
     Fr beta;
     Fr gamma;

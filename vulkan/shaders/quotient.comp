@@ -60,7 +60,17 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Pa
 };
 
 #define P ParamsRef(pc.params).v
-#define W(i) U32_AT(pc.words, i)
+
+// The last word of the tables (set first in `main`).
+uint g_last_word;
+
+// Word i of the tables. The host checks every offset and operand of the
+// tables, so the index of a running invocation is always inside them; the
+// clamp keeps the loads of invocations a CPU implementation executes past
+// their control flow (lavapipe) inside the buffer too.
+uint W(uint i) {
+    return U32_AT(pc.words, min(i, g_last_word));
+}
 
 // This invocation and its current row.
 uint g_tid;
@@ -151,6 +161,7 @@ Fr pow_u32(Fr b, uint e) {
 }
 
 void main() {
+    g_last_word = P.nwords - 1u;
     g_tid = global_index();
     const uint threads = P.threads;
     if (g_tid >= threads) return;

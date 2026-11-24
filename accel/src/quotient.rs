@@ -603,7 +603,10 @@ struct Params {
     l0: u32,
     l_last: u32,
     l_active: u32,
-    pad: [u32; 5],
+    /// The words of the job's tables: no kernel reads past them (Metal's
+    /// kernel ignores it).
+    nwords: u32,
+    pad: [u32; 4],
     y: Scalar,
     beta: Scalar,
     gamma: Scalar,
@@ -1041,6 +1044,7 @@ fn numerator_params(
         l0: lagrange[0],
         l_last: lagrange[1],
         l_active: lagrange[2],
+        nwords: tab.words.len() as u32,
         y: j.y,
         beta: j.beta,
         gamma: j.gamma,
