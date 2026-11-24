@@ -88,3 +88,8 @@ pub fn xyzz_point(r: &Xyzz) -> G1Projective {
     j[12..].copy_from_slice(&zz.l);
     from_jacobian(j)
 }
+
+/// The limbs of scalars.
+pub fn scalars(a: &[Fq]) -> Vec<[u64; 4]> {
+    a.iter().map(scalar).collect()
+}

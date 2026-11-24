@@ -59,6 +59,41 @@ struct Kernel {
 
 const KERNELS: &[Kernel] = &[
     Kernel {
+        name: "ntt_pass",
+        source: "ntt.comp",
+        defines: &["NTT_PASS"],
+        keep: &[],
+        test: false,
+    },
+    Kernel {
+        name: "ntt_scale",
+        source: "ntt.comp",
+        defines: &["NTT_SCALE"],
+        keep: &[],
+        test: false,
+    },
+    Kernel {
+        name: "ntt_scale_copy",
+        source: "ntt.comp",
+        defines: &["NTT_SCALE_COPY"],
+        keep: &[],
+        test: false,
+    },
+    Kernel {
+        name: "ntt_distribute_zeta",
+        source: "ntt.comp",
+        defines: &["NTT_DISTRIBUTE_ZETA"],
+        keep: &[],
+        test: false,
+    },
+    Kernel {
+        name: "ntt_mul_periodic",
+        source: "ntt.comp",
+        defines: &["NTT_MUL_PERIODIC"],
+        keep: &[],
+        test: false,
+    },
+    Kernel {
         name: "diag_iota",
         source: "diag_iota.comp",
         defines: &[],

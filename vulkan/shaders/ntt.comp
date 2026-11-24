@@ -1,0 +1,268 @@
+#version 460
+// This file is part of MIDNIGHT-ZK.
+// Copyright (C) Midnight Foundation
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// You may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// http://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// The scalar-field NTT and the elementwise kernels around it, a port of the
+// Metal crate's `ntt.metal`. build.rs compiles one kernel per define:
+// NTT_PASS (`ntt_pass`), NTT_SCALE, NTT_SCALE_COPY, NTT_DISTRIBUTE_ZETA,
+// NTT_MUL_PERIODIC.
+//
+// The transform of n = 2^L elements is a Stockham radix-2^d transform: a
+// sequence of passes, pass q of radix R_q = 2^d_q, with sum d_q = L. Natural
+// order in, natural order out, no bit-reversal pass. Pass q, with p the
+// product of the radices of the earlier passes, takes for every column
+// j < n / R the R elements x[j + t n / R] (t < R), multiplies element t by
+// w_{pR}^{(j mod p) t}, computes their R-point DFT V in shared memory, and
+// writes V[r] to y[(j - j mod p) R + j mod p + r p]. The last pass (p R = n)
+// reads and writes the same positions, so it may run in place.
+//
+// A workgroup takes G = 2^log_g consecutive columns (G R elements), so that
+// the strided reads and writes move G consecutive elements at a time. The
+// R-point DFT is a radix-2 decimation in frequency over the shared memory
+// (natural order in, bit-reversed order out, read back in natural order at
+// the write), each invocation doing E / (2 T) butterflies of a stage
+// (E elements, T invocations).
+//
+// Twiddles come from two tables per direction, with H = hi_bits:
+//   hi[j] = w_{2^H}^j (j < 2^H)  and  lo[j] = w_{2^28}^j (j < 2^(28 - H)),
+// times a constant c for lo (see below), w_{2^m} the standard 2^m-th root of
+// unity (or its inverse). A local butterfly of a DFT of size 2^s <= 2^H reads
+// hi[j 2^(H - s)]. The factor w_{pR}^e of a pass is w_{2^28}^x with
+// x = e 2^(28 - log pR), = hi[x >> (28 - H)] lo[x mod 2^(28 - H)]; when
+// pR <= 2^H the low part is zero and only hi is read. A pass that scales its
+// output by c (the divisor of an inverse transform) reads a lo table
+// pre-multiplied by c, always through both tables: the DFT is linear, so
+// scaling its inputs scales its outputs.
+//
+// Push constants (addresses, then the Metal kernel's parameters, then the
+// element count of an elementwise kernel):
+//   ntt_pass             x, y, hi, lo; PassParams                (128 bytes)
+//   ntt_scale            a; Fr c; uint n
+//   ntt_scale_copy       src, dst; Fr c; uint n
+//   ntt_distribute_zeta  a; Fr z[2]; uint n
+//   ntt_mul_periodic     a, t; uint mask; uint n
+
+#extension GL_GOOGLE_include_directive : require
+
+#include "fr.glsl"
+
+#if defined(NTT_PASS)
+
+const uint UNIVERSAL_LOG = 28u;
+
+// Pass flags.
+const uint F_TWIDDLE = 1u;   // multiply the inputs by the pass factors
+const uint F_TWO_LEVEL = 2u; // the factors read hi and lo
+const uint F_COSET = 4u;     // the input is coeff_to_extended's
+
+// One pass (the host's `PassParams`, same layout).
+struct PassParams {
+    uint log_n;   // L
+    uint log_r;   // d: this pass's radix is 2^d
+    uint log_p;   // log2 of the product of the earlier passes' radices
+    uint log_g;   // columns per workgroup, log2
+    uint flags;
+    uint n_src;   // F_COSET: source elements (the rest reads as zero)
+    uint hi_bits; // H: hi holds 2^H elements, lo 2^(28 - H)
+    uint pad;
+    Fr z1;        // F_COSET: factor of the elements with index 1 mod 3
+    Fr z2;        // F_COSET: factor of the elements with index 2 mod 3
+};
+
+layout(push_constant) uniform Push {
+    uvec2 x;
+    uvec2 y;
+    uvec2 hi;
+    uvec2 lo;
+    PassParams pp;
+} p;
+
+// Specialization constant 1: the words of shared memory, 8 per element of a
+// workgroup's tile (at least 8 * 2^(log_r + log_g)).
+layout(constant_id = 1) const uint SH_WORDS = 8192u;
+
+// The tile, limb-major (limb c of element i at c E + i), so that consecutive
+// invocations touch consecutive words.
+shared uint sh[SH_WORDS];
+
+Fr sh_load(uint e, uint i) {
+    Fr r;
+    [[unroll]] for (int c = 0; c < 8; c++) r.l[c] = sh[uint(c) * e + i];
+    return r;
+}
+
+void sh_store(uint e, uint i, Fr v) {
+    [[unroll]] for (int c = 0; c < 8; c++) sh[uint(c) * e + i] = v.l[c];
+}
+
+uint bitrev(uint v, uint bits) {
+    return bits == 0u ? 0u : (bitfieldReverse(v) >> (32u - bits));
+}
+
+// One Stockham pass (see the file text), one workgroup per G columns, on
+// workgroups of any size.
+void main() {
+    const uint gid = group_index();
+    const uint lid = gl_LocalInvocationID.x;
+    const uint tpg = gl_WorkGroupSize.x;
+    const uint d = p.pp.log_r;
+    const uint lg = p.pp.log_g;
+    const uint lp = p.pp.log_p;
+    const uint hb = p.pp.hi_bits;
+    const uint lo_bits = UNIVERSAL_LOG - hb;
+    const uint lo_mask = (1u << lo_bits) - 1u;
+    const uint gmask = (1u << lg) - 1u;
+    const uint e = 1u << (d + lg);
+    const uint stride_log = p.pp.log_n - d;
+    const uint j0 = gid << lg;
+    const uint pmask = (1u << lp) - 1u;
+    const uint xshift = UNIVERSAL_LOG - (lp + d);
+    const uint flags = p.pp.flags;
+
+    // load, with the coset distribution and the pass factors
+    for (uint l = lid; l < e; l += tpg) {
+        const uint g = l & gmask;
+        const uint t = l >> lg;
+        const uint j = j0 + g;
+        const uint idx = j + (t << stride_log);
+        Fr v;
+        if ((flags & F_COSET) != 0u) {
+            if (idx < p.pp.n_src) {
+                v = FR_AT(p.x, idx);
+                const uint m = idx % 3u;
+                if (m == 1u) v = fr_mul(v, p.pp.z1);
+                else if (m == 2u) v = fr_mul(v, p.pp.z2);
+            } else {
+                v = fr_zero();
+            }
+        } else {
+            v = FR_AT(p.x, idx);
+        }
+        if ((flags & F_TWIDDLE) != 0u) {
+            const uint xi = ((j & pmask) * t) << xshift;
+            Fr w = FR_AT(p.hi, xi >> lo_bits);
+            if ((flags & F_TWO_LEVEL) != 0u) w = fr_mul(w, FR_AT(p.lo, xi & lo_mask));
+            v = fr_mul(v, w);
+        }
+        sh_store(e, (t << lg) | g, v);
+    }
+    barrier();
+
+    // radix-2 decimation in frequency over each column's R elements
+    const uint half_e = e >> 1;
+    for (uint s = d; s >= 1u; s--) {
+        const uint h = 1u << (s - 1u);
+        const uint tw_shift = hb - s;
+        for (uint b = lid; b < half_e; b += tpg) {
+            const uint g = b & gmask;
+            const uint bb = b >> lg;
+            const uint jj = bb & (h - 1u);
+            const uint i0 = ((bb - jj) << 1) + jj;
+            const uint a0 = (i0 << lg) | g;
+            const uint a1 = ((i0 + h) << lg) | g;
+            const Fr u0 = sh_load(e, a0);
+            const Fr u1 = sh_load(e, a1);
+            Fr dif = fr_sub(u0, u1);
+            if (jj != 0u) dif = fr_mul(dif, FR_AT(p.hi, jj << tw_shift));
+            sh_store(e, a0, fr_add(u0, u1));
+            sh_store(e, a1, dif);
+        }
+        barrier();
+    }
+
+    // write V[r] (at the bit-reversed position r in shared memory)
+    const bool by_row = lp < lg;
+    for (uint l = lid; l < e; l += tpg) {
+        uint g, r;
+        if (by_row) {
+            // p < G: a column's own outputs are the contiguous ones
+            g = l >> d;
+            r = l & ((1u << d) - 1u);
+        } else {
+            g = l & gmask;
+            r = l >> lg;
+        }
+        const uint j = j0 + g;
+        const uint k = j & pmask;
+        const uint o = ((j - k) << d) + k + (r << lp);
+        FR_AT(p.y, o) = sh_load(e, (bitrev(r, d) << lg) | g);
+    }
+}
+
+#elif defined(NTT_SCALE)
+
+layout(push_constant) uniform Push {
+    uvec2 a;
+    Fr c;
+    uint n;
+} p;
+
+// a[i] *= c.
+void main() {
+    const uint i = global_index();
+    if (i >= p.n) return;
+    FR_AT(p.a, i) = fr_mul(FR_AT(p.a, i), p.c);
+}
+
+#elif defined(NTT_SCALE_COPY)
+
+layout(push_constant) uniform Push {
+    uvec2 src;
+    uvec2 dst;
+    Fr c;
+    uint n;
+} p;
+
+// dst[i] = src[i] * c.
+void main() {
+    const uint i = global_index();
+    if (i >= p.n) return;
+    FR_AT(p.dst, i) = fr_mul(FR_AT(p.src, i), p.c);
+}
+
+#elif defined(NTT_DISTRIBUTE_ZETA)
+
+layout(push_constant) uniform Push {
+    uvec2 a;
+    Fr z[2];
+    uint n;
+} p;
+
+// a[i] *= [1, z[0], z[1]][i mod 3].
+void main() {
+    const uint i = global_index();
+    if (i >= p.n) return;
+    const uint m = i % 3u;
+    if (m == 1u) FR_AT(p.a, i) = fr_mul(FR_AT(p.a, i), p.z[0]);
+    else if (m == 2u) FR_AT(p.a, i) = fr_mul(FR_AT(p.a, i), p.z[1]);
+}
+
+#elif defined(NTT_MUL_PERIODIC)
+
+layout(push_constant) uniform Push {
+    uvec2 a;
+    uvec2 t;
+    uint mask;
+    uint n;
+} p;
+
+// a[i] *= t[i & mask] (a period of mask + 1, a power of two).
+void main() {
+    const uint i = global_index();
+    if (i >= p.n) return;
+    FR_AT(p.a, i) = fr_mul(FR_AT(p.a, i), FR_AT(p.t, i & p.mask));
+}
+
+#else
+#error "one of NTT_PASS, NTT_SCALE, NTT_SCALE_COPY, NTT_DISTRIBUTE_ZETA, NTT_MUL_PERIODIC (build.rs)"
+#endif
