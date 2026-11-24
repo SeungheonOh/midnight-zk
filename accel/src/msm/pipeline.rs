@@ -35,13 +35,13 @@ use crate::{
 const SORT_BLOCK: usize = 1024;
 /// Threads of an `msm_ones` group (sppark `BATCH_ADD_BLOCK_SIZE`).
 const ONES_BLOCK: usize = 256;
-/// Threads of an `msm_accumulate` group (`ACC_GROUP` in msm.metal).
+/// Threads of an `msm_accumulate` group (`ACC_GROUP` of the kernel).
 const ACC_GROUP: usize = 256;
 /// Threads per window of `msm_integrate` (sppark `MSM_NTHREADS`).
 const MSM_NTHREADS: usize = 256;
-/// The largest low-digit width of the lower sort (`MAX_LOW` in msm.metal).
+/// The largest low-digit width of the lower sort (`MAX_LOW` of the kernel).
 const MAX_LOW_BITS: u32 = 12;
-/// The largest top-digit width of the upper sort (`MAX_TOP` in msm.metal).
+/// The largest top-digit width of the upper sort (`MAX_TOP` of the kernel).
 const MAX_TOP_BITS: u32 = 9;
 
 /// The SIMD-group width the `msm_ones` reduction and the sort's prefix sums
@@ -184,7 +184,7 @@ pub(super) fn scratch_bytes(pl: &Plan, g: &Geometry) -> [usize; 7] {
     ]
 }
 
-/// The kernel parameters of one chunk (the `constant` structs of msm.metal).
+/// The kernel parameters of one chunk (the parameter blocks of the kernels).
 struct ChunkParams {
     /// `DigitsParams`.
     digits: [u32; 6],

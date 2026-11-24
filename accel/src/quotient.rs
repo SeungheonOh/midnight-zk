@@ -26,10 +26,12 @@
 //! is read.
 //!
 //! Departures from the CUDA backend:
-//! - A Metal kernel takes at most 31 buffers, so the CUDA tables of device
-//!   pointers become flat buffers with index tables ([`tables`]).
-//! - The numerator runs over row ranges of about [`crate::Tuning::quotient_target_nanos`] each, so no
-//!   command buffer runs long.
+//! - The CUDA tables of device pointers become flat buffers with index
+//!   tables ([`tables`]): a kernel takes seven buffers (a Metal kernel takes
+//!   at most 31).
+//! - The numerator runs over row ranges of about
+//!   [`crate::Tuning::quotient_target_nanos`] each, so no command buffer runs
+//!   long.
 //! - Proving-key polynomials are also checked reduced.
 //! - Outside a request every serve checks the digests of the registered
 //!   polynomials it reads; the CUDA crate checks once per request.
@@ -252,7 +254,7 @@ impl Need {
         self.buffers().iter().sum()
     }
 
-    /// The largest single buffer (against `maxBufferLength`).
+    /// The largest single buffer (against the device's largest buffer).
     fn biggest(&self) -> usize {
         self.buffers().into_iter().max().unwrap_or(0)
     }

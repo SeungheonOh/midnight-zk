@@ -64,7 +64,7 @@ use crate::{
 pub enum Error {
     /// No usable device, or the context could not be made.
     NoDevice(String),
-    /// A buffer could not be allocated (or is above `maxBufferLength`).
+    /// A buffer could not be allocated (or is above the largest buffer).
     Memory(String),
     /// A pipeline, encoder or command buffer failed.
     Device(String),

@@ -64,7 +64,7 @@ pub enum Reason {
     Shape,
     /// A scalar not below the modulus.
     Unreduced,
-    /// A buffer above `maxBufferLength`, a failed allocation, or a budget.
+    /// A buffer above the largest buffer, a failed allocation, or a budget.
     Memory,
     /// A pipeline, encoder or command buffer failed.
     DeviceError,
