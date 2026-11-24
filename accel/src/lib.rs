@@ -140,6 +140,27 @@ pub struct Stats {
     pub quotient: ClassStats,
 }
 
+/// The host's time around the device work since the counters were last
+/// reset, in nanoseconds: where a call's wall time goes besides the GPU.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostTimes {
+    /// Copies through the host views of buffers (`Buffer::host_read`,
+    /// `host_write`, `read`, `write`), on the calling threads.
+    pub copy_nanos: u64,
+    /// Zeroing of buffers on the calling threads: pooled buffers coming back,
+    /// new allocations, shadows.
+    pub zero_nanos: u64,
+    /// Zeroing of released buffers on background threads.
+    pub zero_background_nanos: u64,
+    /// Command buffers ([`ctx::Ctx::run`]) from the start of encoding to the
+    /// end of their wait.
+    pub run_nanos: u64,
+    /// The GPU time of those command buffers.
+    pub run_gpu_nanos: u64,
+    /// Those command buffers.
+    pub runs: u64,
+}
+
 /// What a request's end report erased.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WipeStats {

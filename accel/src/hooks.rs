@@ -161,7 +161,12 @@ pub fn declines<B: Backend>() -> Vec<(&'static str, &'static str, u64)> {
     account::declines::<B>()
 }
 
-/// Resets [`stats`] and [`declines`].
+/// The host time around the device work since the last [`reset_stats`].
+pub fn host_times<B: Backend>() -> crate::HostTimes {
+    account::host_times::<B>()
+}
+
+/// Resets [`stats`], [`declines`] and [`host_times`].
 pub fn reset_stats<B: Backend>() {
     account::reset::<B>();
 }

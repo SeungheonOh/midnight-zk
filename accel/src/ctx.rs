@@ -51,11 +51,12 @@ use std::{
             Ordering::{Relaxed, SeqCst},
         },
     },
+    time::Instant,
 };
 
 use crate::{
     WipeStats,
-    account::Reason,
+    account::{self, HostPhase, Reason},
     backend::{Backend, Encoder, RawBuffer},
 };
 
@@ -457,11 +458,28 @@ pub fn release_later<B: Backend>(bufs: Vec<Buffer<B>>) {
     // the buffers stay reachable from here if the thread is not made
     let slot = Arc::new(Mutex::new(Some(bufs)));
     let theirs = Arc::clone(&slot);
-    let spawned = std::thread::Builder::new()
-        .name(format!("midnight-{}-release", B::NAME))
-        .spawn(move || release_now(&theirs, ticket));
+    let spawned = std::thread::Builder::new().name(format!("midnight-{}-release", B::NAME)).spawn(
+        move || {
+            BACKGROUND.set(true);
+            release_now(&theirs, ticket)
+        },
+    );
     if spawned.is_err() {
         release_now(&slot, ticket);
+    }
+}
+
+thread_local! {
+    /// Whether this thread zeroes released buffers in the background.
+    static BACKGROUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The host counter of a zeroing on this thread.
+fn zero_phase() -> HostPhase {
+    if BACKGROUND.get() {
+        HostPhase::ZeroBackground
+    } else {
+        HostPhase::Zero
     }
 }
 
@@ -714,7 +732,10 @@ impl<B: Backend> Buffer<B> {
         // and no GPU work writes it while `&self` is held outside `Ctx::run`.
         let s =
             unsafe { std::slice::from_raw_parts(p.as_ptr().cast(), self.bytes / size_of::<T>()) };
-        Ok(f(s))
+        let t = Instant::now();
+        let r = f(s);
+        account::add_host_since::<B>(HostPhase::Copy, t);
+        Ok(r)
     }
 
     /// `f` over the contents as mutable `T`s; the next run that binds the
@@ -727,7 +748,10 @@ impl<B: Backend> Buffer<B> {
         let s = unsafe {
             std::slice::from_raw_parts_mut(p.as_ptr().cast(), self.bytes / size_of::<T>())
         };
-        Ok(f(s))
+        let t = Instant::now();
+        let r = f(s);
+        account::add_host_since::<B>(HostPhase::Copy, t);
+        Ok(r)
     }
 
     /// The contents as a slice of `T` ([`Buffer::host_read`]). Panics when the
@@ -748,12 +772,18 @@ impl<B: Backend> Buffer<B> {
 
     /// Copies `data` to the start of the buffer. Panics if it does not fit.
     pub fn write<T: Pod>(&mut self, data: &[T]) {
-        self.as_mut_slice::<T>()[..data.len()].copy_from_slice(data);
+        let to = &mut self.as_mut_slice::<T>()[..data.len()];
+        let t = Instant::now();
+        to.copy_from_slice(data);
+        account::add_host_since::<B>(HostPhase::Copy, t);
     }
 
     /// Copies the start of the buffer into `out`. Panics if it is shorter.
     pub fn read<T: Pod>(&self, out: &mut [T]) {
-        out.copy_from_slice(&self.as_slice::<T>()[..out.len()]);
+        let from = &self.as_slice::<T>()[..out.len()];
+        let t = Instant::now();
+        out.copy_from_slice(from);
+        account::add_host_since::<B>(HostPhase::Copy, t);
     }
 
     /// `f` over the whole allocation's bytes, which may exceed
@@ -773,12 +803,14 @@ impl<B: Backend> Buffer<B> {
     /// counted as an erasure fault and the buffer is released instead of
     /// pooled.
     pub fn zero(&mut self) {
+        let t = Instant::now();
         // exclusive: `&mut self`
         let mut ok = self.raw.zero_all().is_ok();
         if let Some(sh) = self.shadow.get() {
             ok &= sh.raw.zero_all().is_ok();
             sh.state.store(SYNCED, SeqCst);
         }
+        account::add_host_since::<B>(zero_phase(), t);
         if ok {
             self.dirty.store(false, Relaxed);
         } else {
@@ -886,9 +918,14 @@ fn staging_take<B: Backend>(len: usize) -> Result<B::Raw, Error> {
     let (raw, zeroed) = context::<B>()?
         .alloc_staging(len)
         .ok_or_else(|| Error::Memory(format!("staging buffer of {len} bytes")))?;
-    if !zeroed && let Err(e) = raw.zero_all() {
-        raw.on_release();
-        return Err(e);
+    if !zeroed {
+        let t = Instant::now();
+        let r = raw.zero_all();
+        account::add_host_since::<B>(zero_phase(), t);
+        if let Err(e) = r {
+            raw.on_release();
+            return Err(e);
+        }
     }
     Ok(raw)
 }
@@ -918,9 +955,14 @@ impl<B: Backend> Ctx<B> {
     /// to be zero-filled is zeroed first.
     fn wrap(&self, raw: Option<(B::Raw, bool)>, bytes: usize) -> Result<Buffer<B>, Error> {
         let (raw, zeroed) = raw.ok_or_else(|| Error::Memory(format!("buffer of {bytes} bytes")))?;
-        if !zeroed && let Err(e) = raw.zero_all() {
-            raw.on_release();
-            return Err(e);
+        if !zeroed {
+            let t = Instant::now();
+            let r = raw.zero_all();
+            account::add_host_since::<B>(zero_phase(), t);
+            if let Err(e) = r {
+                raw.on_release();
+                return Err(e);
+            }
         }
         count_alloc::<B>(raw.len() as u64);
         Ok(Buffer::new(raw, bytes, false))
@@ -1001,7 +1043,8 @@ impl<B: Backend> Ctx<B> {
         &'a self,
         f: impl FnOnce(&mut Command<'_, 'a, B>) -> Result<R, Error>,
     ) -> Result<(R, u64), Error> {
-        let ((r, down), ns) = self.0.run(|enc| {
+        let t = Instant::now();
+        let ran = self.0.run(|enc| {
             let mut cmd = Command {
                 enc,
                 down: Vec::new(),
@@ -1009,7 +1052,11 @@ impl<B: Backend> Ctx<B> {
             let r = f(&mut cmd)?;
             cmd.encode_downloads()?;
             Ok((r, cmd.down))
-        })?;
+        });
+        account::add_host_since::<B>(HostPhase::Run, t);
+        account::add_host::<B>(HostPhase::Runs, 1);
+        let ((r, down), ns) = ran?;
+        account::add_host::<B>(HostPhase::RunGpu, ns);
         for (_, sh) in down {
             sh.state.store(SYNCED, SeqCst);
         }

@@ -112,8 +112,8 @@ use std::ffi::c_void;
 
 use midnight_accel as accel;
 pub use midnight_accel::{
-    ClassStats, G1AffineLimbs, G1JacobianLimbs, MAX_LOG_N, MAX_MSM_LOG, Scalar, Stats, Thresholds,
-    WipeStats, field,
+    ClassStats, G1AffineLimbs, G1JacobianLimbs, HostTimes, MAX_LOG_N, MAX_MSM_LOG, Scalar, Stats,
+    Thresholds, WipeStats, field,
 };
 
 pub mod ctx;
@@ -178,6 +178,19 @@ pub fn mem_info() -> Option<(usize, usize)> {
     accel::mem_info::<Vulkan>()
 }
 
+/// The pipelines created so far: `(kernel, workgroup width, driver creation
+/// time)`, in no particular order. Empty before the context is made.
+pub fn pipeline_times() -> Vec<(&'static str, u32, std::time::Duration)> {
+    let Ok(c) = ctx::context() else {
+        return Vec::new();
+    };
+    c.device()
+        .pipelines()
+        .iter()
+        .map(|p| (p.name(), p.workgroup(), p.creation_time()))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Thresholds and counters
 
@@ -207,6 +220,12 @@ pub fn stats() -> Stats {
     accel::stats::<Vulkan>()
 }
 
+/// The host time around the device work since the last [`reset_stats`]:
+/// copies, zeroing and command buffers.
+pub fn host_times() -> HostTimes {
+    accel::host_times::<Vulkan>()
+}
+
 /// Every decline since the last [`reset_stats`]: `(class, reason, count)`.
 /// The reasons are those of [`midnight_accel::declines`]; `no-device` also
 /// covers a build without SPIR-V and `MIDNIGHT_VULKAN=off`.
@@ -214,7 +233,7 @@ pub fn declines() -> Vec<(&'static str, &'static str, u64)> {
     accel::declines::<Vulkan>()
 }
 
-/// Resets [`stats`] and [`declines`].
+/// Resets [`stats`], [`declines`] and [`host_times`].
 pub fn reset_stats() {
     accel::reset_stats::<Vulkan>()
 }

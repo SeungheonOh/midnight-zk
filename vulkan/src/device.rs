@@ -836,6 +836,12 @@ impl Context {
     // -----------------------------------------------------------------------
     // Pipelines
 
+    /// The pipelines created so far, in no particular order.
+    pub fn pipelines(&self) -> Vec<Arc<Pipeline>> {
+        let cache = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+        cache.values().cloned().collect()
+    }
+
     /// The compute pipeline of `kernel` in `variant`, created at first use.
     pub fn pipeline(
         &self,
@@ -940,9 +946,11 @@ impl Context {
         let create = [vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(self.pipeline_layout)];
+        let t0 = Instant::now();
         // SAFETY: valid device, module and layout; the create info outlives
         // the call.
         let r = unsafe { d.create_compute_pipelines(vk::PipelineCache::null(), &create, None) };
+        let creation = t0.elapsed();
         // SAFETY: the module is no longer needed once the pipeline exists.
         unsafe { d.destroy_shader_module(module, None) };
         let pipeline = s.check("vkCreateComputePipelines", r.map_err(|(_, e)| e))?[0];
@@ -952,6 +960,7 @@ impl Context {
             name: shader.name,
             variant,
             options,
+            creation,
         })
     }
 
@@ -1317,9 +1326,17 @@ pub struct Pipeline {
     name: &'static str,
     variant: Variant,
     options: PipelineOptions,
+    /// The wall time of `vkCreateComputePipelines`.
+    creation: Duration,
 }
 
 impl Pipeline {
+    /// The wall time the driver took to create the pipeline (its shader
+    /// compilation).
+    pub fn creation_time(&self) -> Duration {
+        self.creation
+    }
+
     /// The kernel name.
     pub fn name(&self) -> &'static str {
         self.name

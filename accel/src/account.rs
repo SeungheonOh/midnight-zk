@@ -111,6 +111,43 @@ pub(crate) struct Account {
     /// Calls served, and their GPU nanoseconds, by [`Class::index`].
     served: [AtomicU64; 4],
     nanos: [AtomicU64; 4],
+    /// Host time by [`HostPhase`], in nanoseconds, and the command buffers.
+    host: [AtomicU64; 6],
+}
+
+/// A part of the host time around the device work ([`crate::HostTimes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostPhase {
+    Copy = 0,
+    Zero = 1,
+    ZeroBackground = 2,
+    Run = 3,
+    RunGpu = 4,
+    Runs = 5,
+}
+
+/// Adds `n` to the host counter `p`.
+pub(crate) fn add_host<B: Backend>(p: HostPhase, n: u64) {
+    account::<B>().host[p as usize].fetch_add(n, Relaxed);
+}
+
+/// Adds the time since `t` to the host counter `p`.
+pub(crate) fn add_host_since<B: Backend>(p: HostPhase, t: std::time::Instant) {
+    add_host::<B>(p, t.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+}
+
+/// The host times since the last [`reset`].
+pub fn host_times<B: Backend>() -> crate::HostTimes {
+    let h = &account::<B>().host;
+    let at = |p: HostPhase| h[p as usize].load(Relaxed);
+    crate::HostTimes {
+        copy_nanos: at(HostPhase::Copy),
+        zero_nanos: at(HostPhase::Zero),
+        zero_background_nanos: at(HostPhase::ZeroBackground),
+        run_nanos: at(HostPhase::Run),
+        run_gpu_nanos: at(HostPhase::RunGpu),
+        runs: at(HostPhase::Runs),
+    }
 }
 
 impl Account {
@@ -120,6 +157,7 @@ impl Account {
             declines: Mutex::new(BTreeMap::new()),
             served: [const { AtomicU64::new(0) }; 4],
             nanos: [const { AtomicU64::new(0) }; 4],
+            host: [const { AtomicU64::new(0) }; 6],
         }
     }
 }
@@ -169,7 +207,7 @@ pub fn class_stats<B: Backend>(class: Class) -> crate::ClassStats {
 /// Clears every counter.
 pub fn reset<B: Backend>() {
     let a = account::<B>();
-    for c in a.served.iter().chain(a.nanos.iter()) {
+    for c in a.served.iter().chain(a.nanos.iter()).chain(a.host.iter()) {
         c.store(0, Relaxed);
     }
     a.declines.lock().unwrap_or_else(|e| e.into_inner()).clear();
