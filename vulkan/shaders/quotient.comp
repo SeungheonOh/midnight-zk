@@ -1,0 +1,254 @@
+#version 460
+// This file is part of MIDNIGHT-ZK.
+// Copyright (C) Midnight Foundation
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// You may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// http://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// The quotient numerator nu(X) on the extended coset, `quotient_numerator`,
+// a port of the Metal crate's `quotient.metal` (itself a port of the CUDA
+// kernel `mgpu_quotient_kernel`, gpu/cuda/quotient.cuh).
+//
+// The job is the one midnight-proofs builds from its flat evaluators
+// (gpu::QuotientJob): the gates program, the permutation terms, the LogUp
+// terms of each lookup, the trash terms, each step `value = value * y +
+// term`, as `QuotientJob::numerator_reference` computes them. Field
+// arithmetic is exact, so every value equals the CPU value bit for bit.
+//
+// - A polynomial is a "handle" `(bank << 30) | index`: the extended coset
+//   `index` (2^ext_k values) of one of three banks, bank 0 the proof's
+//   cosets, bank 1 the resident proving-key copy, bank 2 the proving-key
+//   polynomials uploaded for the call. A bank may exceed 4 GiB: its element
+//   offsets are 64-bit.
+// - The job's tables (programs, permutation columns, lookups, trash) are one
+//   buffer of 32-bit words addressed by word offsets (quotient.glsl), the
+//   programs' uniforms one buffer of field elements.
+// - One dispatch covers the rows [row0, row_end) with `threads` invocations,
+//   each taking the rows row0 + tid, row0 + tid + threads, ...; invocations
+//   from `threads` on return at once. Program intermediates live in a device
+//   buffer, slot-major: scratch[slot * threads + tid].
+//
+// Push constants: the addresses proof, key_res, key_tmp, words, uniforms,
+// nu, scratch, params (64 bytes). `Params` (320 bytes, over the push-constant
+// block) is read from the buffer at `params`.
+
+#extension GL_GOOGLE_include_directive : require
+
+#include "fr.glsl"
+#include "quotient.glsl"
+
+layout(push_constant) uniform Push {
+    uvec2 proof;
+    uvec2 key_res;
+    uvec2 key_tmp;
+    uvec2 words;
+    uvec2 uniforms;
+    uvec2 nu;
+    uvec2 scratch;
+    uvec2 params;
+} pc;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ParamsRef {
+    Params v;
+};
+
+#define P ParamsRef(pc.params).v
+#define W(i) U32_AT(pc.words, i)
+
+// This invocation and its current row.
+uint g_tid;
+uint g_idx;
+
+// The value of `handle` at `row`: element `(index << ext_k) + row` of its
+// bank, a 64-bit offset.
+Fr column(uint handle, uint row) {
+    const uint bank = handle >> HANDLE_SHIFT;
+    const uint index = handle & HANDLE_MASK;
+    const uint ext_k = P.ext_k;
+    uvec2 off = ext_k == 0u ? uvec2(index, 0u) : uvec2(index << ext_k, index >> (32u - ext_k));
+    off = add64(off, uvec2(row, 0u));
+    const uvec2 base = bank == BANK_PROOF ? pc.proof : (bank == BANK_KEY_RES ? pc.key_res : pc.key_tmp);
+    return FrRef(addr_at64(base, off, 32u)).v;
+}
+
+// Row `idx` rotated by `rot` rows of the base domain (2^log_scale extended
+// rows each), modulo the extended size: the wrap of a 32-bit sum is a
+// multiple of 2^ext_k, so the mask gives the reference's
+// `wrapping_add & (n - 1)`.
+uint rotate(uint idx, int rot) {
+    return (idx + (uint(rot) << P.log_scale)) & P.mask;
+}
+
+// The address of scratch slot `i` of this invocation.
+uvec2 scratch_at(uint i) {
+    uvec2 e;
+    umulExtended(i, P.threads, e.y, e.x);
+    return addr_at64(pc.scratch, add64(e, uvec2(g_tid, 0u)), 32u);
+}
+
+Fr operand(uint reads, uint unis, uint o) {
+    const uint i = o & OPERAND_MASK;
+    switch (o >> OPERAND_SHIFT) {
+    case TAG_UNIFORM:
+        return FR_AT(pc.uniforms, unis + i);
+    case TAG_READ: {
+        const uint h = W(reads + 2u * i);
+        const int rot = int(W(reads + 2u * i + 1u));
+        return column(h, rotate(g_idx, rot));
+    }
+    default:
+        return FrRef(scratch_at(i)).v;
+    }
+}
+
+// Runs the program at word offset `pd` for the current row; writes its first
+// noutputs (at most 4) outputs.
+void program(uint pd, inout Fr outv[4]) {
+    const uint ops = W(pd + PROG_OPS);
+    const uint nops = W(pd + PROG_NOPS);
+    const uint reads = W(pd + PROG_READS);
+    const uint unis = W(pd + PROG_UNIFORMS);
+    const uint outs = W(pd + PROG_OUTPUTS);
+    const uint nouts = W(pd + PROG_NOUTPUTS);
+    for (uint k = 0u; k < nops; k++) {
+        const uint o = ops + OP_WORDS * k;
+        const uint kind = W(o);
+        const uint dst = W(o + 1u);
+        const Fr a = operand(reads, unis, W(o + 2u));
+        Fr v;
+        switch (kind) {
+        case OP_ADD: v = fr_add(a, operand(reads, unis, W(o + 3u))); break;
+        case OP_SUB: v = fr_sub(a, operand(reads, unis, W(o + 3u))); break;
+        case OP_MUL: v = fr_mul(a, operand(reads, unis, W(o + 3u))); break;
+        case OP_SQUARE: v = fr_sqr(a); break;
+        case OP_DOUBLE: v = fr_dbl(a); break;
+        case OP_NEGATE: v = fr_neg(a); break;
+        default:
+            v = fr_add(fr_mul(a, operand(reads, unis, W(o + 3u))),
+                       operand(reads, unis, W(o + 4u)));
+            break;
+        }
+        FrRef(scratch_at(dst)).v = v;
+    }
+    for (uint k = 0u; k < nouts && k < 4u; k++) outv[k] = operand(reads, unis, W(outs + k));
+}
+
+Fr pow_u32(Fr b, uint e) {
+    Fr r = fr_one();
+    while (e != 0u) {
+        if ((e & 1u) != 0u) r = fr_mul(r, b);
+        b = fr_sqr(b);
+        e >>= 1;
+    }
+    return r;
+}
+
+void main() {
+    g_tid = global_index();
+    const uint threads = P.threads;
+    if (g_tid >= threads) return;
+    const Fr one = fr_one();
+    const Fr y = P.y;
+    Fr o[4];
+
+    const uint first = P.row0 + g_tid;
+    const uint row_end = P.row_end;
+    // omega^idx for the permutation's delta powers: one exponentiation per
+    // invocation, then one multiplication by omega^threads per row
+    Fr omega_i = fr_one();
+    if (P.perm_nsets != 0u && first < row_end) omega_i = pow_u32(P.omega, first);
+
+    for (uint idx = first; idx < row_end; idx += threads) {
+        g_idx = idx;
+        program(P.gates, o);
+        Fr value = o[0];
+        const Fr l0 = column(P.l0, idx);
+        const Fr l_last = column(P.l_last, idx);
+        const Fr l_active = column(P.l_active, idx);
+        const uint r_next = rotate(idx, 1);
+
+        // Permutation.
+        const uint nsets = P.perm_nsets;
+        if (nsets != 0u) {
+            const uint zs = P.perm;                // handles of the accumulators
+            const uint cols = zs + nsets;          // handles of the permuted columns
+            const uint sig = cols + P.perm_ncolumns; // handles of the sigma cosets
+            const uint r_last = rotate(idx, P.perm_last_rotation);
+            const Fr z_first = column(W(zs), idx);
+            const Fr z_last = column(W(zs + nsets - 1u), idx);
+            value = fr_add(fr_mul(value, y), fr_mul(fr_sub(one, z_first), l0));
+            value = fr_add(fr_mul(value, y), fr_mul(fr_sub(fr_sqr(z_last), z_last), l_last));
+            for (uint s = 1u; s < nsets; s++) {
+                const Fr cur = column(W(zs + s), idx);
+                const Fr prev = column(W(zs + s - 1u), r_last);
+                value = fr_add(fr_mul(value, y), fr_mul(fr_sub(cur, prev), l0));
+            }
+            Fr current_delta = fr_mul(P.delta_start, omega_i);
+            for (uint s = 0u; s < nsets; s++) {
+                const uint z = W(zs + s);
+                const uint c0 = s * P.perm_chunk_len;
+                const uint c1 = min(c0 + P.perm_chunk_len, P.perm_ncolumns);
+                Fr left = column(z, r_next);
+                for (uint k = c0; k < c1; k++) {
+                    const Fr x = column(W(cols + k), idx);
+                    const Fr sg = column(W(sig + k), idx);
+                    left = fr_mul(left, fr_add(fr_add(x, fr_mul(P.beta, sg)), P.gamma));
+                }
+                Fr right = column(z, idx);
+                for (uint k = c0; k < c1; k++) {
+                    const Fr x = column(W(cols + k), idx);
+                    right = fr_mul(right, fr_add(fr_add(x, current_delta), P.gamma));
+                    current_delta = fr_mul(current_delta, P.delta);
+                }
+                value = fr_add(fr_mul(value, y), fr_mul(fr_sub(left, right), l_active));
+            }
+            omega_i = fr_mul(omega_i, P.omega_step);
+        }
+
+        // Lookups (LogUp).
+        for (uint li = 0u; li < P.nlookups; li++) {
+            const uint L = P.lookups + LOOKUP_WORDS * li;
+            const uint agg = W(L + LOOKUP_AGGREGATOR);
+            const uint mult = W(L + LOOKUP_MULTIPLICITIES);
+            const uint nchunks = W(L + LOOKUP_NCHUNKS);
+            const uint chunks = W(L + LOOKUP_CHUNKS);
+            const Fr agg_i = column(agg, idx);
+            value = fr_add(fr_mul(value, y), fr_mul(agg_i, fr_add(l0, l_last)));
+            Fr sum_helpers = fr_zero(), table = fr_zero(), selector = fr_zero();
+            for (uint fi = 0u; fi < nchunks; fi++) {
+                const uint ch = chunks + CHUNK_WORDS * fi;
+                program(W(ch + CHUNK_PROGRAM), o);
+                if (fi == 0u) {
+                    table = o[2];
+                    selector = o[3];
+                }
+                const Fr h = column(W(ch + CHUNK_HELPER), idx);
+                value = fr_sub(fr_add(fr_mul(value, y), fr_mul(h, o[1])), o[0]);
+                sum_helpers = fr_add(sum_helpers, h);
+            }
+            const Fr agg_next = column(agg, r_next);
+            const Fr m = column(mult, idx);
+            const Fr inner =
+                fr_add(fr_mul(fr_sub(fr_sub(agg_next, agg_i), fr_mul(selector, sum_helpers)), table), m);
+            value = fr_add(fr_mul(value, y), fr_mul(l_active, inner));
+        }
+
+        // Trash arguments.
+        for (uint ti = 0u; ti < P.ntrash; ti++) {
+            const uint T = P.trash + TRASH_WORDS * ti;
+            program(W(T + TRASH_PROGRAM), o);
+            const Fr q = column(W(T + TRASH_SELECTOR), idx);
+            const Fr t = column(W(T + TRASH_POLY), idx);
+            value = fr_add(fr_mul(value, y), fr_sub(o[0], fr_mul(fr_sub(one, q), t)));
+        }
+
+        FR_AT(pc.nu, idx) = value;
+    }
+}

@@ -82,6 +82,7 @@ const KERNELS: &[Kernel] = &[
         &["g1_mul"],
     ),
     kernel("msm_integrate", "msm.comp", &["MSM_INTEGRATE"], &["g1_mul"]),
+    kernel("quotient_numerator", "quotient.comp", &[], &[]),
     test("diag_iota", "diag_iota.comp", &[], &[]),
     test("field_test_fr", "field_test.comp", &["FIELD_FR"], &[]),
     test("field_test_fp", "field_test.comp", &["FIELD_FP"], &[]),
