@@ -21,6 +21,8 @@ default = []
 rc1-bench-cuda = ["dep:midnight-gpu", "midnight-gpu/cuda", "midnight-proofs/gpu"]
 # The bench through the Metal hooks (midnight-metal), on an Apple GPU.
 rc1-bench-metal = ["dep:midnight-metal", "midnight-proofs/gpu"]
+# The bench through the Vulkan hooks (midnight-vulkan), on a Vulkan GPU.
+rc1-bench-vulkan = ["dep:midnight-vulkan", "midnight-proofs/gpu"]
 
 [dependencies]
 blake2b_simd = { workspace = true }
@@ -34,6 +36,7 @@ midnight-proofs = { version = "0.9.0-rc.1", default-features = false, features =
 ] }
 midnight-gpu = { version = "0.1.0", path = "../../gpu", optional = true }
 midnight-metal = { version = "0.1.0", path = "../../metal", optional = true }
+midnight-vulkan = { version = "0.1.0", path = "../../vulkan", optional = true }
 rand = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }

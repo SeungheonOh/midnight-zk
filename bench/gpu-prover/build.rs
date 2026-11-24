@@ -17,6 +17,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(rc1_device)");
     if std::env::var_os("CARGO_FEATURE_RC1_BENCH_CUDA").is_some()
         || std::env::var_os("CARGO_FEATURE_RC1_BENCH_METAL").is_some()
+        || std::env::var_os("CARGO_FEATURE_RC1_BENCH_VULKAN").is_some()
     {
         println!("cargo::rustc-cfg=rc1_device");
     }

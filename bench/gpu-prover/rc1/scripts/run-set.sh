@@ -2,7 +2,7 @@
 set -euo pipefail
 source bench/gpu-prover/rc1/scripts/common.sh
 
-[[ $# == 2 && $1 =~ ^(cpu|gpu|metal)$ && $2 =~ ^[123]$ ]] || { echo "usage: run-{cpu,gpu,metal}.sh REP (1, 2, or 3)" >&2; exit 2; }
+[[ $# == 2 && $1 =~ ^(cpu|gpu|metal|vulkan)$ && $2 =~ ^[123]$ ]] || { echo "usage: run-{cpu,gpu,metal,vulkan}.sh REP (1, 2, or 3)" >&2; exit 2; }
 mode=$1
 export RC1_REP=$2 RC1_K=${RC1_K:-21} RC1_WARM=${RC1_WARM:-1}
 mkdir -p "$out_dir"

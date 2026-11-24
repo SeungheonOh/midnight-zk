@@ -6,7 +6,7 @@ rc.1 bench executable.
 
 | Path | What it is |
 |---|---|
-| [`rc1/`](rc1/README.md) | The rc.1 chain-circuit bench (`rc1-bench`), its scripts and per-GPU results. Built with no feature for the stock CPU prover, `rc1-bench-cuda` for the CUDA hooks, `rc1-bench-metal` for the Metal hooks (macOS only). |
+| [`rc1/`](rc1/README.md) | The rc.1 chain-circuit bench (`rc1-bench`), its scripts and per-GPU results. Built with no feature for the stock CPU prover, `rc1-bench-cuda` for the CUDA hooks, `rc1-bench-metal` for the Metal hooks (macOS only), `rc1-bench-vulkan` for the Vulkan hooks. |
 | [`session/`](session/run.sh) | The measurement session behind the tables in `docs/gpu-prover/benchmarks.md`: the runner, the summary script and the raw rows. |
 | [`abab/`](abab/README.md) | Interleaved A/B comparisons of two trees. |
 | [`h2h/`](h2h/results/RESULTS.md) | Head-to-head CPU and GPU runs of the rc.1 bench. |

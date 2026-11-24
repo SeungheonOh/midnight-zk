@@ -190,3 +190,94 @@ pub mod device {
         })
     }
 }
+
+/// The Vulkan counterpart of the CUDA `device` module above.
+#[cfg(all(
+    feature = "rc1-bench-vulkan",
+    not(feature = "rc1-bench-cuda"),
+    not(feature = "rc1-bench-metal")
+))]
+pub mod device {
+    use midnight_curves::Bls12;
+    use midnight_proofs::{
+        gpu::{self as hooks, adapter},
+        poly::{
+            Coeff, LagrangeCoeff, LagrangeDeltaCoeff, LagrangeDoubleDeltaCoeff,
+            kzg::params::ParamsKZG,
+        },
+    };
+    use midnight_vulkan as vulkan;
+
+    use super::Metrics;
+    use crate::{Key, Result};
+
+    /// The device model and the budget of its device-local memory in bytes.
+    pub fn info() -> Result<(String, u64)> {
+        let info = vulkan::present().ok_or("Vulkan device unavailable")?;
+        let (_, total) = vulkan::mem_info().ok_or("Vulkan device unavailable")?;
+        Ok((info.name.clone(), total as u64))
+    }
+
+    /// Registers the SRS vectors and the key's resident polynomials, and
+    /// installs the hooks.
+    pub fn install(
+        params: &ParamsKZG<Bls12>,
+        pk: &Key,
+    ) -> Result<([vulkan::SrsHandle; 4], vulkan::KeyHandle)> {
+        if !vulkan::device() {
+            return Err("Vulkan device unavailable".into());
+        }
+        let srs = [
+            params.bases::<Coeff>(),
+            params.bases::<LagrangeCoeff>(),
+            params.bases::<LagrangeDeltaCoeff>(),
+            params.bases::<LagrangeDoubleDeltaCoeff>(),
+        ]
+        .map(|p| vulkan::register_srs(adapter::affine(p)));
+        let polys = pk.gpu_resident_polys().ok_or("unsupported quotient shape")?;
+        let key =
+            vulkan::register_key(&polys.iter().map(|p| adapter::scalars(p)).collect::<Vec<_>>());
+        if !hooks::install(hooks::GpuHooks {
+            msm_g1: Some(vulkan::msm_g1),
+            fft: Some(vulkan::fft),
+            ifft: Some(vulkan::ifft),
+            quotient: Some(vulkan::quotient),
+        }) {
+            return Err("hooks already installed".into());
+        }
+        Ok((srs, key))
+    }
+
+    /// The crate's counters are reset at `begin`.
+    pub struct Baseline;
+
+    pub fn begin() -> Baseline {
+        vulkan::begin_request();
+        vulkan::reset_stats();
+        hooks::reset_hook_declines();
+        Baseline
+    }
+
+    /// The crate counts no transfers: the transfer and staging counters are
+    /// 0, also on a discrete GPU.
+    pub fn finish(_: Baseline) -> Result<Metrics> {
+        let stats = vulkan::stats();
+        let hook_declines = hooks::hook_declines();
+        let declines = vulkan::declines();
+        let peak_bytes = vulkan::device_bytes().1;
+        if !vulkan::end_request() {
+            return Err("device cleanup failed".into());
+        }
+        Ok(Metrics {
+            msm: stats.msm.served,
+            ntt: stats.fft.served + stats.ifft.served,
+            quotient: stats.quotient.served,
+            device_errors: declines.iter().filter(|d| d.1 == "device-error").map(|d| d.2).sum(),
+            fallbacks: hook_declines.iter().map(|d| d.2).sum(),
+            declines,
+            hook_declines,
+            peak_bytes,
+            ..Metrics::default()
+        })
+    }
+}

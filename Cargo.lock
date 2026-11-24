@@ -1287,6 +1287,7 @@ dependencies = [
  "midnight-gpu",
  "midnight-metal",
  "midnight-proofs",
+ "midnight-vulkan",
  "rand 0.8.7",
  "rayon",
  "serde",
