@@ -680,7 +680,7 @@ fn device_run<B: Backend>(
         s.scratch("quotient-tmp", tmp_need).map_err(err)?;
     }
     let ntemp = plan.places.iter().filter(|p| **p == Place::Temp).count();
-    let proof_buf = c.alloc_pooled(tab.proof.len().max(1) * ebytes).map_err(err)?;
+    let mut proof_buf = c.alloc_pooled(tab.proof.len().max(1) * ebytes).map_err(err)?;
     let mut src_a = c.alloc_pooled(n * SCALAR_BYTES).map_err(err)?;
     let mut src_b = c.alloc_pooled(n * SCALAR_BYTES).map_err(err)?;
     let mut key_tmp = c.alloc_pooled(ntemp * ebytes).map_err(err)?;
@@ -699,10 +699,23 @@ fn device_run<B: Backend>(
     let dummy = c.alloc(0).map_err(err)?;
     let tmp = tmp_ref.unwrap_or(&dummy);
 
-    // keys on CPU threads while the device moves the proof's polynomials to
-    // the coset; the first proof polynomial is copied first, as the device
-    // waits for it
-    if let Some(first) = tab.proof.first()
+    // When `ext_k` uses an even pass count (2 passes for 11 <= ext_k <= 20),
+    // copy all proof polynomials directly into their `proof_buf` slots and
+    // run every coset NTT in a single batched command buffer (eliminating
+    // 7-17 per-polynomial fence stalls) while keys are copied/hashed in parallel.
+    let batch_cosets = c.unified() && !tab.proof.is_empty() && ntt::plan(ext_k).len().is_multiple_of(2);
+    if batch_cosets {
+        let reduced = proof_buf
+            .host_write(|dst: &mut [Scalar]| {
+                tab.proof.iter().enumerate().all(|(i, p)| {
+                    copy_checked(&mut dst[i * en..i * en + n], p)
+                })
+            })
+            .map_err(err)?;
+        if !reduced {
+            return Err(Reason::Unreduced);
+        }
+    } else if let Some(first) = tab.proof.first()
         && !src_a.host_write(|d: &mut [Scalar]| copy_checked(d, first)).map_err(err)?
     {
         return Err(Reason::Unreduced);
@@ -722,7 +735,20 @@ fn device_run<B: Backend>(
                 en,
             )
         });
-        let cosets = proof_cosets(c, j, &tab.proof, [&mut src_a, &mut src_b], &proof_buf, tmp);
+        let cosets = if batch_cosets {
+            ntt::coeff_to_extended_batch_in_place(
+                c,
+                &proof_buf,
+                tab.proof.len(),
+                tmp,
+                k,
+                ext_k,
+                &j.zeta,
+            )
+            .map_err(err)
+        } else {
+            proof_cosets(c, j, &tab.proof, [&mut src_a, &mut src_b], &proof_buf, tmp)
+        };
         // a panicked key thread reads as unreduced copies
         (kh.join().unwrap_or_default(), cosets)
     });

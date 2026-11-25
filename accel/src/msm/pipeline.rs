@@ -187,17 +187,22 @@ pub(super) struct Bufs<'a, B: Backend> {
 
 /// Byte sizes of the scratch buffers of `pl`, in [`Bufs`] field order from
 /// `digits` to `hot`.
-pub(super) fn scratch_bytes(pl: &Plan, g: &Geometry) -> [usize; 7] {
+pub(super) fn scratch_bytes<B: Backend>(pl: &Plan, g: &Geometry) -> [usize; 7] {
     let ntop = 1usize << pl.top_bits;
     let rows = (pl.nwins as usize) << pl.bits;
+    let temps_bytes = pl.pass as usize * pl.stride * 8;
     [
         pl.nwins as usize * pl.stride * 4,
-        pl.pass as usize * pl.stride * 8,
+        if B::MSM_LENGTH_BINS {
+            temps_bytes.max(rows * 4)
+        } else {
+            temps_bytes
+        },
         pl.pass as usize * ntop * g.sort_groups as usize * 4,
         rows * 4,
         rows * size_of::<Xyzz>(),
         g.ones_slots() * size_of::<Xyzz>(),
-        4,
+        if B::MSM_LENGTH_BINS { 128 * 4 } else { 4 },
     ]
 }
 
@@ -334,6 +339,57 @@ fn enc_accumulate<'a, B: Backend>(
 ) -> Result<(), Error> {
     let pts = Arg::BufferAt(b.points, h_off * size_of::<G1AffineLimbs>());
     let total = (pl.nwins as usize) << pl.bits;
+    if B::MSM_LENGTH_BINS {
+        cmd.dispatch(
+            "msm_bin_count",
+            total,
+            &[
+                Arg::Buffer(b.buckets),
+                Arg::Buffer(b.hist),
+                Arg::Buffer(b.hot),
+            ],
+            &p.acc,
+        )?;
+        cmd.dispatch("msm_bin_scan", 1, &[Arg::Buffer(b.hot)], &())?;
+        cmd.dispatch(
+            "msm_bin_scatter",
+            total,
+            &[
+                Arg::Buffer(b.temps),
+                Arg::Buffer(b.hist),
+                Arg::Buffer(b.hot),
+            ],
+            &p.acc,
+        )?;
+        cmd.dispatch_groups(
+            "msm_ones",
+            g.ones_groups,
+            g.ones_block,
+            &[
+                Arg::Buffer(b.ones),
+                pts,
+                Arg::Buffer(b.digits),
+                Arg::Buffer(b.hist),
+            ],
+            &(),
+            &[],
+        )?;
+        return cmd.dispatch_with(
+            "msm_accumulate",
+            total,
+            g.acc_block,
+            &[
+                Arg::Buffer(b.buckets),
+                pts,
+                Arg::Buffer(b.digits),
+                Arg::Buffer(b.hist),
+                Arg::Buffer(b.hot),
+                Arg::Buffer(b.temps),
+            ],
+            &p.acc,
+            &[],
+        );
+    }
     cmd.dispatch(
         "msm_bucket_guard",
         total,

@@ -599,6 +599,116 @@ pub fn coeff_to_extended_dev_at<B: Backend>(
     )
 }
 
+/// Batched `coeff_to_extended` on the device for `count` polynomials whose
+/// `2^k` coefficients are already placed at the start of each `2^ext_k`-scalar
+/// slot in `cosets`. Encodes all `count` transforms into as few command buffers
+/// as [`crate::Tuning::ntt_run_budget`] allows (typically one), eliminating
+/// per-polynomial fence stalls. Requires an even pass count (`11 <= ext_k <= 20`,
+/// i.e. 2 passes) so pass 0 reads `cosets[i]` into `tmp` and pass 1 writes
+/// `cosets[i]` without aliasing.
+#[allow(clippy::too_many_arguments)]
+pub fn coeff_to_extended_batch_in_place<B: Backend>(
+    ctx: &Ctx<B>,
+    cosets: &Buffer<B>,
+    count: usize,
+    tmp: &Buffer<B>,
+    k: u32,
+    ext_k: u32,
+    zeta: &[Scalar; 2],
+) -> Result<u64, Error> {
+    if count == 0 {
+        return Ok(0);
+    }
+    if !zeta.iter().all(field::is_reduced) {
+        return Err(Error::Unreduced("coeff_to_extended_batch: zeta".into()));
+    }
+    if k < 1 || k > ext_k || ext_k > MAX_LOG_N {
+        return Err(Error::Device(format!(
+            "coeff_to_extended_batch: dimensions k {k}, ext_k {ext_k}"
+        )));
+    }
+    let radices = plan(ext_k);
+    let passes = radices.len();
+    if passes == 0 || !passes.is_multiple_of(2) {
+        return Err(Error::Device(
+            "coeff_to_extended_batch: requires an even pass count".into(),
+        ));
+    }
+    let n = 1usize << ext_k;
+    let ebytes = n * SCALAR_BYTES;
+    if std::ptr::eq(cosets, tmp) {
+        return Err(Error::Device(
+            "coeff_to_extended_batch: cosets aliases scratch".into(),
+        ));
+    }
+    check_len(cosets, count * n, "cosets")?;
+    check_len(tmp, n, "scratch")?;
+
+    let tables = tables(ctx)?;
+    let d = Dir::Forward.index();
+    let hi = &tables.hi[d];
+    let lo = &tables.lo[d];
+
+    let dummy_job = Job {
+        log_n: ext_k,
+        dir: Dir::Forward,
+        src: cosets,
+        dst: cosets,
+        dst_off: 0,
+        tmp,
+        scale: None,
+        coset: Some((1usize << k, *zeta)),
+        pre_mul: None,
+        post_zeta: None,
+        read_back: false,
+    };
+    let params = pass_params(&dummy_job, &radices, false);
+    let per_poly_cost: u64 = params
+        .iter()
+        .map(|p| (n as u64) * (u64::from(p.log_r) / 2 + 1 + 2 * u64::from(p.flags & F_TWIDDLE)))
+        .sum();
+    let budget = B::tuning().ntt_run_budget;
+    let per_cb = (budget / per_poly_cost.max(1)).max(1) as usize;
+
+    let mut ns = 0u64;
+    let mut i0 = 0usize;
+    while i0 < count {
+        let i1 = (i0 + per_cb).min(count);
+        ns += ctx
+            .run(|cmd| {
+                for poly in i0..i1 {
+                    let off = poly * ebytes;
+                    for (q, p) in params.iter().enumerate() {
+                        let ((src, src_off), (dst, dst_off)) = if q % 2 == 0 {
+                            ((cosets, off), (tmp, 0))
+                        } else {
+                            ((tmp, 0), (cosets, off))
+                        };
+                        let args = [
+                            Arg::BufferAt(src, src_off),
+                            Arg::BufferAt(dst, dst_off),
+                            Arg::Buffer(hi),
+                            Arg::Buffer(lo),
+                        ];
+                        let e_log = p.log_r + p.log_g;
+                        cmd.dispatch_groups(
+                            "ntt_pass",
+                            n >> e_log,
+                            group_threads(e_log),
+                            &args,
+                            p,
+                            &[SCALAR_BYTES << e_log],
+                        )?;
+                    }
+                }
+                Ok(())
+            })?
+            .1;
+        i0 = i1;
+    }
+    Ok(ns)
+}
+
 /// `extended_to_coeff` in place on `a[..2^ext_k]`: the inverse NTT times
 /// `divisor`, then [`encode_distribute_zeta`] with `zeta_out`, for the host to
 /// read `a`. Returns the GPU time.

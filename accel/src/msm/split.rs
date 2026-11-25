@@ -179,7 +179,7 @@ fn bind_buffers<'s, B: Backend>(
     let keys = [
         K_DIGITS, K_TEMPS, K_COUNTS, K_HIST, K_BUCKETS, K_ONES, K_HOT,
     ];
-    for (k, bytes) in keys.into_iter().zip(scratch_bytes(pl, geo)) {
+    for (k, bytes) in keys.into_iter().zip(scratch_bytes::<B>(pl, geo)) {
         s.scratch(k, bytes)?;
     }
     write_parallel(s.scratch(K_SCALARS, size_of_val(scalars))?, scalars)?;

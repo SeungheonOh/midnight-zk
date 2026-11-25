@@ -30,12 +30,70 @@ use std::{
 
 use super::{
     checks::{first_not_in_g1, points_equal},
-    par::{lock, read, write},
+    par::{host_threads, lock, par_parts, read, write},
 };
 use crate::{
     Backend, G1AffineLimbs, G1JacobianLimbs,
     ctx::{Buffer, Ctx, Error},
 };
+
+/// Points hashed per chunk for fast host-side SRS identity checks without
+/// reading uncached device memory (4096 * 96 B = 384 KiB per chunk).
+const DIGEST_CHUNK: usize = 4096;
+
+fn sha256_points(pts: &[G1AffineLimbs]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    // SAFETY: `G1AffineLimbs` is `[u64; 12]`, plain bytes with no padding.
+    unsafe {
+        blst::blst_sha256(
+            out.as_mut_ptr(),
+            pts.as_ptr() as *const u8,
+            std::mem::size_of_val(pts),
+        );
+    }
+    out
+}
+
+fn chunk_digests_of(bases: &[G1AffineLimbs]) -> Vec<[u8; 32]> {
+    let nchunks = bases.len() / DIGEST_CHUNK;
+    if nchunks == 0 {
+        return Vec::new();
+    }
+    let parts = par_parts(nchunks, host_threads(), 1, |lo, hi| {
+        (lo..hi)
+            .map(|c| sha256_points(&bases[c * DIGEST_CHUNK..(c + 1) * DIGEST_CHUNK]))
+            .collect::<Vec<_>>()
+    });
+    match parts {
+        Some(ps) => ps.into_iter().flatten().collect(),
+        None => (0..nchunks)
+            .map(|c| sha256_points(&bases[c * DIGEST_CHUNK..(c + 1) * DIGEST_CHUNK]))
+            .collect(),
+    }
+}
+
+fn chunk_digests_match(bases: &[G1AffineLimbs], expected: &[[u8; 32]]) -> bool {
+    let nchunks = bases.len() / DIGEST_CHUNK;
+    if nchunks == 0 {
+        return true;
+    }
+    if expected.len() < nchunks {
+        return false;
+    }
+    let differs = std::sync::atomic::AtomicBool::new(false);
+    let done = par_parts(nchunks, host_threads(), 1, |lo, hi| {
+        for c in lo..hi {
+            if differs.load(Relaxed) {
+                return;
+            }
+            if sha256_points(&bases[c * DIGEST_CHUNK..(c + 1) * DIGEST_CHUNK]) != expected[c] {
+                differs.store(true, Relaxed);
+                return;
+            }
+        }
+    });
+    done.is_some() && !differs.load(Relaxed)
+}
 
 /// Where a table's points are: the host copy until the first MSM, then the
 /// device buffer alone when the host reads device memory in place
@@ -76,6 +134,10 @@ pub(crate) struct Table<B: Backend> {
     /// The first index whose point is not in G1, or `len`. An MSM on a longer
     /// prefix declines.
     pub(super) first_bad: usize,
+    /// SHA-256 digests of each full [`DIGEST_CHUNK`]-point block, so unified
+    /// backends verify `bases` from cached host RAM without reading uncached
+    /// device memory.
+    chunk_digests: Vec<[u8; 32]>,
     pub(super) store: RwLock<Store<B>>,
     pub(super) masks: MaskCache,
 }
@@ -88,6 +150,24 @@ impl<B: Backend> Table<B> {
             return false;
         }
         let st = read(&self.store);
+        // When the table is only in device memory (unified GPUs), verify full
+        // chunks via cached SHA-256 digests so we avoid reading tens of MiB of
+        // uncached write-combining GPU memory on every MSM call; only a short
+        // tail (< DIGEST_CHUNK points) touches the device mapping.
+        if let Store::Device(b) = &*st {
+            let full = (bases.len() / DIGEST_CHUNK) * DIGEST_CHUNK;
+            if !chunk_digests_match(&bases[..full], &self.chunk_digests) {
+                return false;
+            }
+            if full == bases.len() {
+                return true;
+            }
+            return b
+                .host_read(|t: &[G1AffineLimbs]| {
+                    t.len() >= bases.len() && points_equal(&t[full..bases.len()], &bases[full..])
+                })
+                .unwrap_or(false);
+        }
         st.with_points(self.len, |t| {
             t.len() >= bases.len() && points_equal(&t[..bases.len()], bases)
         })
@@ -236,6 +316,7 @@ pub fn register_srs<B: Backend>(bases: &[G1AffineLimbs]) -> SrsHandle<B> {
         id,
         len: bases.len(),
         first_bad: first_not_in_g1(bases),
+        chunk_digests: chunk_digests_of(bases),
         store: RwLock::new(Store::Host(bases.to_vec())),
         masks: Mutex::new(HashMap::new()),
     });

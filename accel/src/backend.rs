@@ -100,6 +100,10 @@ pub trait Backend: Sized + Send + Sync + 'static {
     /// The prefix of the backend's environment variables (`{ENV_PREFIX}=off`,
     /// `{ENV_PREFIX}_MIN_K`, ...).
     const ENV_PREFIX: &'static str;
+    /// Whether the backend implements global length-binned MSM bucket
+    /// accumulation (`msm_bin_count` / `msm_bin_scan` / `msm_bin_scatter` +
+    /// 6-buffer `msm_accumulate`).
+    const MSM_LENGTH_BINS: bool = false;
     /// A device buffer.
     type Raw: RawBuffer;
     /// The encoder of one command buffer ([`Backend::run`]).
