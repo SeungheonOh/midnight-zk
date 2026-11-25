@@ -431,13 +431,26 @@ type Mem = vk::MemoryPropertyFlags;
 /// `(wanted, avoided)` memory flags, in order of preference.
 type Preferences = &'static [(Mem, Mem)];
 
-/// Device buffers of a unified device: mapped.
-const UNIFIED: Preferences = &[(
-    Mem::from_raw(
-        Mem::DEVICE_LOCAL.as_raw() | Mem::HOST_VISIBLE.as_raw() | Mem::HOST_COHERENT.as_raw(),
+/// Device buffers of a unified device: mapped, preferring host-cached coherent
+/// memory so CPU readbacks, copies, and SRS/key verification run at cached RAM
+/// speed without GPU penalty.
+const UNIFIED: Preferences = &[
+    (
+        Mem::from_raw(
+            Mem::DEVICE_LOCAL.as_raw()
+                | Mem::HOST_VISIBLE.as_raw()
+                | Mem::HOST_COHERENT.as_raw()
+                | Mem::HOST_CACHED.as_raw(),
+        ),
+        Mem::LAZILY_ALLOCATED,
     ),
-    Mem::LAZILY_ALLOCATED,
-)];
+    (
+        Mem::from_raw(
+            Mem::DEVICE_LOCAL.as_raw() | Mem::HOST_VISIBLE.as_raw() | Mem::HOST_COHERENT.as_raw(),
+        ),
+        Mem::LAZILY_ALLOCATED,
+    ),
+];
 /// Device buffers of a discrete device: device memory the host does not see
 /// first.
 const DEVICE_ONLY: Preferences = &[
@@ -635,7 +648,7 @@ impl Context {
             .unwrap_or(0);
         let host_mapped_device = memory.memory_types[..memory.memory_type_count as usize]
             .iter()
-            .any(|t| t.property_flags.contains(UNIFIED[0].0));
+            .any(|t| UNIFIED.iter().any(|(want, _)| t.property_flags.contains(*want)));
         let shares_memory = matches!(
             base.device_type,
             vk::PhysicalDeviceType::INTEGRATED_GPU | vk::PhysicalDeviceType::CPU
@@ -1162,6 +1175,27 @@ impl Context {
                     vk::PipelineStageFlags::TOP_OF_PIPE,
                     submit.query,
                     0,
+                );
+            }
+            // Make host writes to mapped unified (especially HOST_CACHED)
+            // buffers visible to device reads before the first command runs.
+            if self.info.unified_memory {
+                let from_host = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                    .dst_access_mask(
+                        vk::AccessFlags::SHADER_READ
+                            | vk::AccessFlags::SHADER_WRITE
+                            | vk::AccessFlags::TRANSFER_READ
+                            | vk::AccessFlags::TRANSFER_WRITE,
+                    )];
+                d.cmd_pipeline_barrier(
+                    submit.cmd,
+                    vk::PipelineStageFlags::HOST,
+                    vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &from_host,
+                    &[],
+                    &[],
                 );
             }
         }
