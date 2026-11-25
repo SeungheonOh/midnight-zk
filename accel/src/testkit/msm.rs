@@ -581,7 +581,7 @@ pub fn sparse_msm_declines_below_min_k<B: Backend>() {
     }
 
     let h = crate::register_srs::<B>(adapter::affine(bases));
-    for nz in [2, 1 << t.msm_table, need - 1] {
+    for nz in [2, (1 << t.msm_table).min(need - 1), need - 1] {
         assert!(declined(&sparse_scalars(n, nz, 5), bases), "table {nz}");
     }
     served(&sparse_scalars(n, need, 6), bases);

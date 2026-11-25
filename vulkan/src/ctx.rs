@@ -39,7 +39,10 @@
 //! `msm_ones`, the one MSM kernel with subgroup operations, runs in pinned
 //! subgroups of 32 where the device allows, else of the device's fixed
 //! width, reducing Metal's runs of 32 across narrower subgroups through
-//! shared memory.
+//! shared memory. On Qualcomm Adreno (`vendor_id == 0x5143`), `msm_ones`
+//! reduces entirely through shared memory (`ONES_LANES = 1`), and
+//! `msm_accumulate`, `msm_integrate`, and `msm_ones` are capped to 128-thread
+//! workgroups.
 //!
 //! On a unified device every buffer is mapped for the host, as on Metal. On a
 //! discrete one device buffers are device-local and unmapped: the shared

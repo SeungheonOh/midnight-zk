@@ -59,10 +59,15 @@
 //! 64-bit accumulators (`shaderInt64`, the default where the device has it)
 //! or 32-bit words only.
 //!
-//! On an integrated GPU device memory is host memory and every buffer is
-//! mapped, as on Metal. On a discrete GPU buffers are device-local: the host
-//! reaches them through staging buffers, and they are zeroed and read back on
-//! the GPU.
+//! On an integrated GPU (including mobile GPUs such as Qualcomm Adreno)
+//! device memory is host memory and every buffer is mapped, as on Metal. On a
+//! discrete GPU buffers are device-local: the host reaches them through
+//! staging buffers, and they are zeroed and read back on the GPU.
+//!
+//! On Qualcomm Adreno (`vendor_id == 0x5143`), `msm_accumulate`,
+//! `msm_integrate`, and `msm_ones` are capped to 128-thread workgroups,
+//! `msm_ones` reduces through shared memory (`ONES_LANES = 1`), and an
+//! Adreno-specific MSM tuning profile is selected automatically.
 //!
 //! # Requests
 //!
@@ -93,6 +98,9 @@
 //! - `MIDNIGHT_VULKAN_KEEP_KEYS=1`: see [`keep_resident`].
 //! - `MIDNIGHT_VULKAN_LOADER`: the Vulkan loader library to load instead of the
 //!   system's.
+//! - `MIDNIGHT_VULKAN_PIPELINE_CACHE`: optional file path to persist the
+//!   driver's `VkPipelineCache` across process restarts (avoids repeated cold
+//!   shader compilation, notably on mobile drivers such as Qualcomm Adreno).
 //! - `MIDNIGHT_VULKAN_ARITH=64|32`: the arithmetic variant ([`variant`]).
 //! - `MIDNIGHT_VULKAN_DEVICE`: the device, by its index in the Vulkan
 //!   enumeration order or by text its name contains (ASCII case ignored);
@@ -137,8 +145,9 @@ pub use midnight_accel::QuotientStages;
 pub use midnight_accel::quotient::abi as quotient_abi;
 
 /// Per-class break-evens against the stock CPU code on a unified-memory
-/// device: the Metal backend's. A discrete GPU has its own ([`thresholds`]).
-/// The one-shot MSM never breaks even because of its G1 check.
+/// desktop GPU: the Metal backend's. Discrete and Qualcomm Adreno GPUs select
+/// their own defaults ([`thresholds`]). The one-shot MSM never breaks even
+/// because of its G1 check.
 pub const DEFAULT_THRESHOLDS: Thresholds = tuning::TUNING.thresholds;
 
 // ---------------------------------------------------------------------------
