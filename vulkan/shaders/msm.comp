@@ -107,7 +107,8 @@ struct AccParams {
 struct IntParams {
     uint nwins;
     uint wbits;
-    uint nbits; // scalar bits: 255
+    uint nbits;  // scalar bits: 255
+    uint groups; // workgroups per window (a power of two)
 };
 
 // The largest top and low digit counts held in shared memory.
@@ -594,6 +595,10 @@ void main() {
 // of `2^(wbits - lsbits)` adjacent ones and the running sum takes only whole
 // buckets (`mask`). The workgroup size is a power of two below
 // `2^(wbits-1)`.
+//
+// With `groups` workgroups per window, workgroup g of a window takes the
+// g-th part of its row: its invocations are runs g * threads + tid of the
+// window, and it writes its records over the start of its own part.
 
 layout(push_constant) uniform Push {
     uvec2 buckets;
@@ -601,11 +606,12 @@ layout(push_constant) uniform Push {
 } pc;
 
 void main() {
-    const uint bid = group_index(), tid = gl_LocalInvocationID.x, tpg = gl_WorkGroupSize.x;
+    const uint gid = group_index(), tid = gl_LocalInvocationID.x, tpg = gl_WorkGroupSize.x;
     const IntParams p = pc.p;
-    const uint nthrbits = findLSB(tpg);
-    const uint row = bid << (p.wbits - 1u);
+    const uint bid = gid / p.groups;
+    const uint nthrbits = findLSB(tpg) + findLSB(p.groups);
     uint i = 1u << (p.wbits - 1u - nthrbits);
+    const uint row = (bid << (p.wbits - 1u)) + (gid % p.groups) * tpg * i;
     const uint run = row + tid * i;
 
     uint mask = 0u;

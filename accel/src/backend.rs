@@ -64,6 +64,9 @@ pub struct Tuning {
     pub msm_sort_groups: u32,
     /// Groups of `msm_ones`.
     pub msm_ones_groups: usize,
+    /// Workgroups of `msm_integrate` per window (a power of two; 1: one, as
+    /// in sppark).
+    pub msm_integrate_groups: u32,
     /// The most points one bucket of a chunk may hold (the digit-1 bucket of
     /// window 0 excepted). One GPU thread sums a bucket serially, so its
     /// length bounds the command buffer's time; `msm_chunk_adds` assumes

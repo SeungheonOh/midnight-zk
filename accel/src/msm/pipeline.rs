@@ -76,8 +76,11 @@ pub(super) struct Geometry {
     ones_groups: usize,
     /// [`crate::Tuning::msm_hot_bucket_limit`].
     hot_limit: u32,
-    /// `msm_integrate` threads per window (a power of two).
+    /// `msm_integrate` threads per workgroup (a power of two).
     nthr: usize,
+    /// `msm_integrate` workgroups per window (a power of two): `nthr *
+    /// int_groups` runs per window.
+    int_groups: usize,
 }
 
 impl Geometry {
@@ -97,6 +100,11 @@ impl Geometry {
         .try_fold(SORT_BLOCK, |a, m| m.map(|m| a.min(pow2_floor(m))))?;
         let ones_block = pow2_floor(max("msm_ones")?.min(ONES_BLOCK));
         let nthr = pow2_floor(max("msm_integrate")?.min(MSM_NTHREADS));
+        // more workgroups only while each run keeps at least two buckets
+        let mut int_groups = pow2_floor(B::tuning().msm_integrate_groups.max(1) as usize);
+        while int_groups > 1 && lg2(nthr * int_groups) >= pl.bits {
+            int_groups /= 2;
+        }
         if sort_block < 32 || ones_block < 32 || nthr < 2 || lg2(nthr) >= pl.bits {
             return Err(Error::Device(format!(
                 "msm: threadgroup sizes {sort_block}/{ones_block}/{nthr} too small"
@@ -114,6 +122,7 @@ impl Geometry {
             ones_groups: t.msm_ones_groups,
             hot_limit: t.msm_hot_bucket_limit,
             nthr,
+            int_groups,
         })
     }
 
@@ -193,7 +202,7 @@ struct ChunkParams {
     /// `AccParams`.
     acc: [u32; 4],
     /// `IntParams`.
-    int: [u32; 3],
+    int: [u32; 4],
 }
 
 fn chunk_params(pl: &Plan, g: &Geometry, mode: u32, h_off: usize, num: usize) -> ChunkParams {
@@ -224,7 +233,7 @@ fn chunk_params(pl: &Plan, g: &Geometry, mode: u32, h_off: usize, num: usize) ->
         ],
         sort,
         acc: [pl.nwins, pl.bits, pl.stride as u32, g.hot_limit],
-        int: [pl.nwins, pl.wbits, NBITS],
+        int: [pl.nwins, pl.wbits, NBITS, g.int_groups as u32],
     }
 }
 
@@ -361,7 +370,7 @@ fn enc_integrate<'a, B: Backend>(
 ) -> Result<(), Error> {
     cmd.dispatch_groups(
         "msm_integrate",
-        pl.nwins as usize,
+        pl.nwins as usize * g.int_groups,
         g.nthr,
         &[Arg::Buffer(b.buckets)],
         &p.int,
@@ -390,7 +399,7 @@ pub(super) fn run<B: Backend>(
     // when that thread could not be started)
     type Inputs = Mutex<Option<Partials>>;
     let inputs: Vec<Inputs> = (0..pl.batch).map(|_| Mutex::new(None)).collect();
-    let nthr = g.nthr;
+    let nthr = g.nthr * g.int_groups;
     let collect_inputs = |i: &Inputs| {
         let _scrub = ScrubOnExit;
         lock(i).take().and_then(|(rows, ones)| collect(rows, ones, pl, nthr))
@@ -474,16 +483,18 @@ fn run_chunk<B: Backend>(
 /// The partial sums of the chunk just run, copied into guards; `None` when a
 /// device buffer is shorter than the plan needs.
 fn copy_partials<B: Backend>(b: &Bufs<'_, B>, pl: &Plan, g: &Geometry) -> Option<Partials> {
-    let per_row = 2 * g.nthr;
+    // each workgroup writes its `2 * nthr` records at the start of its part
+    // of the row, in run order
+    let per_group = 2 * g.nthr;
     let row_len = 1usize << pl.bits;
-    let mut rows = SecretVec::with_capacity(pl.nwins as usize * per_row);
+    let part = row_len / g.int_groups;
+    let mut rows = SecretVec::with_capacity(pl.nwins as usize * per_group * g.int_groups);
     let mut ok = b
         .buckets
         .host_read(|bk: &[Xyzz]| {
-            (0..pl.nwins as usize).fold(true, |ok, y| {
-                ok & bk
-                    .get(y * row_len..y * row_len + per_row)
-                    .is_some_and(|r| rows.extend_within(r))
+            (0..pl.nwins as usize * g.int_groups).fold(true, |ok, r| {
+                let at = r * part;
+                ok & bk.get(at..at + per_group).is_some_and(|r| rows.extend_within(r))
             })
         })
         .ok()?;

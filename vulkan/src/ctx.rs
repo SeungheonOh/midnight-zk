@@ -540,6 +540,18 @@ pub fn set_ones_lanes(lanes: Option<u32>) -> bool {
     ok
 }
 
+/// Kernels that run faster in subgroups of 32 than in wider default ones
+/// (AMD's wave64): `msm_integrate`, whose long serial runs diverge.
+fn wave32_kernel(kernel: &str) -> bool {
+    kernel == "msm_integrate"
+}
+
+/// 32 where the device's default subgroups are wider and a pipeline may
+/// require 32.
+fn wave32(info: &device::VulkanInfo) -> Option<u32> {
+    (info.subgroup_size > 32 && info.takes_subgroup(32)).then_some(32)
+}
+
 /// What a kernel takes besides its buffer addresses and parameter block in
 /// the push-constant block.
 #[derive(Clone, Copy, Debug, Default)]
@@ -688,6 +700,9 @@ impl<'a> VulkanCommand<'a> {
             }
             subgroup = Some(width);
             spec[0] = lanes;
+        }
+        if subgroup.is_none() && wave32_kernel(kernel) && group.is_multiple_of(32) {
+            subgroup = wave32(info);
         }
         let options = PipelineOptions {
             workgroup: group as u32,

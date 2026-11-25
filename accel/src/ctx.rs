@@ -1879,6 +1879,7 @@ mod tests {
         msm_chunk_adds: 1 << 25,
         msm_sort_groups: 8,
         msm_ones_groups: 32,
+        msm_integrate_groups: 1,
         msm_hot_bucket_limit: 1 << 16,
         msm_sparse_div: 5,
         msm_sparse_fixed: 1 << 12,

@@ -66,6 +66,7 @@ pub(crate) const TUNING: Tuning = Tuning {
     msm_sort_groups: 8,
     // sppark: `sm_count` blocks
     msm_ones_groups: 32,
+    msm_integrate_groups: 1,
     // one invocation sums a bucket serially: this bound keeps that chain far
     // below the watchdog of AMD's graphics ring (10 s), also on integrated
     // GPUs, whose single-thread rate is a fraction of a discrete GPU's
@@ -126,6 +127,8 @@ pub(crate) const DISCRETE: Tuning = Tuning {
     },
     msm_windows: DISCRETE_MSM_WINDOWS,
     msm_shares: DISCRETE_MSM_SHARES,
+    // one workgroup per window leaves most compute units idle
+    msm_integrate_groups: 4,
     ..TUNING
 };
 
@@ -172,6 +175,9 @@ fn tmp_override(base: &'static Tuning) -> &'static Tuning {
     }
     if let Some(s) = get("VKT_SORTG") {
         t.msm_sort_groups = s.parse().unwrap();
+    }
+    if let Some(s) = get("VKT_INTG") {
+        t.msm_integrate_groups = s.parse().unwrap();
     }
     if let Some(s) = get("VKT_ONESG") {
         t.msm_ones_groups = s.parse().unwrap();

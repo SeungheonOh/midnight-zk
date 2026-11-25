@@ -68,6 +68,7 @@ pub(crate) const TUNING: Tuning = Tuning {
     msm_sort_groups: 8,
     // sppark: `sm_count` blocks
     msm_ones_groups: 32,
+    msm_integrate_groups: 1,
     msm_hot_bucket_limit: 1 << 16,
     // measured crossovers against the stock CPU MSM: `n/5` at large `n`, plus
     // a fixed part for the device's fixed cost near the threshold
