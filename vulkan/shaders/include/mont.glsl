@@ -112,34 +112,68 @@ MONT_T MONT_FN(_neg)(MONT_T a) {
     return d;
 }
 
-// a * b: CIOS, no-carry variant, 32-bit limbs.
-// For 12-limb Fp (`MONT_N > 8`), keep the outer loop rolled with register
-// rotation of `b` (no dynamic array indexing): this shrinks `fp_mul` 12x so
-// drivers that ignore SPIR-V `DontInline` (e.g. Qualcomm Adreno) compile
-// straight-line `g1_add`/`g1_madd` without hanging, while reducing instruction
-// footprint and speeding up MoltenVK as well.
-MONT_T MONT_FN(_mul)(MONT_T a, MONT_T b) {
+#if defined(MONT_FR_SPECIAL) && MONT_INT64
+#define MONT_CIOS_STEP(bi_val)                                                                     \
+    do {                                                                                           \
+        uint _bi = (bi_val);                                                                       \
+        uint A, C;                                                                                 \
+        uint t0 = mad_cc(a.l[0], _bi, t.l[0], 0u, A);                                              \
+        uint m = 0u - t0;                                                                          \
+        C = t0 != 0u ? 1u : 0u;                                                                    \
+        {                                                                                          \
+            uint x1 = mad_cc(a.l[1], _bi, t.l[1], A, A);                                           \
+            uint64_t y1 = (uint64_t(m) << 32) - uint64_t(m) + uint64_t(x1) + uint64_t(C);          \
+            t.l[0] = uint(y1);                                                                     \
+            C = uint(y1 >> 32);                                                                    \
+        }                                                                                          \
+        [[unroll]] for (int j = 2; j < MONT_N; j++) {                                              \
+            uint x = mad_cc(a.l[j], _bi, t.l[j], A, A);                                            \
+            t.l[j - 1] = mad_cc(m, MONT_P[j], x, C, C);                                            \
+        }                                                                                          \
+        t.l[MONT_N - 1] = C + A;                                                                   \
+    } while (false)
+#else
+#define MONT_CIOS_STEP(bi_val)                                                                     \
+    do {                                                                                           \
+        uint _bi = (bi_val);                                                                       \
+        uint A, C;                                                                                 \
+        uint t0 = mad_cc(a.l[0], _bi, t.l[0], 0u, A);                                              \
+        uint m = t0 * MONT_INV;                                                                    \
+        mad_cc(m, MONT_P[0], t0, 0u, C);                                                           \
+        [[unroll]] for (int j = 1; j < MONT_N; j++) {                                              \
+            uint x = mad_cc(a.l[j], _bi, t.l[j], A, A);                                            \
+            t.l[j - 1] = mad_cc(m, MONT_P[j], x, C, C);                                            \
+        }                                                                                          \
+        t.l[MONT_N - 1] = C + A;                                                                   \
+    } while (false)
+#endif
+
+// a * b (unreduced, < 2p for BLS12-381 Fp when a < 4p and b < 2p): CIOS,
+// no-carry variant, 32-bit limbs.
+// For 12-limb Fp (`MONT_N > 8`) or `MONT_ROLL_OUTER`, keep the outer loop
+// rolled 1x with register rotation of `b` (no dynamic array indexing): keeps
+// code size minimal so drivers that ignore SPIR-V `DontInline` (e.g. Qualcomm
+// Adreno) compile fast without register spilling or I-cache thrashing.
+MONT_T MONT_FN(_mul_lazy)(MONT_T a, MONT_T b) {
     MONT_T t = MONT_FN(_zero)();
-#if MONT_N > 8
+#if MONT_N > 8 || defined(MONT_ROLL_OUTER)
     [[dont_unroll]] for (int i = 0; i < MONT_N; i++) {
         uint bi = b.l[0];
         [[unroll]] for (int k = 0; k < MONT_N - 1; k++) b.l[k] = b.l[k + 1];
+        MONT_CIOS_STEP(bi);
+    }
 #else
     [[unroll]] for (int i = 0; i < MONT_N; i++) {
-        uint bi = b.l[i];
-#endif
-        uint A, C;
-        uint t0 = mad_cc(a.l[0], bi, t.l[0], 0u, A);
-        uint m = t0 * MONT_INV;
-        // the low word of m * p[0] + t0 is zero
-        mad_cc(m, MONT_P[0], t0, 0u, C);
-        [[unroll]] for (int j = 1; j < MONT_N; j++) {
-            uint x = mad_cc(a.l[j], bi, t.l[j], A, A);
-            t.l[j - 1] = mad_cc(m, MONT_P[j], x, C, C);
-        }
-        t.l[MONT_N - 1] = C + A;
+        MONT_CIOS_STEP(b.l[i]);
     }
-    return MONT_FN(_reduce_once)(t);
+#endif
+    return t;
+}
+
+#undef MONT_CIOS_STEP
+
+MONT_T MONT_FN(_mul)(MONT_T a, MONT_T b) {
+    return MONT_FN(_reduce_once)(MONT_FN(_mul_lazy)(a, b));
 }
 
 MONT_T MONT_FN(_sqr)(MONT_T a) {

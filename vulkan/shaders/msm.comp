@@ -189,7 +189,9 @@ uint booth_encode(uint wval, uint wmask, uint wbits) {
 // `scalars` is not read.
 void main() {
     const uint i = global_index();
-    if (i == 0u) U32_AT(pc.hot, 0u) = 0u;
+    if (i == 0u) {
+        for (uint k = 0u; k < 128u; k++) U32C_AT(pc.hot, k) = 0u;
+    }
     if (i >= pc.p.len) return;
 
     uint c;
@@ -202,10 +204,8 @@ void main() {
         if (pc.p.mode == MODE_MASKED) s = fr_add(s, mask_elem(mi));
     }
 
-    // out of Montgomery form (sppark `s.from()`): s * 1 * 2^-256
-    Fr raw_one = fr_zero();
-    raw_one.l[0] = 1u;
-    s = fr_mul(s, raw_one);
+    // out of Montgomery form (sppark `s.from()`): s * 2^-256
+    s = fr_from_mont(s);
 
     // sppark `abs()`: make the value "positive", keep the sign
     Fr t;
@@ -494,7 +494,10 @@ void main() {
         }
     }
 
-    if ((tid & 31u) == 0u) XYZZ_AT(pc.ones, tid / 32u) = acc;
+    if ((tid & 31u) == 0u) {
+        g1_reduce(acc);
+        XYZZ_AT(pc.ones, tid / 32u) = acc;
+    }
 }
 
 #elif defined(MSM_BUCKET_GUARD)
@@ -518,11 +521,121 @@ void main() {
     if (bucket_len(pc.hist, pc.p, t, idx) > pc.p.hot_limit) atomicExchange(U32_AT(pc.hot, 0u), 1u);
 }
 
+#elif defined(MSM_BIN_COUNT)
+
+// Global length-binning pass 1 (also replaces `msm_bucket_guard`):
+// - checks `len > hot_limit` and sets `hot[0] = 1`
+// - writes `g1_inf()` for empty buckets (`len == 0`) so `msm_accumulate` skips them
+// - counts non-empty buckets per exact length bin `1..62` and `63+` into `hot[1..=63]`.
+
+layout(push_constant) uniform Push {
+    uvec2 buckets;
+    uvec2 hist;
+    uvec2 hot;
+    AccParams p;
+} pc;
+
+shared uint sh_bin[64];
+
+void main() {
+    const uint t = global_index();
+    const uint lid = gl_LocalInvocationID.x;
+    const uint total = pc.p.nwins << pc.p.bits;
+    if (lid < 64u) sh_bin[lid] = 0u;
+    memoryBarrierShared();
+    barrier();
+    if (t < total) {
+        uint idx;
+        uint len = bucket_len(pc.hist, pc.p, t, idx);
+        if (len == 0u) {
+            XYZZ_AT(pc.buckets, t) = g1_inf();
+        } else {
+            if (len > pc.p.hot_limit) atomicExchange(U32C_AT(pc.hot, 0u), 1u);
+            atomicAdd(sh_bin[min(len, 63u)], 1u);
+        }
+    }
+    memoryBarrierShared();
+    barrier();
+    if (lid >= 1u && lid < 64u) {
+        uint c = sh_bin[lid];
+        if (c != 0u) atomicAdd(U32C_AT(pc.hot, lid), c);
+    }
+}
+
+#elif defined(MSM_BIN_SCAN)
+
+// Global length-binning pass 2: reads bin counts from `hot[1..=63]` and writes
+// exclusive prefix-sum offsets into disjoint `hot[65..=127]` in descending
+// length order (63 down to 1) so the longest buckets execute first; writes
+// total non-empty count to `hot[64]`. Writing to a disjoint range avoids
+// SPIRV-Cross / MoltenVK re-reading overwritten device addresses in-place.
+
+layout(push_constant) uniform Push {
+    uvec2 hot;
+} pc;
+
+void main() {
+    if (global_index() != 0u) return;
+    uint off = 0u;
+    for (uint b = 63u; b >= 1u; b--) {
+        uint c = U32C_AT(pc.hot, b);
+        U32C_AT(pc.hot, 64u + b) = off;
+        off += c;
+    }
+    U32C_AT(pc.hot, 64u) = off;
+}
+
+#elif defined(MSM_BIN_SCATTER)
+
+// Global length-binning pass 3: scatters every non-empty bucket index `t` into
+// `order` grouped by exact bucket length (descending), giving ~99.8% SIMT lane
+// utilization in `msm_accumulate`.
+
+layout(push_constant) uniform Push {
+    uvec2 order;
+    uvec2 hist;
+    uvec2 hot;
+    AccParams p;
+} pc;
+
+shared uint sh_bin[64];
+shared uint sh_off[64];
+
+void main() {
+    const uint t = global_index();
+    const uint lid = gl_LocalInvocationID.x;
+    const uint total = pc.p.nwins << pc.p.bits;
+    if (lid < 64u) sh_bin[lid] = 0u;
+    memoryBarrierShared();
+    barrier();
+    uint b = 0u;
+    uint local_pos = 0u;
+    if (t < total) {
+        uint idx;
+        uint len = bucket_len(pc.hist, pc.p, t, idx);
+        if (len != 0u) {
+            b = min(len, 63u);
+            local_pos = atomicAdd(sh_bin[b], 1u);
+        }
+    }
+    memoryBarrierShared();
+    barrier();
+    if (lid >= 1u && lid < 64u) {
+        uint c = sh_bin[lid];
+        sh_off[lid] = c != 0u ? atomicAdd(U32C_AT(pc.hot, 64u + lid), c) : 0u;
+    }
+    memoryBarrierShared();
+    barrier();
+    if (b != 0u) {
+        U32_AT(pc.order, sh_off[b] + local_pos) = t;
+    }
+}
+
 #elif defined(MSM_ACCUMULATE)
 
-// sppark `accumulate`: one invocation per bucket (window y, bucket x) sums
-// its sorted points with mixed additions into XYZZ. The bucket of digit 1 in
-// window 0 is left to `msm_ones`.
+// Globally length-binned `accumulate`: every wave processes non-empty buckets
+// of the exact same length (descending, longest first), eliminating Poisson
+// SIMT tail divergence, shared-memory sorting, barriers, and empty buckets.
 
 layout(push_constant) uniform Push {
     uvec2 buckets;
@@ -530,58 +643,34 @@ layout(push_constant) uniform Push {
     uvec2 digits;
     uvec2 hist;
     uvec2 hot;
+    uvec2 order;
     AccParams p;
 } pc;
 
-// Fixed upper bound (`ACC_GROUP` = 256): avoids two spec-constant-sized
-// workgroup arrays overlapping in Qualcomm Adreno's shared-memory layout
-// (see `scan` above), while keeping shared memory at 2 KiB for high occupancy.
-shared uint lens[256];
-shared uint slot[256];
-
 void main() {
-    const uint g = global_index(), tid = gl_LocalInvocationID.x, tpg = gl_WorkGroupSize.x;
+    const uint g = global_index();
     const AccParams p = pc.p;
     const uint total = p.nwins << p.bits;
-    // Keep both `barrier()` calls in top-level unconditional control flow:
-    // an early `return` before `barrier()` wraps the barriers in a selection
-    // merge after `spirv-opt --merge-return`, which hangs Adreno.
-    const bool is_hot = U32_AT(pc.hot, 0u) != 0u;
-    uint idx;
-    const uint mine = (!is_hot && g < total) ? bucket_len(pc.hist, p, g, idx) : 0u;
-    // the workgroup's buckets by load, longest first: each subgroup takes
-    // buckets of similar length (invocations past the end rank last)
-    lens[tid] = mine;
-    barrier();
-    uint rank = 0u;
-    for (uint j = 0u; j < tpg; j++) {
-        uint l = lens[j];
-        rank += (l > mine || (l == mine && j < tid)) ? 1u : 0u;
-    }
-    slot[rank] = tid;
-    barrier();
-    if (is_hot) {
+    if (U32C_AT(pc.hot, 0u) != 0u) {
         if (g < total) XYZZ_AT(pc.buckets, g) = g1_inf();
         return;
     }
-    const uint t = g - tid + slot[tid];
-    if (t >= total) return;
+    const uint non_empty = U32C_AT(pc.hot, 64u);
+    if (g >= non_empty) return;
+    const uint t = U32_AT(pc.order, g);
     const uint y = t >> p.bits;
+    uint idx;
     uint len = bucket_len(pc.hist, p, t, idx);
 
-    G1Xyzz bucket;
-    if (len != 0u) {
-        uint digs = y * p.stride + idx;
-        uint digit = U32_AT(pc.digits, digs++);
-        bucket = g1_from_affine(AFFINE_AT(pc.points, digit & 0x7fffffffu));
-        g1_cneg(bucket, (digit >> 31) != 0u);
-        while (--len != 0u) {
-            digit = U32_AT(pc.digits, digs++);
-            g1_madd(bucket, AFFINE_AT(pc.points, digit & 0x7fffffffu), (digit >> 31) != 0u);
-        }
-    } else {
-        bucket = g1_inf();
+    uint digs = y * p.stride + idx;
+    uint digit = U32_AT(pc.digits, digs++);
+    G1Xyzz bucket = g1_from_affine(AFFINE_AT(pc.points, digit & 0x7fffffffu));
+    g1_cneg(bucket, (digit >> 31) != 0u);
+    while (--len != 0u) {
+        digit = U32_AT(pc.digits, digs++);
+        g1_madd(bucket, AFFINE_AT(pc.points, digit & 0x7fffffffu), (digit >> 31) != 0u);
     }
+    g1_reduce(bucket);
     XYZZ_AT(pc.buckets, t) = bucket;
 }
 
@@ -647,6 +736,8 @@ void main() {
     memoryBarrierBuffer();
     barrier();
 
+    g1_reduce(q);
+    g1_reduce(acc);
     XYZZ_AT(pc.buckets, row + 2u * tid) = q;
     XYZZ_AT(pc.buckets, row + 2u * tid + 1u) = acc;
 }

@@ -535,7 +535,15 @@ impl<'a> Encoder<'a, Vulkan> for VulkanCommand<'a> {
         args: &[Arg<'a>],
         params: &[u8],
     ) -> Result<(), Error> {
-        let group = DISPATCH_GROUP.min(max_group(self.vk.dev.info()));
+        // `quotient_numerator` keeps its hot program scratch slots in a fixed
+        // 64-thread workgroup shared-memory tile (16 KiB) for zero-DRAM-traffic
+        // intermediates and full-wave occupancy on Adreno & Apple GPUs.
+        let cap = if kernel == "quotient_numerator" {
+            64
+        } else {
+            DISPATCH_GROUP
+        };
+        let group = cap.min(max_group(self.vk.dev.info()));
         self.encode(
             kernel,
             Grid::Threads(threads as u64),
@@ -613,6 +621,7 @@ static HOST: HostState<Vulkan> = HostState::new();
 impl Backend for Vulkan {
     const NAME: &'static str = "vulkan";
     const ENV_PREFIX: &'static str = "MIDNIGHT_VULKAN";
+    const MSM_LENGTH_BINS: bool = true;
     type Raw = VulkanBuffer;
     type Cmd<'a> = VulkanCommand<'a>;
     /// The constants of the device's class ([`crate::tuning::for_device`]),
@@ -693,10 +702,9 @@ impl Backend for Vulkan {
         }
         let info = self.dev.info();
         let mut limit = max_group(info);
-        // Qualcomm Adreno (vendor 0x5143): high-register G1 kernels with
-        // barriers deadlock at 256 invocations (4 waves of 64) due to
-        // register-file residency limits; 128 invocations (2 waves) runs
-        // cleanly.
+        // Qualcomm Adreno (vendor 0x5143): high-register G1 kernels cap at
+        // 128 invocations (2 waves of 64) for optimal occupancy and to avoid
+        // register-file residency deadlocks at 256 invocations on barriered kernels.
         if info.vendor_id == 0x5143
             && matches!(kernel, "msm_accumulate" | "msm_integrate" | "msm_ones")
         {

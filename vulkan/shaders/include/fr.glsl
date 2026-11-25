@@ -48,12 +48,43 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer FrRef {
 #define MONT_P FR_P
 #define MONT_ONE FR_ONE
 #define MONT_PREFIX fr
+#define MONT_FR_SPECIAL
 #include "mont.glsl"
+#undef MONT_FR_SPECIAL
 #undef MONT_T
 #undef MONT_N
 #undef MONT_INV
 #undef MONT_P
 #undef MONT_ONE
 #undef MONT_PREFIX
+
+// Convert out of Montgomery form (`a * 2^-256 mod r`) without the 64
+// multiply-by-zero products of `fr_mul(a, 1)`.
+Fr fr_from_mont(Fr t) {
+    [[unroll]] for (int i = 0; i < 8; i++) {
+        uint t0 = t.l[0];
+        uint C;
+#if MONT_INT64
+        uint m = 0u - t0;
+        C = t0 != 0u ? 1u : 0u;
+        {
+            uint64_t y1 = (uint64_t(m) << 32) - uint64_t(m) + uint64_t(t.l[1]) + uint64_t(C);
+            t.l[0] = uint(y1);
+            C = uint(y1 >> 32);
+        }
+        [[unroll]] for (int j = 2; j < 8; j++) {
+            t.l[j - 1] = mad_cc(m, FR_P[j], t.l[j], C, C);
+        }
+#else
+        uint m = t0 * 0xffffffffu;
+        mad_cc(m, FR_P[0], t0, 0u, C);
+        [[unroll]] for (int j = 1; j < 8; j++) {
+            t.l[j - 1] = mad_cc(m, FR_P[j], t.l[j], C, C);
+        }
+#endif
+        t.l[7] = C;
+    }
+    return fr_reduce_once(t);
+}
 
 #endif // MIDNIGHT_VULKAN_FR_GLSL

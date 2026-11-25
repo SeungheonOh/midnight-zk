@@ -83,32 +83,35 @@ pub(crate) const TUNING: Tuning = Tuning {
 };
 
 /// `(log2 n, wbits, chunks)` of the MSM on Qualcomm Adreno GPUs.
+/// Avoids `wbits = 14` (19 windows, 2x buckets of `wbits = 13`'s 20 windows)
+/// and `wbits = 16` below `2^21` (16 windows, 2x buckets of `wbits = 15`'s
+/// exact `255 / 15 = 17` windows) to minimize `g1_madd + 2 * g1_add` work and
+/// bucket DRAM footprint.
 const ADRENO_MSM_WINDOWS: &[(u32, u32, usize)] = &[
     (13, 11, 1),
     (14, 11, 1),
     (15, 12, 1),
     (16, 13, 1),
     (17, 13, 1),
-    (18, 14, 1),
+    (18, 15, 1),
     (19, 15, 1),
     (20, 15, 1),
     (21, 16, 1),
     (22, 16, 1),
 ];
 
-/// The device share of the MSM on Qualcomm Adreno GPUs (in 64ths): at k=15..18
-/// mobile CPU cores keep pace with Adreno (~44-56% GPU), while at k>=19
-/// prolonged CPU load heats the CPU cores faster than the GPU so a higher GPU
-/// share (44-50/64) prevents the GPU from stalling on CPU.
+/// The device share of the MSM on Qualcomm Adreno GPUs (in 64ths): balanced
+/// so GPU (with length-binned lazy-Fp accumulation) and 8-core Oryon CPU
+/// shares finish together without overloading GPU thermals at k >= 18.
 const ADRENO_MSM_SHARES: &[(u32, usize, usize)] = &[
-    (13, 28, 28),
-    (14, 28, 28),
-    (15, 32, 32),
+    (13, 30, 30),
+    (14, 30, 30),
+    (15, 34, 34),
     (16, 36, 36),
-    (17, 36, 36),
-    (18, 36, 36),
+    (17, 40, 40),
+    (18, 42, 42),
     (19, 44, 44),
-    (20, 50, 50),
+    (20, 46, 46),
     (21, 50, 50),
     (22, 50, 50),
 ];
@@ -127,8 +130,10 @@ pub(crate) const ADRENO: Tuning = Tuning {
     },
     msm_windows: ADRENO_MSM_WINDOWS,
     msm_shares: ADRENO_MSM_SHARES,
-    // 4 workgroups per window keeps Adreno's shader processors busy in integrate
-    msm_integrate_groups: 4,
+    // 1 workgroup per window (128 threads * 17-22 windows = 34-44 waves)
+    // saturates Adreno's shader processors while cutting CPU `collect()` work
+    // and partial-sum readback by 4x compared to 4 groups.
+    msm_integrate_groups: 1,
     ..TUNING
 };
 

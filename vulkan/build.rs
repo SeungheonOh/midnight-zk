@@ -58,7 +58,7 @@ const MAX_WORKERS: usize = 4;
 const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Functions kept out of line in every kernel that defines them, by GLSL name.
-const OUT_OF_LINE: &[&str] = &["fr_mul", "fp_mul"];
+const OUT_OF_LINE: &[&str] = &["fr_mul", "fr_mul_lazy", "fp_mul", "fp_mul_lazy"];
 
 /// The `spirv-opt` passes: those of `-O` (SPIRV-Tools v2026) without
 /// `loop-unroll` and the passes that only clean up after it.
@@ -120,6 +120,9 @@ const KERNELS: &[Kernel] = &[
     kernel("msm_sort_lower", "msm.comp", &["MSM_SORT_LOWER"], &[]),
     kernel("msm_ones", "msm.comp", &["MSM_ONES"], &["g1_mul"]),
     kernel("msm_bucket_guard", "msm.comp", &["MSM_BUCKET_GUARD"], &[]),
+    kernel("msm_bin_count", "msm.comp", &["MSM_BIN_COUNT"], &[]),
+    kernel("msm_bin_scan", "msm.comp", &["MSM_BIN_SCAN"], &[]),
+    kernel("msm_bin_scatter", "msm.comp", &["MSM_BIN_SCATTER"], &[]),
     kernel(
         "msm_accumulate",
         "msm.comp",

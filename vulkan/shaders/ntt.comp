@@ -152,24 +152,61 @@ void main() {
     }
     barrier();
 
-    // radix-2 decimation in frequency over each column's R elements
-    const uint half_e = e >> 1;
-    for (uint s = d; s >= 1u; s--) {
-        const uint h = 1u << (s - 1u);
+    // Radix-4 decimation in frequency over each column's R elements (fuses
+    // pairs of radix-2 stages in registers, cutting shared-memory traffic and
+    // workgroup barriers in half), with a trailing radix-2 stage when d is odd.
+    const uint quarter_e = e >> 2;
+    const Fr omega4 = FR_AT(p.hi, 1u << (hb - 2u));
+    uint s = d;
+    while (s >= 2u) {
+        const uint q = 1u << (s - 2u);
         const uint tw_shift = hb - s;
+        for (uint b = lid; b < quarter_e; b += tpg) {
+            const uint g = b & gmask;
+            const uint bb = b >> lg;
+            const uint jj = bb & (q - 1u);
+            const uint i0 = ((bb - jj) << 2) + jj;
+            const uint a0 = (i0 << lg) | g;
+            const uint a1 = ((i0 + q) << lg) | g;
+            const uint a2 = ((i0 + 2u * q) << lg) | g;
+            const uint a3 = ((i0 + 3u * q) << lg) | g;
+            const Fr x0 = sh_load(e, a0);
+            const Fr x1 = sh_load(e, a1);
+            const Fr x2 = sh_load(e, a2);
+            const Fr x3 = sh_load(e, a3);
+            const Fr t0 = fr_add(x0, x2);
+            const Fr t1 = fr_add(x1, x3);
+            const Fr t2 = fr_sub(x0, x2);
+            const Fr t3 = fr_mul(fr_sub(x1, x3), omega4);
+            Fr y0 = fr_add(t0, t1);
+            Fr y1 = fr_sub(t0, t1);
+            Fr y2 = fr_add(t2, t3);
+            Fr y3 = fr_sub(t2, t3);
+            if (jj != 0u) {
+                y1 = fr_mul(y1, FR_AT(p.hi, (2u * jj) << tw_shift));
+                y2 = fr_mul(y2, FR_AT(p.hi, jj << tw_shift));
+                y3 = fr_mul(y3, FR_AT(p.hi, (3u * jj) << tw_shift));
+            }
+            sh_store(e, a0, y0);
+            sh_store(e, a1, y1);
+            sh_store(e, a2, y2);
+            sh_store(e, a3, y3);
+        }
+        barrier();
+        s -= 2u;
+    }
+    if (s == 1u) {
+        const uint half_e = e >> 1;
         for (uint b = lid; b < half_e; b += tpg) {
             const uint g = b & gmask;
             const uint bb = b >> lg;
-            const uint jj = bb & (h - 1u);
-            const uint i0 = ((bb - jj) << 1) + jj;
+            const uint i0 = bb << 1;
             const uint a0 = (i0 << lg) | g;
-            const uint a1 = ((i0 + h) << lg) | g;
+            const uint a1 = ((i0 + 1u) << lg) | g;
             const Fr u0 = sh_load(e, a0);
             const Fr u1 = sh_load(e, a1);
-            Fr dif = fr_sub(u0, u1);
-            if (jj != 0u) dif = fr_mul(dif, FR_AT(p.hi, jj << tw_shift));
             sh_store(e, a0, fr_add(u0, u1));
-            sh_store(e, a1, dif);
+            sh_store(e, a1, fr_sub(u0, u1));
         }
         barrier();
     }

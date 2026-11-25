@@ -35,6 +35,10 @@
 
 #extension GL_GOOGLE_include_directive : require
 
+// Roll the outer loop of `fr_mul` (1x rolled, 8 iterations) so drivers that
+// ignore SPIR-V `DontInline` (e.g. Qualcomm Adreno) don't blow up I-cache or
+// register allocation across the ~27 `fr_mul` call sites in this kernel.
+#define MONT_ROLL_OUTER
 #include "fr.glsl"
 #include "quotient.glsl"
 
@@ -55,8 +59,13 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Pa
 
 #define P ParamsRef(pc.params).v
 
-// The last word of the tables (set first in `main`).
+// The last word of the tables and cached hot params (set once in `main` to
+// avoid repeated global reads through `pc.params` inside inner loops).
 uint g_last_word;
+uint g_ext_k;
+uint g_log_scale;
+uint g_mask;
+uint g_threads;
 
 // Word i of the tables. The host checks every offset and operand, so a
 // running invocation stays inside them; the clamp covers the loads lavapipe
@@ -67,14 +76,27 @@ uint W(uint i) {
 
 // This invocation and its current row.
 uint g_tid;
+uint g_lid;
 uint g_idx;
+
+// On-chip shared-memory cache for the lowest `LOCAL_SLOTS` program scratch
+// slots per invocation. The host allocates slots lowest-index-first via
+// interval coloring, so virtually all program intermediates stay in fast
+// on-chip SRAM instead of bouncing through global DRAM.
+// Fixed compile-time bounds (64 threads * 8 slots * 8 limbs = 16 KiB) fit the
+// Vulkan 1.3 shared-memory minimum and avoid Adreno's OpSpecConstantOp bug.
+// Limb-major / thread-major layout (`(slot * 8 + limb) * 64 + lid`) gives
+// bank-conflict-free access across a 64-lane wave.
+const uint Q_WG = 64u;
+const uint LOCAL_SLOTS = 8u;
+shared uint sh_slot[LOCAL_SLOTS * 8u * Q_WG];
 
 // The value of `handle` at `row`: element `(index << ext_k) + row` of its
 // bank, a 64-bit offset.
 Fr column(uint handle, uint row) {
     const uint bank = handle >> HANDLE_SHIFT;
     const uint index = handle & HANDLE_MASK;
-    const uint ext_k = P.ext_k;
+    const uint ext_k = g_ext_k;
     uvec2 off = ext_k == 0u ? uvec2(index, 0u) : uvec2(index << ext_k, index >> (32u - ext_k));
     off = add64(off, uvec2(row, 0u));
     const uvec2 base = bank == BANK_PROOF ? pc.proof : (bank == BANK_KEY_RES ? pc.key_res : pc.key_tmp);
@@ -86,14 +108,34 @@ Fr column(uint handle, uint row) {
 // multiple of 2^ext_k, so the mask gives the reference's
 // `wrapping_add & (n - 1)`.
 uint rotate(uint idx, int rot) {
-    return (idx + (uint(rot) << P.log_scale)) & P.mask;
+    return (idx + (uint(rot) << g_log_scale)) & g_mask;
 }
 
-// The address of scratch slot `i` of this invocation.
+// The address of scratch slot `i` of this invocation (fallback for slots
+// beyond `LOCAL_SLOTS`).
 uvec2 scratch_at(uint i) {
     uvec2 e;
-    umulExtended(i, P.threads, e.y, e.x);
+    umulExtended(i, g_threads, e.y, e.x);
     return addr_at64(pc.scratch, add64(e, uvec2(g_tid, 0u)), 32u);
+}
+
+Fr load_slot(uint i) {
+    if (i < LOCAL_SLOTS && g_lid < Q_WG) {
+        Fr r;
+        const uint base = i * (8u * Q_WG) + g_lid;
+        [[unroll]] for (uint c = 0u; c < 8u; c++) r.l[c] = sh_slot[base + c * Q_WG];
+        return r;
+    }
+    return FrRef(scratch_at(i)).v;
+}
+
+void store_slot(uint i, Fr v) {
+    if (i < LOCAL_SLOTS && g_lid < Q_WG) {
+        const uint base = i * (8u * Q_WG) + g_lid;
+        [[unroll]] for (uint c = 0u; c < 8u; c++) sh_slot[base + c * Q_WG] = v.l[c];
+    } else {
+        FrRef(scratch_at(i)).v = v;
+    }
 }
 
 Fr operand(uint reads, uint unis, uint o) {
@@ -107,13 +149,14 @@ Fr operand(uint reads, uint unis, uint o) {
         return column(h, rotate(g_idx, rot));
     }
     default:
-        return FrRef(scratch_at(i)).v;
+        return load_slot(i);
     }
 }
 
-// Runs the program at word offset `pd` for the current row; writes its first
-// noutputs (at most 4) outputs.
-void program(uint pd, inout Fr outv[4]) {
+// Runs the program at word offset `pd` for the current row; writes up to 4
+// outputs into scalar registers (avoiding dynamically-indexed `Fr o[4]` local
+// arrays that force private-memory spilling on Adreno).
+void program(uint pd, out Fr o0, out Fr o1, out Fr o2, out Fr o3) {
     const uint ops = W(pd + PROG_OPS);
     const uint nops = W(pd + PROG_NOPS);
     const uint reads = W(pd + PROG_READS);
@@ -140,9 +183,12 @@ void program(uint pd, inout Fr outv[4]) {
             default: v = fr_neg(a); break;
             }
         }
-        FrRef(scratch_at(dst)).v = v;
+        store_slot(dst, v);
     }
-    for (uint k = 0u; k < nouts && k < 4u; k++) outv[k] = operand(reads, unis, W(outs + k));
+    o0 = nouts > 0u ? operand(reads, unis, W(outs)) : fr_zero();
+    o1 = nouts > 1u ? operand(reads, unis, W(outs + 1u)) : fr_zero();
+    o2 = nouts > 2u ? operand(reads, unis, W(outs + 2u)) : fr_zero();
+    o3 = nouts > 3u ? operand(reads, unis, W(outs + 3u)) : fr_zero();
 }
 
 Fr pow_u32(Fr b, uint e) {
@@ -157,36 +203,44 @@ Fr pow_u32(Fr b, uint e) {
 
 void main() {
     g_last_word = P.nwords - 1u;
+    g_ext_k = P.ext_k;
+    g_log_scale = P.log_scale;
+    g_mask = P.mask;
+    g_threads = P.threads;
     g_tid = global_index();
-    const uint threads = P.threads;
+    g_lid = gl_LocalInvocationID.x;
+    const uint threads = g_threads;
     if (g_tid >= threads) return;
     const Fr one = fr_one();
     const Fr y = P.y;
-    Fr o[4];
+    const uint nsets = P.perm_nsets;
+    const uint perm_ncolumns = P.perm_ncolumns;
+    const uint perm_chunk_len = P.perm_chunk_len;
+    const int perm_last_rotation = P.perm_last_rotation;
 
     const uint first = P.row0 + g_tid;
     const uint row_end = P.row_end;
     // omega^idx for the permutation's delta powers: one exponentiation per
     // invocation, then one multiplication by omega^threads per row
     Fr omega_i = fr_one();
-    if (P.perm_nsets != 0u && first < row_end) omega_i = pow_u32(P.omega, first);
+    if (nsets != 0u && first < row_end) omega_i = pow_u32(P.omega, first);
 
     for (uint idx = first; idx < row_end; idx += threads) {
         g_idx = idx;
-        program(P.gates, o);
-        Fr value = o[0];
+        Fr o0, o1, o2, o3;
+        program(P.gates, o0, o1, o2, o3);
+        Fr value = o0;
         const Fr l0 = column(P.l0, idx);
         const Fr l_last = column(P.l_last, idx);
         const Fr l_active = column(P.l_active, idx);
         const uint r_next = rotate(idx, 1);
 
-        // Permutation.
-        const uint nsets = P.perm_nsets;
+        // Permutation (fused left/right loops: each permuted column read once).
         if (nsets != 0u) {
-            const uint zs = P.perm;                // handles of the accumulators
-            const uint cols = zs + nsets;          // handles of the permuted columns
-            const uint sig = cols + P.perm_ncolumns; // handles of the sigma cosets
-            const uint r_last = rotate(idx, P.perm_last_rotation);
+            const uint zs = P.perm;                 // handles of the accumulators
+            const uint cols = zs + nsets;           // handles of the permuted columns
+            const uint sig = cols + perm_ncolumns;  // handles of the sigma cosets
+            const uint r_last = rotate(idx, perm_last_rotation);
             const Fr z_first = column(W(zs), idx);
             const Fr z_last = column(W(zs + nsets - 1u), idx);
             value = fr_add(fr_mul(value, y), fr_mul(fr_sub(one, z_first), l0));
@@ -197,21 +251,21 @@ void main() {
                 value = fr_add(fr_mul(value, y), fr_mul(fr_sub(cur, prev), l0));
             }
             Fr current_delta = fr_mul(P.delta_start, omega_i);
+            const Fr beta = P.beta;
+            const Fr gamma = P.gamma;
+            const Fr delta = P.delta;
             for (uint s = 0u; s < nsets; s++) {
                 const uint z = W(zs + s);
-                const uint c0 = s * P.perm_chunk_len;
-                const uint c1 = min(c0 + P.perm_chunk_len, P.perm_ncolumns);
+                const uint c0 = s * perm_chunk_len;
+                const uint c1 = min(c0 + perm_chunk_len, perm_ncolumns);
                 Fr left = column(z, r_next);
-                for (uint k = c0; k < c1; k++) {
-                    const Fr x = column(W(cols + k), idx);
-                    const Fr sg = column(W(sig + k), idx);
-                    left = fr_mul(left, fr_add(fr_add(x, fr_mul(P.beta, sg)), P.gamma));
-                }
                 Fr right = column(z, idx);
                 for (uint k = c0; k < c1; k++) {
-                    const Fr x = column(W(cols + k), idx);
-                    right = fr_mul(right, fr_add(fr_add(x, current_delta), P.gamma));
-                    current_delta = fr_mul(current_delta, P.delta);
+                    const Fr x_gamma = fr_add(column(W(cols + k), idx), gamma);
+                    const Fr sg = column(W(sig + k), idx);
+                    left = fr_mul(left, fr_add(x_gamma, fr_mul(beta, sg)));
+                    right = fr_mul(right, fr_add(x_gamma, current_delta));
+                    current_delta = fr_mul(current_delta, delta);
                 }
                 value = fr_add(fr_mul(value, y), fr_mul(fr_sub(left, right), l_active));
             }
@@ -230,13 +284,13 @@ void main() {
             Fr sum_helpers = fr_zero(), table = fr_zero(), selector = fr_zero();
             for (uint fi = 0u; fi < nchunks; fi++) {
                 const uint ch = chunks + CHUNK_WORDS * fi;
-                program(W(ch + CHUNK_PROGRAM), o);
+                program(W(ch + CHUNK_PROGRAM), o0, o1, o2, o3);
                 if (fi == 0u) {
-                    table = o[2];
-                    selector = o[3];
+                    table = o2;
+                    selector = o3;
                 }
                 const Fr h = column(W(ch + CHUNK_HELPER), idx);
-                value = fr_sub(fr_add(fr_mul(value, y), fr_mul(h, o[1])), o[0]);
+                value = fr_sub(fr_add(fr_mul(value, y), fr_mul(h, o1)), o0);
                 sum_helpers = fr_add(sum_helpers, h);
             }
             const Fr agg_next = column(agg, r_next);
@@ -249,10 +303,10 @@ void main() {
         // Trash arguments.
         for (uint ti = 0u; ti < P.ntrash; ti++) {
             const uint T = P.trash + TRASH_WORDS * ti;
-            program(W(T + TRASH_PROGRAM), o);
+            program(W(T + TRASH_PROGRAM), o0, o1, o2, o3);
             const Fr q = column(W(T + TRASH_SELECTOR), idx);
             const Fr t = column(W(T + TRASH_POLY), idx);
-            value = fr_add(fr_mul(value, y), fr_sub(o[0], fr_mul(fr_sub(one, q), t)));
+            value = fr_add(fr_mul(value, y), fr_sub(o0, fr_mul(fr_sub(one, q), t)));
         }
 
         FR_AT(pc.nu, idx) = value;
