@@ -134,10 +134,10 @@ pub(crate) struct Table<B: Backend> {
     /// The first index whose point is not in G1, or `len`. An MSM on a longer
     /// prefix declines.
     pub(super) first_bad: usize,
-    /// SHA-256 digests of each full [`DIGEST_CHUNK`]-point block, so unified
-    /// backends verify `bases` from cached host RAM without reading uncached
-    /// device memory.
-    chunk_digests: Vec<[u8; 32]>,
+    /// SHA-256 digests of each full [`DIGEST_CHUNK`]-point block, populated
+    /// lazily only if uploaded to an uncached unified device mapping so we
+    /// avoid reading tens of MiB of uncached GPU memory on every MSM call.
+    chunk_digests: OnceLock<Vec<[u8; 32]>>,
     pub(super) store: RwLock<Store<B>>,
     pub(super) masks: MaskCache,
 }
@@ -150,13 +150,17 @@ impl<B: Backend> Table<B> {
             return false;
         }
         let st = read(&self.store);
-        // When the table is only in device memory (unified GPUs), verify full
-        // chunks via cached SHA-256 digests so we avoid reading tens of MiB of
-        // uncached write-combining GPU memory on every MSM call; only a short
-        // tail (< DIGEST_CHUNK points) touches the device mapping.
-        if let Store::Device(b) = &*st {
+        // When the table lives only in an *uncached* unified device mapping,
+        // verify full chunks via cached SHA-256 digests instead of reading
+        // uncached GPU memory; on CPU-cached unified memory (`HOST_CACHED`),
+        // direct parallel `points_equal` (`memcmp`) is faster.
+        if let Store::Device(b) = &*st
+            && !b.host_cached()
+            && let Some(digests) = self.chunk_digests.get()
+            && !digests.is_empty()
+        {
             let full = (bases.len() / DIGEST_CHUNK) * DIGEST_CHUNK;
-            if !chunk_digests_match(&bases[..full], &self.chunk_digests) {
+            if !chunk_digests_match(&bases[..full], digests) {
                 return false;
             }
             if full == bases.len() {
@@ -181,6 +185,9 @@ impl<B: Backend> Table<B> {
             let mut w = write(&self.store);
             if let Store::Host(h) = &mut *w {
                 let b = ctx.upload(h)?;
+                if ctx.unified() && !b.host_cached() {
+                    let _ = self.chunk_digests.set(chunk_digests_of(h));
+                }
                 let host = std::mem::take(h);
                 *w = if ctx.unified() {
                     Store::Device(b)
@@ -316,7 +323,7 @@ pub fn register_srs<B: Backend>(bases: &[G1AffineLimbs]) -> SrsHandle<B> {
         id,
         len: bases.len(),
         first_bad: first_not_in_g1(bases),
-        chunk_digests: chunk_digests_of(bases),
+        chunk_digests: OnceLock::new(),
         store: RwLock::new(Store::Host(bases.to_vec())),
         masks: Mutex::new(HashMap::new()),
     });

@@ -115,31 +115,32 @@ pub fn bytes_of<T: Pod>(v: &T) -> &[u8] {
 /// Copies `src` into `dst`, on several threads when long. Never panics: a
 /// part whose thread cannot be made is copied here.
 pub fn par_copy(dst: &mut [crate::Scalar], src: &[crate::Scalar]) {
+    assert_eq!(dst.len(), src.len());
     const PART: usize = 1 << 15;
     if src.len() <= 2 * PART {
         dst.copy_from_slice(src);
         return;
     }
-    let threads = std::thread::available_parallelism().map_or(4, |t| t.get()).min(8);
-    let per = src.len().div_ceil(threads).max(PART);
-    std::thread::scope(|s| {
-        for (d, c) in dst.chunks_mut(per).zip(src.chunks(per)) {
-            // the part stays reachable from here if the thread is not made
-            // (a failed `spawn_scoped` drops its closure)
-            let part = Arc::new(Mutex::new(Some((d, c))));
-            let theirs = Arc::clone(&part);
-            let spawned = std::thread::Builder::new().spawn_scoped(s, move || {
-                if let Some((d, c)) = theirs.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                    d.copy_from_slice(c);
-                }
-            });
-            if spawned.is_err()
-                && let Some((d, c)) = part.lock().unwrap_or_else(|e| e.into_inner()).take()
-            {
-                d.copy_from_slice(c);
+    let base = dst.as_mut_ptr() as usize;
+    let copied = crate::msm::par::par_parts(
+        src.len(),
+        crate::msm::par::host_threads().min(8),
+        PART,
+        |lo, hi| {
+            // SAFETY: `dst` and `src` have the same length (`dst.copy_from_slice`
+            // contract) and `[lo, hi)` partitions are disjoint and in-bounds.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src[lo..hi].as_ptr(),
+                    (base as *mut crate::Scalar).add(lo),
+                    hi - lo,
+                );
             }
-        }
-    });
+        },
+    );
+    if copied.is_none() {
+        dst.copy_from_slice(src);
+    }
 }
 
 /// The backend's device with the shared buffer management on top.
@@ -754,6 +755,11 @@ impl<B: Backend> Buffer<B> {
         let t = Instant::now();
         out.copy_from_slice(from);
         account::add_host_since::<B>(HostPhase::Copy, t);
+    }
+
+    /// Whether the buffer's host mapping is CPU-cached (fast for direct reads).
+    pub fn host_cached(&self) -> bool {
+        self.raw.host_cached()
     }
 
     /// `f` over the whole allocation's bytes, which may exceed

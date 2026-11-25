@@ -169,6 +169,11 @@ pub trait RawBuffer: Send + Sync + 'static {
     /// The host address of the contents, when the host can read and write
     /// them in place.
     fn host_ptr(&self) -> Option<NonNull<u8>>;
+    /// Whether the host mapping (if any) is CPU-cached (fast for direct reads
+    /// such as `memcmp` without avoiding read-back).
+    fn host_cached(&self) -> bool {
+        true
+    }
     /// Zeroes the whole allocation. The caller has exclusive use of the
     /// buffer (no host reference, no GPU work). Never panics.
     fn zero_all(&self) -> Result<(), Error> {

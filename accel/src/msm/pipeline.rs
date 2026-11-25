@@ -464,6 +464,13 @@ pub(super) fn run<B: Backend>(
     type Inputs = Mutex<Option<Partials>>;
     let inputs: Vec<Inputs> = (0..pl.batch).map(|_| Mutex::new(None)).collect();
     let nthr = g.nthr * g.int_groups;
+    if pl.batch == 1 {
+        let (ns, (rows, ones)) = run_chunk(c, b, pl, g, mode, 0, pl.n)?;
+        let _scrub = ScrubOnExit;
+        let out = collect(rows, ones, pl, nthr)
+            .ok_or_else(|| Error::Device("msm: host collect failed".into()))?;
+        return Ok((out, ns));
+    }
     let collect_inputs = |i: &Inputs| {
         let _scrub = ScrubOnExit;
         lock(i).take().and_then(|(rows, ones)| collect(rows, ones, pl, nthr))

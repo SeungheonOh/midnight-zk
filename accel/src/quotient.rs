@@ -555,7 +555,7 @@ fn err(e: Error) -> Reason {
 /// Copies `src` into the start of `dst` on several threads, checking every
 /// element reduced; `false` when one is not (the copy may be partial).
 fn copy_checked(dst: &mut [Scalar], src: &[Scalar]) -> bool {
-    const PART: usize = 1 << 16;
+    const PART: usize = 1 << 14;
     let dst = &mut dst[..src.len()];
     let one = |d: &mut [Scalar], s: &[Scalar]| {
         d.copy_from_slice(s);
@@ -564,16 +564,26 @@ fn copy_checked(dst: &mut [Scalar], src: &[Scalar]) -> bool {
     if src.len() <= 2 * PART {
         return one(dst, src);
     }
-    let threads = std::thread::available_parallelism().map_or(4, |t| t.get()).min(8);
-    let per = src.len().div_ceil(threads).max(PART);
-    std::thread::scope(|s| {
-        let hs: Vec<_> = dst
-            .chunks_mut(per)
-            .zip(src.chunks(per))
-            .map(|(d, c)| s.spawn(move || one(d, c)))
-            .collect();
-        hs.into_iter().all(|h| h.join().unwrap_or(false))
-    })
+    let base = dst.as_mut_ptr() as usize;
+    crate::msm::par::par_parts(
+        src.len(),
+        crate::msm::par::host_threads().min(8),
+        PART,
+        |lo, hi| {
+            let s = &src[lo..hi];
+            // SAFETY: `dst` has length `src.len()` and `[lo, hi)` partitions
+            // are disjoint and in-bounds.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    s.as_ptr(),
+                    (base as *mut Scalar).add(lo),
+                    hi - lo,
+                );
+            }
+            s.iter().all(field::is_reduced)
+        },
+    )
+    .is_some_and(|ok| ok.into_iter().all(|b| b))
 }
 
 // ---------------------------------------------------------------------------

@@ -15,14 +15,31 @@
 
 use std::{
     panic::AssertUnwindSafe,
-    sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
+
+use rayon::prelude::*;
 
 use crate::Backend;
 
 /// The threads of a host pass over the points or the scalars.
 pub fn host_threads() -> usize {
     std::thread::available_parallelism().map_or(4, |t| t.get()).min(16)
+}
+
+/// Persistent thread pool for short host passes (`par_parts`, `all_reduced`,
+/// `par_copy`, `collect`), avoiding per-call OS thread creation overhead while
+/// staying separate from `cpu_pool` (which runs `cpu_msm`).
+pub fn host_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(host_threads())
+            .thread_name(|i| format!("midnight-accel-host-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
 }
 
 /// The thread pool of the CPU share of an MSM: its own threads, so that the
@@ -63,7 +80,12 @@ pub fn par_parts<R: Send>(
     if bounds.len() <= 1 {
         return catch(|| bounds.iter().map(|&(a, b)| f(a, b)).collect());
     }
-    // `bounds` has at least two parts from here
+    if let Some(pool) = host_pool() {
+        let res: Vec<Option<R>> =
+            pool.install(|| bounds.par_iter().map(|&(a, b)| catch(|| f(a, b))).collect());
+        return res.into_iter().collect();
+    }
+    // fallback if the pool could not be created: scoped threads
     let f = &f;
     std::thread::scope(|s| {
         let started: Vec<_> = bounds[1..]
