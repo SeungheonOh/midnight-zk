@@ -146,20 +146,21 @@ const ADRENO_MSM_WINDOWS: &[(u32, u32, usize)] = &[
     (22, 16, 1),
 ];
 
-/// The device share of the MSM on Qualcomm Adreno GPUs (in 64ths): paired with
-/// 8 fast mobile Oryon/ARM cores, an even-to-62% GPU split keeps both halves
-/// busy in parallel.
+/// The device share of the MSM on Qualcomm Adreno GPUs (in 64ths): at k=15..18
+/// Snapdragon's 8 Oryon CPU cores keep pace with Adreno (~44-56% GPU), while at
+/// k>=19 prolonged CPU load/verify heats the CPU cores faster than the GPU so a
+/// higher GPU share (44-50/64) prevents the GPU from stalling on CPU.
 const ADRENO_MSM_SHARES: &[(u32, usize, usize)] = &[
-    (13, 32, 32),
-    (14, 32, 32),
+    (13, 28, 28),
+    (14, 28, 28),
     (15, 32, 32),
     (16, 36, 36),
-    (17, 40, 40),
-    (18, 40, 40),
-    (19, 40, 40),
-    (20, 40, 40),
-    (21, 40, 40),
-    (22, 40, 40),
+    (17, 36, 36),
+    (18, 36, 36),
+    (19, 44, 44),
+    (20, 50, 50),
+    (21, 50, 50),
+    (22, 50, 50),
 ];
 
 /// The constants of Qualcomm Adreno GPUs (vendor 0x5143), measured on
