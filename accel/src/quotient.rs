@@ -717,9 +717,46 @@ fn device_run<B: Backend>(
     if batch_cosets {
         let reduced = proof_buf
             .host_write(|dst: &mut [Scalar]| {
-                tab.proof.iter().enumerate().all(|(i, p)| {
-                    copy_checked(&mut dst[i * en..i * en + n], p)
-                })
+                let npolys = tab.proof.len();
+                let base = dst.as_mut_ptr() as usize;
+                let total = npolys * n;
+                const PART: usize = 1 << 14;
+                if total <= 2 * PART {
+                    return tab
+                        .proof
+                        .iter()
+                        .enumerate()
+                        .all(|(i, p)| copy_checked(&mut dst[i * en..i * en + n], p));
+                }
+                crate::msm::par::par_parts(
+                    total,
+                    crate::msm::par::host_threads().min(8),
+                    PART,
+                    |lo, hi| {
+                        let mut cur = lo;
+                        let mut ok = true;
+                        while cur < hi {
+                            let pi = cur / n;
+                            let off = cur % n;
+                            let take = (n - off).min(hi - cur).min(1024);
+                            let s = &tab.proof[pi][off..off + take];
+                            // SAFETY: `dst` holds `npolys * en` elements (`en >= n`) and
+                            // `[cur, cur + take)` maps uniquely to disjoint destination
+                            // ranges `pi * en + off .. pi * en + off + take`.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    s.as_ptr(),
+                                    (base as *mut Scalar).add(pi * en + off),
+                                    take,
+                                );
+                            }
+                            ok &= s.iter().all(field::is_reduced);
+                            cur += take;
+                        }
+                        ok
+                    },
+                )
+                .is_some_and(|ok| ok.into_iter().all(|b| b))
             })
             .map_err(err)?;
         if !reduced {

@@ -138,11 +138,27 @@ pub(crate) struct Table<B: Backend> {
     /// lazily only if uploaded to an uncached unified device mapping so we
     /// avoid reading tens of MiB of uncached GPU memory on every MSM call.
     chunk_digests: OnceLock<Vec<[u8; 32]>>,
+    /// Lazily precomputed `beta * x` coordinates for the GLV CPU share so
+    /// repeated MSMs on the same SRS table skip all `phi` multiplications.
+    phi_x: OnceLock<Vec<blst::blst_fp>>,
     pub(super) store: RwLock<Store<B>>,
     pub(super) masks: MaskCache,
 }
 
 impl<B: Backend> Table<B> {
+    /// Returns `beta * bases[i].x` for the full registered table, computed once
+    /// lazily when a full-length slice is presented. Returns `None` for shorter
+    /// prefixes before full initialization so a prefix call never locks in a
+    /// truncated cache.
+    pub(super) fn phi_x(&self, bases: &[G1AffineLimbs]) -> Option<&[blst::blst_fp]> {
+        if let Some(p) = self.phi_x.get() {
+            return (p.len() >= bases.len()).then_some(p.as_slice());
+        }
+        if bases.len() == self.len {
+            return Some(self.phi_x.get_or_init(|| super::cpu_glv::precompute_phi_x(bases)));
+        }
+        None
+    }
     /// Whether the table still holds the caller's points (every point
     /// compared).
     fn serves(&self, bases: &[G1AffineLimbs]) -> bool {
@@ -324,6 +340,7 @@ pub fn register_srs<B: Backend>(bases: &[G1AffineLimbs]) -> SrsHandle<B> {
         len: bases.len(),
         first_bad: first_not_in_g1(bases),
         chunk_digests: OnceLock::new(),
+        phi_x: OnceLock::new(),
         store: RwLock::new(Store::Host(bases.to_vec())),
         masks: Mutex::new(HashMap::new()),
     });

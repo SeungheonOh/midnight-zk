@@ -1036,7 +1036,7 @@ impl<B: Backend> Ctx<B> {
     }
 }
 
-fn bytes_of_slice<T: Pod>(v: &[T]) -> &[u8] {
+pub(crate) fn bytes_of_slice<T: Pod>(v: &[T]) -> &[u8] {
     // SAFETY: Pod values are valid to view as their bytes.
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), size_of_val(v)) }
 }

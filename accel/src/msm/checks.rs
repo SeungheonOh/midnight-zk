@@ -37,7 +37,9 @@ pub fn points_equal(a: &[G1AffineLimbs], b: &[G1AffineLimbs]) -> bool {
                 return;
             }
             let e = (s + POINT_BLOCK).min(hi);
-            if a[s..e] != b[s..e] {
+            // Compare as raw byte slices (`G1AffineLimbs` is `Pod` with no
+            // padding) so the compiler lowers directly to vectorized `memcmp`.
+            if crate::ctx::bytes_of_slice(&a[s..e]) != crate::ctx::bytes_of_slice(&b[s..e]) {
                 differs.store(true, Relaxed);
                 return;
             }

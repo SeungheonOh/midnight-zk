@@ -51,6 +51,12 @@ pub fn wipe<T: Copy>(v: &mut T) {
     unsafe { zero_volatile((v as *mut T).cast::<u8>(), size_of::<T>()) };
 }
 
+/// Writes zero over `s` (a slice derived from the scalars) in one volatile pass.
+pub fn wipe_slice<T: Copy>(s: &mut [T]) {
+    // SAFETY: `s` is valid for writes of `std::mem::size_of_val(s)` bytes.
+    unsafe { zero_volatile(s.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(s)) };
+}
+
 /// One value derived from the scalars, zeroed when dropped (unwinding
 /// included).
 pub struct Secret<T: Copy>(pub T);
@@ -98,6 +104,11 @@ impl<T: Copy> SecretVec<T> {
         SecretVec(Vec::with_capacity(n))
     }
 
+    /// Allocates `n` copies of `val` (never reallocated).
+    pub fn from_elem(val: T, n: usize) -> Self {
+        SecretVec(vec![val; n])
+    }
+
     /// Appends `s` if it fits in the capacity; `false` otherwise.
     pub fn extend_within(&mut self, s: &[T]) -> bool {
         if self.0.capacity() - self.0.len() < s.len() {
@@ -117,6 +128,12 @@ impl<T: Copy> Deref for SecretVec<T> {
     type Target = [T];
     fn deref(&self) -> &[T] {
         &self.0
+    }
+}
+
+impl<T: Copy> DerefMut for SecretVec<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.0
     }
 }
 

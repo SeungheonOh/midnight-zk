@@ -59,6 +59,7 @@ pub(super) fn split<B: Backend>(
     scalars: &[Scalar],
     bases: &[G1AffineLimbs],
     masks: Option<&MaskCache>,
+    phi_x: Option<&[blst::blst_fp]>,
     mut trace: Trace<'_>,
 ) -> Result<Served, Error> {
     let n = scalars.len();
@@ -72,9 +73,10 @@ pub(super) fn split<B: Backend>(
         t => t,
     };
     let (cs, cb) = (&scalars[m..], &bases[m..]);
+    let cphi = phi_x.and_then(|p| p.get(m..n));
     let cpu_share = move || {
         let _scrub = ScrubOnExit;
-        cpu_msm::<B>(cs, cb)
+        cpu_msm::<B>(cs, cb, cphi)
     };
     let (dev, cpu) = std::thread::scope(|sc| {
         let h = std::thread::Builder::new()
@@ -98,27 +100,37 @@ pub(super) fn split<B: Backend>(
     Ok((Secret(limbs_of(&sum)), ns))
 }
 
-/// The CPU share: the stock `msm_pippenger` on the share's own pool, over the
-/// caller's slices. Afterwards each pool thread scrubs its stack.
-fn cpu_msm<B: Backend>(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<Secret<blst_p1>> {
+/// The CPU share: GLV batched-affine Pippenger on the share's own pool (every
+/// base was verified in G1 before entering `split`), falling back to stock
+/// `msm_pippenger` for small shares. Afterwards each pool thread scrubs its
+/// stack.
+fn cpu_msm<B: Backend>(
+    scalars: &[Scalar],
+    bases: &[G1AffineLimbs],
+    phi_x: Option<&[blst::blst_fp]>,
+) -> Option<Secret<blst_p1>> {
     use midnight_curves::{Fq, G1Affine, G1Projective, msm::msm_pippenger};
-    // SAFETY: `Fq` is a transparent `blst_fr` (`[u64; 4]`) and `G1Affine` a
-    // transparent `blst_p1_affine` (`[u64; 12]`), with the sizes and
-    // alignments of `Scalar` and `G1AffineLimbs` (asserted in the parent
-    // module); the scalars were checked reduced at admission.
-    let (s, b) = unsafe {
-        (
-            &*(scalars as *const [Scalar] as *const [Fq]),
-            &*(bases as *const [G1AffineLimbs] as *const [G1Affine]),
-        )
-    };
     let pool = cpu_pool::<B>()?;
-    let r = pool.install(|| {
-        let r: G1Projective = msm_pippenger(s, b);
-        // SAFETY: `G1Projective` is a transparent `blst_p1` (sizes asserted
-        // in the parent module).
-        Secret(unsafe { std::mem::transmute::<G1Projective, blst_p1>(r) })
-    });
+    let r = if scalars.len() >= 2048 {
+        pool.install(|| super::cpu_glv::msm_glv(scalars, bases, phi_x))
+    } else {
+        // SAFETY: `Fq` is a transparent `blst_fr` (`[u64; 4]`) and `G1Affine` a
+        // transparent `blst_p1_affine` (`[u64; 12]`), with the sizes and
+        // alignments of `Scalar` and `G1AffineLimbs` (asserted in the parent
+        // module); the scalars were checked reduced at admission.
+        let (s, b) = unsafe {
+            (
+                &*(scalars as *const [Scalar] as *const [Fq]),
+                &*(bases as *const [G1AffineLimbs] as *const [G1Affine]),
+            )
+        };
+        pool.install(|| {
+            let r: G1Projective = msm_pippenger(s, b);
+            // SAFETY: `G1Projective` is a transparent `blst_p1` (sizes asserted
+            // in the parent module).
+            Secret(unsafe { std::mem::transmute::<G1Projective, blst_p1>(r) })
+        })
+    };
     pool.broadcast(|_| scrub_stack());
     Some(r)
 }
@@ -215,7 +227,10 @@ fn write_parallel<T: ctx::Pod + Sync + Send, B: Backend>(
     buf: &mut Buffer<B>,
     data: &[T],
 ) -> Result<(), Error> {
-    const PART: usize = 1 << 20;
+    // Keep <= 8 MiB uploads single-threaded on the calling thread so they do
+    // not contend with the CPU MSM share's rayon pool while the device share
+    // prepares its buffers.
+    const PART: usize = 8 << 20;
     buf.host_write(|all: &mut [T]| {
         let dst = all.get_mut(..data.len()).ok_or_else(|| Error::Memory("msm scratch".into()))?;
         if size_of_val(data) <= PART {
