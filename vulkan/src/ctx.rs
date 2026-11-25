@@ -686,7 +686,12 @@ impl<'a> VulkanCommand<'a> {
             let width = ones_subgroup(info).ok_or_else(|| {
                 Error::Device(format!("`{kernel}`: no power-of-two subgroup width"))
             })?;
+            // Qualcomm Adreno (vendor 0x5143): `subgroupShuffleDown` over the
+            // 48 limbs of `G1Xyzz` in `msm_ones` corrupts partial sums across
+            // lanes. Fall back to the shared-memory reduction (`ONES_LANES = 1`),
+            // which stages 64 `G1Xyzz` records (12 KiB) per pass.
             let lanes = match ONES_LANES.load(std::sync::atomic::Ordering::Relaxed) {
+                0 if info.vendor_id == 0x5143 => 1,
                 0 => width.min(MSM_RUN),
                 l => l,
             };
@@ -909,7 +914,18 @@ impl Backend for Vulkan {
         if !device::kernels().any(|k| k == kernel) {
             return Err(Error::Device(format!("no kernel `{kernel}`")));
         }
-        Ok(max_group(self.dev.info()))
+        let info = self.dev.info();
+        let mut limit = max_group(info);
+        // Qualcomm Adreno (vendor 0x5143): high-register G1 kernels with
+        // barriers deadlock at 256 invocations (4 waves of 64) due to
+        // register-file residency limits; 128 invocations (2 waves) runs
+        // cleanly.
+        if info.vendor_id == 0x5143
+            && matches!(kernel, "msm_accumulate" | "msm_integrate" | "msm_ones")
+        {
+            limit = limit.min(128);
+        }
+        Ok(limit)
     }
 
     fn subgroup_width(&self, kernel: &str) -> Result<usize, Error> {

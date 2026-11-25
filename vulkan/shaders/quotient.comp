@@ -132,17 +132,19 @@ void program(uint pd, inout Fr outv[4]) {
         const uint dst = W(o + 1u);
         const Fr a = operand(reads, unis, W(o + 2u));
         Fr v;
-        switch (kind) {
-        case OP_ADD: v = fr_add(a, operand(reads, unis, W(o + 3u))); break;
-        case OP_SUB: v = fr_sub(a, operand(reads, unis, W(o + 3u))); break;
-        case OP_MUL: v = fr_mul(a, operand(reads, unis, W(o + 3u))); break;
-        case OP_SQUARE: v = fr_sqr(a); break;
-        case OP_DOUBLE: v = fr_dbl(a); break;
-        case OP_NEGATE: v = fr_neg(a); break;
-        default:
-            v = fr_add(fr_mul(a, operand(reads, unis, W(o + 3u))),
-                       operand(reads, unis, W(o + 4u)));
-            break;
+        if (kind == OP_MUL || kind == OP_SQUARE || kind > OP_NEGATE) {
+            const Fr b = kind == OP_SQUARE ? a : operand(reads, unis, W(o + 3u));
+            v = fr_mul(a, b);
+            if (kind > OP_NEGATE) {
+                v = fr_add(v, operand(reads, unis, W(o + 4u)));
+            }
+        } else {
+            switch (kind) {
+            case OP_ADD: v = fr_add(a, operand(reads, unis, W(o + 3u))); break;
+            case OP_SUB: v = fr_sub(a, operand(reads, unis, W(o + 3u))); break;
+            case OP_DOUBLE: v = fr_dbl(a); break;
+            default: v = fr_neg(a); break;
+            }
         }
         FrRef(scratch_at(dst)).v = v;
     }

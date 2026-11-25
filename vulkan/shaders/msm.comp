@@ -139,7 +139,10 @@ void slice_of(uint len, uint groups, uint g, out uint base, out uint slice) {
 
 #if defined(MSM_SORT_SCAN) || defined(MSM_SORT_LOWER)
 
-shared uint scan[gl_WorkGroupSize.x];
+// Fixed upper bound (`SORT_BLOCK` = 1024): avoids a spec-constant-sized
+// workgroup array alongside other shared arrays (`counters`, `base_len`),
+// which hangs Qualcomm Adreno's `msm_sort_lower` dispatch.
+shared uint scan[1024];
 
 // Exclusive prefix sum over the workgroup, one value per invocation; `total`
 // is the sum of all values. A scan in shared memory: it does not depend on
@@ -453,8 +456,11 @@ layout(push_constant) uniform Push {
 // The invocations reduced with subgroup shuffles (a power of two up to 32).
 layout(constant_id = 1) const uint ONES_LANES = 32u;
 
-// The partial sums of each `ONES_LANES` invocations, below 32.
-shared G1Xyzz parts[ONES_LANES < 32u ? gl_WorkGroupSize.x / ONES_LANES : 1u];
+// Fixed-size staging for reducing runs of 32 invocations when `ONES_LANES < 32`
+// (64 * 192 B = 12 KiB, within the 16 KiB Vulkan minimum). A fixed size avoids
+// an `OpSpecConstantOp`-sized workgroup array, which Qualcomm Adreno truncates.
+const uint ONES_PARTS = 64u;
+shared G1Xyzz parts[ONES_PARTS];
 
 Fp shuffle_down(Fp a, uint delta) {
     Fp r;
@@ -492,10 +498,17 @@ void main() {
     // then each run of 32 into its first invocation, through shared memory
     if (ONES_LANES < 32u) {
         const uint lid = gl_LocalInvocationID.x;
-        if ((lid & (ONES_LANES - 1u)) == 0u) parts[lid / ONES_LANES] = acc;
-        barrier();
-        if ((lid & 31u) == 0u) {
-            for (uint j = 1u; j < 32u / ONES_LANES; j++) g1_add(acc, parts[lid / ONES_LANES + j]);
+        const uint stride = ONES_PARTS * ONES_LANES;
+        for (uint base = 0u; base < gl_WorkGroupSize.x; base += stride) {
+            if (lid >= base && lid < base + stride && (lid & (ONES_LANES - 1u)) == 0u) {
+                parts[(lid - base) / ONES_LANES] = acc;
+            }
+            barrier();
+            if (lid >= base && lid < base + stride && (lid & 31u) == 0u) {
+                const uint slot = (lid - base) / ONES_LANES;
+                for (uint j = 1u; j < 32u / ONES_LANES; j++) g1_add(acc, parts[slot + j]);
+            }
+            barrier();
         }
     }
 
@@ -538,21 +551,21 @@ layout(push_constant) uniform Push {
     AccParams p;
 } pc;
 
-shared uint lens[gl_WorkGroupSize.x];
-shared uint slot[gl_WorkGroupSize.x];
+// Fixed upper bound (1024): avoids two spec-constant-sized workgroup arrays
+// overlapping in Qualcomm Adreno's shared-memory layout (see `scan` above).
+shared uint lens[1024];
+shared uint slot[1024];
 
 void main() {
     const uint g = global_index(), tid = gl_LocalInvocationID.x, tpg = gl_WorkGroupSize.x;
     const AccParams p = pc.p;
     const uint total = p.nwins << p.bits;
-    // the same value for every invocation: the whole grid returns here,
-    // before any barrier
-    if (U32_AT(pc.hot, 0u) != 0u) {
-        if (g < total) XYZZ_AT(pc.buckets, g) = g1_inf();
-        return;
-    }
+    // Keep both `barrier()` calls in top-level unconditional control flow:
+    // an early `return` before `barrier()` wraps the barriers in a selection
+    // merge after `spirv-opt --merge-return`, which hangs Adreno.
+    const bool is_hot = U32_AT(pc.hot, 0u) != 0u;
     uint idx;
-    const uint mine = g < total ? bucket_len(pc.hist, p, g, idx) : 0u;
+    const uint mine = (!is_hot && g < total) ? bucket_len(pc.hist, p, g, idx) : 0u;
     // the workgroup's buckets by load, longest first: each subgroup takes
     // buckets of similar length (invocations past the end rank last)
     lens[tid] = mine;
@@ -564,6 +577,10 @@ void main() {
     }
     slot[rank] = tid;
     barrier();
+    if (is_hot) {
+        if (g < total) XYZZ_AT(pc.buckets, g) = g1_inf();
+        return;
+    }
     const uint t = g - tid + slot[tid];
     if (t >= total) return;
     const uint y = t >> p.bits;

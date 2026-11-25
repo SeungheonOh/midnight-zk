@@ -70,6 +70,7 @@ pub(super) const MODE_MASK: u32 = 2;
 pub(super) struct Geometry {
     sort_block: usize,
     ones_block: usize,
+    acc_block: usize,
     /// Upper-sort groups per window ([`crate::Tuning::msm_sort_groups`]).
     sort_groups: u32,
     /// Groups of `msm_ones` ([`crate::Tuning::msm_ones_groups`]).
@@ -99,15 +100,21 @@ impl Geometry {
         .map(|k| max(k))
         .try_fold(SORT_BLOCK, |a, m| m.map(|m| a.min(pow2_floor(m))))?;
         let ones_block = pow2_floor(max("msm_ones")?.min(ONES_BLOCK));
+        let acc_block = pow2_floor(max("msm_accumulate")?.min(ACC_GROUP));
         let nthr = pow2_floor(max("msm_integrate")?.min(MSM_NTHREADS));
         // more workgroups only while each run keeps at least two buckets
         let mut int_groups = pow2_floor(B::tuning().msm_integrate_groups.max(1) as usize);
         while int_groups > 1 && lg2(nthr * int_groups) >= pl.bits {
             int_groups /= 2;
         }
-        if sort_block < 32 || ones_block < 32 || nthr < 2 || lg2(nthr) >= pl.bits {
+        if sort_block < 32
+            || ones_block < 32
+            || acc_block < 32
+            || nthr < 2
+            || lg2(nthr) >= pl.bits
+        {
             return Err(Error::Device(format!(
-                "msm: threadgroup sizes {sort_block}/{ones_block}/{nthr} too small"
+                "msm: threadgroup sizes {sort_block}/{ones_block}/{acc_block}/{nthr} too small"
             )));
         }
         if pl.low_bits > MAX_LOW_BITS || pl.top_bits > MAX_TOP_BITS {
@@ -118,6 +125,7 @@ impl Geometry {
         Ok(Geometry {
             sort_block,
             ones_block,
+            acc_block,
             sort_groups: t.msm_sort_groups,
             ones_groups: t.msm_ones_groups,
             hot_limit: t.msm_hot_bucket_limit,
@@ -348,7 +356,7 @@ fn enc_accumulate<'a, B: Backend>(
     cmd.dispatch_with(
         "msm_accumulate",
         total,
-        ACC_GROUP,
+        g.acc_block,
         &[
             Arg::Buffer(b.buckets),
             pts,
