@@ -33,6 +33,7 @@
 
 #if MONT_INT64
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #endif
 
 // The workgroup width is specialization constant 0. The host folds a grid of

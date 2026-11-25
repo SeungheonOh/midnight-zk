@@ -140,14 +140,15 @@ fn env_on(name: &str) -> bool {
 }
 
 /// The arithmetic variant: [`ARITH_ENV`], else A where the device has
-/// `shaderInt64`.
+/// `shaderInt64` and `shaderInt16`.
 fn choose_variant(info: &device::VulkanInfo) -> Result<Variant, String> {
+    let has_64 = info.shader_int64 && info.shader_int16;
     match std::env::var(ARITH_ENV).as_deref() {
-        Ok("64") if info.shader_int64 => Ok(Variant::Int64),
-        Ok("64") => Err(format!("{ARITH_ENV}=64 on a device without shaderInt64")),
+        Ok("64") if has_64 => Ok(Variant::Int64),
+        Ok("64") => Err(format!("{ARITH_ENV}=64 on a device without shaderInt64/shaderInt16")),
         Ok("32") => Ok(Variant::Int32),
         Ok(v) => Err(format!("{ARITH_ENV}={v}: expected 64 or 32")),
-        Err(_) if info.shader_int64 => Ok(Variant::Int64),
+        Err(_) if has_64 => Ok(Variant::Int64),
         Err(_) => Ok(Variant::Int32),
     }
 }
@@ -706,17 +707,23 @@ impl Backend for Vulkan {
         }
         let info = self.dev.info();
         let mut limit = max_group(info);
-        // Qualcomm Adreno (vendor 0x5143): high-register G1 kernels cap at
-        // 128 invocations (2 waves of 64) for optimal occupancy and to avoid
-        // register-file residency deadlocks at 256 invocations on barriered
-        // kernels; `msm_integrate` caps at 64 (1 wave/WG) paired with
-        // `msm_integrate_groups = 2` so `2 * nwins` workgroups balance cleanly
-        // across Adreno's shader processors with the same 128 runs/window.
+        // `msm_accumulate` (15 KiB) and `msm_integrate` (12 KiB) stage per-thread
+        // `G1Xyzz` state in fixed 64-thread bank-conflict-free shared-memory tiles.
+        if matches!(kernel, "msm_accumulate" | "msm_integrate") {
+            limit = limit.min(64);
+        }
+        // Qualcomm Adreno (vendor 0x5143): cap high-register G1 kernels at 128
+        // invocations (2 waves of 64), and cap radix-sort workgroups at 256 (4
+        // waves of 64) to cut `group_exclusive_sum` barrier depth and reduce
+        // shared-memory atomic collisions in `msm_sort_lower`.
         if info.vendor_id == 0x5143 {
-            if matches!(kernel, "msm_accumulate" | "msm_ones") {
+            if matches!(kernel, "msm_accumulate_fallback" | "msm_ones") {
                 limit = limit.min(128);
-            } else if kernel == "msm_integrate" {
-                limit = limit.min(64);
+            } else if matches!(
+                kernel,
+                "msm_sort_count" | "msm_sort_scan" | "msm_sort_scatter" | "msm_sort_lower"
+            ) {
+                limit = limit.min(256);
             }
         }
         Ok(limit)

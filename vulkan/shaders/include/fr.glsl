@@ -49,7 +49,9 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer FrRef {
 #define MONT_ONE FR_ONE
 #define MONT_PREFIX fr
 #define MONT_FR_SPECIAL
+#define MONT_DELAYED_13_FR
 #include "mont.glsl"
+#undef MONT_DELAYED_13_FR
 #undef MONT_FR_SPECIAL
 #undef MONT_T
 #undef MONT_N

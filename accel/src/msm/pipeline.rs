@@ -374,7 +374,7 @@ fn enc_accumulate<'a, B: Backend>(
             &(),
             &[],
         )?;
-        return cmd.dispatch_with(
+        cmd.dispatch_with(
             "msm_accumulate",
             total,
             g.acc_block,
@@ -385,6 +385,20 @@ fn enc_accumulate<'a, B: Backend>(
                 Arg::Buffer(b.hist),
                 Arg::Buffer(b.hot),
                 Arg::Buffer(b.temps),
+            ],
+            &p.acc,
+            &[],
+        )?;
+        return cmd.dispatch_with(
+            "msm_accumulate_fallback",
+            total,
+            g.acc_block,
+            &[
+                Arg::Buffer(b.buckets),
+                pts,
+                Arg::Buffer(b.digits),
+                Arg::Buffer(b.hist),
+                Arg::Buffer(b.hot),
             ],
             &p.acc,
             &[],

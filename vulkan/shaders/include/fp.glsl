@@ -56,7 +56,11 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer FpRef {
 #define MONT_P FP_P
 #define MONT_ONE FP_ONE
 #define MONT_PREFIX fp
+#if !defined(MSM_FALLBACK_COMPACT)
+#define MONT_DELAYED_13_FP
+#endif
 #include "mont.glsl"
+#undef MONT_DELAYED_13_FP
 #undef MONT_T
 #undef MONT_N
 #undef MONT_INV

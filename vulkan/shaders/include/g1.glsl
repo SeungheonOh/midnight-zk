@@ -145,24 +145,24 @@ void g1_add(inout G1Xyzz p31, G1Xyzz p2) {
         p31.Y = fp_sub_2p(Q, p31.Y);  // Y3 = R*(Q-X3)-S1*PPP (< 2p)
         p31.ZZ = g1_mul(p31.ZZ, p2.ZZ);       // ZZ3 = ZZ1*ZZ2*PP (< 2p)
         p31.ZZZ = g1_mul(p31.ZZZ, p2.ZZZ);    // ZZZ3 = ZZZ1*ZZZ2*PPP (< 2p)
-    } else if (fp_is_zero(fp_reduce_once(R))) { // X1 == X2, Y1 == Y2: double
+    } else if (fp_is_zero(fp_reduce_once(R))) { // X1 == X2, Y1 == Y2: double (cold)
         Fp X1 = fp_reduce_once(p31.X);
         Fp Y1 = fp_reduce_once(p31.Y);
         U = fp_dbl(Y1);               // U = 2*Y1 (< p)
-        Fp V = g1_mul(U, U);          // V = U^2 (< 2p)
-        Fp W = g1_mul(U, V);          // W = U*V (< 2p)
-        S = g1_mul(X1, V);            // S = X1*V (< 2p)
-        Fp M = fp_reduce_once(g1_mul(X1, X1));
+        Fp V = fp_mul_compact(U, U);          // V = U^2 (< 2p)
+        Fp W = fp_mul_compact(U, V);          // W = U*V (< 2p)
+        S = fp_mul_compact(X1, V);            // S = X1*V (< 2p)
+        Fp M = fp_reduce_once(fp_mul_compact(X1, X1));
         M = fp_add(fp_dbl(M), M);     // M = 3*X1^2 (< p)
-        p31.X = g1_mul(M, M);
+        p31.X = fp_mul_compact(M, M);
         p31.X = fp_sub_2p(p31.X, S);
         p31.X = fp_sub_2p(p31.X, S);  // X3 = M^2-2*S (< 2p)
-        p31.Y = g1_mul(Y1, W);        // W*Y1 (< 2p)
+        p31.Y = fp_mul_compact(Y1, W);        // W*Y1 (< 2p)
         S = fp_sub_unred(S, p31.X);   // S-X3 (< 4p)
-        S = g1_mul(S, M);             // M*(S-X3) (< 2p)
+        S = fp_mul_compact(S, M);             // M*(S-X3) (< 2p)
         p31.Y = fp_sub_2p(S, p31.Y);  // Y3 = M*(S-X3)-W*Y1 (< 2p)
-        p31.ZZ = g1_mul(p31.ZZ, V);   // ZZ3 = V*ZZ1 (< 2p)
-        p31.ZZZ = g1_mul(p31.ZZZ, W); // ZZZ3 = W*ZZZ1 (< 2p)
+        p31.ZZ = fp_mul_compact(p31.ZZ, V);   // ZZ3 = V*ZZ1 (< 2p)
+        p31.ZZZ = fp_mul_compact(p31.ZZZ, W); // ZZZ3 = W*ZZZ1 (< 2p)
     } else {                          // X1 == X2, Y1 == -Y2
         p31 = g1_inf();
     }
@@ -221,6 +221,57 @@ void g1_madd(inout G1Xyzz p31, G1Affine p2, bool subtract) {
     } else {                          // X1 == X2, Y1 == -+Y2
         p31 = g1_inf();
     }
+}
+
+// Fast mixed addition (`madd-2008-s`) for `msm_accumulate`: handles infinity,
+// distinct-x addition, and opposite points (`P + (-P) = O`), returning `true`.
+// On equal points (doubling, probability < 2^-255 on masked honest MSMs),
+// returns `false` so `msm_accumulate_fallback` completes the bucket. Cuts
+// `g1_mul` call sites in `msm_accumulate` from 17 to 10 (-41% code size) and
+// loads `p2.x` / `p2.y` sequentially so they are never live together (-12 regs).
+bool g1_madd_fast(inout G1Xyzz p31, uvec2 points, uint pt_idx, bool subtract) {
+    Fp p2x = FP_AT(points, 2u * pt_idx);
+    bool p2x_zero = fp_is_zero(p2x);
+    if (g1_is_inf(p31)) {
+        Fp p2y = FP_AT(points, 2u * pt_idx + 1u);
+        if (p2x_zero && fp_is_zero(p2y)) return true;
+        p31.X = p2x;
+        p31.Y = p2y;
+        p31.ZZZ = fp_cneg(fp_one(), subtract);
+        p31.ZZ = fp_one();
+        return true;
+    }
+
+    Fp P = g1_mul(p2x, p31.ZZ);              // U2 = X2*ZZ1 (< 2p); p2x dead here
+    P = fp_reduce_once(fp_sub_2p(P, p31.X)); // P = U2-X1 (< p)
+
+    Fp p2y = FP_AT(points, 2u * pt_idx + 1u);
+    if (p2x_zero && fp_is_zero(p2y)) return true;
+    Fp R = g1_mul(p2y, p31.ZZZ);             // S2 = Y2*ZZZ1 (< 2p); p2y dead here
+    R = fp_cneg_2p(R, subtract);             // (< 2p)
+    R = fp_sub_2p(R, p31.Y);                 // R = S2-Y1 (< 2p)
+
+    if (!fp_is_zero(P)) {                    // X1 != X2: add
+        Fp PP = g1_mul(P, P);
+        Fp PPP = g1_mul(P, PP);
+        p31.ZZ = g1_mul(p31.ZZ, PP);
+        p31.ZZZ = g1_mul(p31.ZZZ, PPP);
+        Fp Q = g1_mul(PP, p31.X);
+        p31.X = g1_mul(R, R);
+        p31.X = fp_sub_2p(p31.X, PPP);
+        p31.X = fp_sub_2p(p31.X, Q);
+        p31.X = fp_sub_2p(p31.X, Q);
+        Q = fp_sub_unred(Q, p31.X);
+        Q = g1_mul(Q, R);
+        p31.Y = g1_mul(p31.Y, PPP);
+        p31.Y = fp_sub_2p(Q, p31.Y);
+        return true;
+    }
+    if (!fp_is_zero(fp_reduce_once(R))) {    // X1 == X2, Y1 == -+Y2
+        p31 = g1_inf();
+        return true;
+    }
+    return false;                            // X1 == X2, Y1 == +-Y2: delegate doubling
 }
 
 #endif // MIDNIGHT_VULKAN_G1_GLSL

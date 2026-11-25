@@ -187,6 +187,8 @@ pub struct VulkanInfo {
     pub max_buffer_size: u64,
     /// `shaderInt64` (variant A).
     pub shader_int64: bool,
+    /// `shaderInt16` (16-bit integer types in shaders).
+    pub shader_int16: bool,
     /// `bufferDeviceAddress` (required).
     pub buffer_device_address: bool,
     /// `timestampValidBits` of the compute queue (0: no timestamps).
@@ -556,7 +558,9 @@ impl Context {
         let mut v13 = vk::PhysicalDeviceVulkan13Features::default()
             .subgroup_size_control(c.info.subgroup_size_control)
             .compute_full_subgroups(c.info.compute_full_subgroups);
-        let features = vk::PhysicalDeviceFeatures::default().shader_int64(c.info.shader_int64);
+        let features = vk::PhysicalDeviceFeatures::default()
+            .shader_int64(c.info.shader_int64)
+            .shader_int16(c.info.shader_int16);
         let priorities = [1.0f32];
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(c.family)
@@ -632,6 +636,7 @@ impl Context {
         // SAFETY: as above.
         unsafe { instance.get_physical_device_features2(p, &mut features) };
         let shader_int64 = features.features.shader_int64 == vk::TRUE;
+        let shader_int16 = features.features.shader_int16 == vk::TRUE;
         // SAFETY: valid physical device.
         let exts = unsafe { instance.enumerate_device_extension_properties(p) };
         let exts = init_error("vkEnumerateDeviceExtensionProperties", exts)?;
@@ -687,6 +692,7 @@ impl Context {
             max_memory_allocation_size: v11.max_memory_allocation_size,
             max_buffer_size: v13.max_buffer_size,
             shader_int64,
+            shader_int16,
             buffer_device_address: f12.buffer_device_address == vk::TRUE,
             timestamp_valid_bits: family_props.timestamp_valid_bits,
             timestamp_period: limits.timestamp_period,
