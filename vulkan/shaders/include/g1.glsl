@@ -127,7 +127,7 @@ void g1_add(inout G1Xyzz p31, G1Xyzz p2) {
     Fp P = g1_mul(p2.X, p31.ZZ);      // U2 = X2*ZZ1  (< 2p)
     Fp R = g1_mul(p2.Y, p31.ZZZ);     // S2 = Y2*ZZZ1 (< 2p)
     P = fp_reduce_once(fp_sub_2p(P, U)); // P = U2-U1 (< p)
-    R = fp_reduce_once(fp_sub_2p(R, S)); // R = S2-S1 (< p)
+    R = fp_sub_2p(R, S);              // R = S2-S1 (< 2p; 4p * 2p < p * 2^384)
 
     if (!fp_is_zero(P)) {             // X1 != X2: add
         Fp PP = g1_mul(P, P);         // PP = P^2 (< 2p)
@@ -140,12 +140,12 @@ void g1_add(inout G1Xyzz p31, G1Xyzz p2) {
         p31.X = fp_sub_2p(p31.X, Q);
         p31.X = fp_sub_2p(p31.X, Q);  // X3 = R^2-PPP-2*Q (< 2p)
         Q = fp_sub_unred(Q, p31.X);   // Q-X3 (< 4p, branchless)
-        Q = g1_mul(Q, R);             // R*(Q-X3) (< 2p since R < p)
+        Q = g1_mul(Q, R);             // R*(Q-X3) (< 2p since 4p*2p < 9.84p^2)
         p31.Y = g1_mul(S, PPP);       // S1*PPP (< 2p)
         p31.Y = fp_sub_2p(Q, p31.Y);  // Y3 = R*(Q-X3)-S1*PPP (< 2p)
         p31.ZZ = g1_mul(p31.ZZ, p2.ZZ);       // ZZ3 = ZZ1*ZZ2*PP (< 2p)
         p31.ZZZ = g1_mul(p31.ZZZ, p2.ZZZ);    // ZZZ3 = ZZZ1*ZZZ2*PPP (< 2p)
-    } else if (fp_is_zero(R)) {       // X1 == X2, Y1 == Y2: double
+    } else if (fp_is_zero(fp_reduce_once(R))) { // X1 == X2, Y1 == Y2: double
         Fp X1 = fp_reduce_once(p31.X);
         Fp Y1 = fp_reduce_once(p31.Y);
         U = fp_dbl(Y1);               // U = 2*Y1 (< p)
@@ -185,7 +185,7 @@ void g1_madd(inout G1Xyzz p31, G1Affine p2, bool subtract) {
 
     Fp R = g1_mul(p2.y, p31.ZZZ);     // S2 = Y2*ZZZ1 (< 2p)
     R = fp_cneg_2p(R, subtract);      // (< 2p)
-    R = fp_reduce_once(fp_sub_2p(R, p31.Y)); // R = S2-Y1 (< p)
+    R = fp_sub_2p(R, p31.Y);          // R = S2-Y1 (< 2p; 4p * 2p < p * 2^384)
     Fp P = g1_mul(p2.x, p31.ZZ);      // U2 = X2*ZZ1 (< 2p)
     P = fp_reduce_once(fp_sub_2p(P, p31.X)); // P = U2-X1 (< p)
 
@@ -200,10 +200,10 @@ void g1_madd(inout G1Xyzz p31, G1Affine p2, bool subtract) {
         p31.X = fp_sub_2p(p31.X, Q);
         p31.X = fp_sub_2p(p31.X, Q);  // X3 = R^2-PPP-2*Q (< 2p)
         Q = fp_sub_unred(Q, p31.X);   // Q-X3 (< 4p, branchless)
-        Q = g1_mul(Q, R);             // R*(Q-X3) (< 2p since R < p)
+        Q = g1_mul(Q, R);             // R*(Q-X3) (< 2p since 4p*2p < 9.84p^2)
         p31.Y = g1_mul(p31.Y, PPP);           // Y1*PPP (< 2p)
         p31.Y = fp_sub_2p(Q, p31.Y);  // Y3 = R*(Q-X3)-Y1*PPP (< 2p)
-    } else if (fp_is_zero(R)) {       // X1 == X2, Y1 == +-Y2: double p2
+    } else if (fp_is_zero(fp_reduce_once(R))) { // X1 == X2, Y1 == +-Y2: double p2
         Fp U = fp_dbl(p2.y);          // U = 2*Y1 (< p)
         p31.ZZ = g1_mul(U, U);        // ZZ3 = V = U^2 (< 2p)
         p31.ZZZ = g1_mul(p31.ZZ, U);          // ZZZ3 = W = U*V (< 2p)

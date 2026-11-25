@@ -156,7 +156,15 @@ MONT_T MONT_FN(_neg)(MONT_T a) {
 // Adreno) compile fast without register spilling or I-cache thrashing.
 MONT_T MONT_FN(_mul_lazy)(MONT_T a, MONT_T b) {
     MONT_T t = MONT_FN(_zero)();
-#if MONT_N > 8 || defined(MONT_ROLL_OUTER)
+#if defined(MONT_ROLL_OUTER_2X)
+    [[dont_unroll]] for (int i = 0; i < MONT_N / 2; i++) {
+        uint b0 = b.l[0];
+        uint b1 = b.l[1];
+        [[unroll]] for (int k = 0; k < MONT_N - 2; k++) b.l[k] = b.l[k + 2];
+        MONT_CIOS_STEP(b0);
+        MONT_CIOS_STEP(b1);
+    }
+#elif MONT_N > 8 || defined(MONT_ROLL_OUTER)
     [[dont_unroll]] for (int i = 0; i < MONT_N; i++) {
         uint bi = b.l[0];
         [[unroll]] for (int k = 0; k < MONT_N - 1; k++) b.l[k] = b.l[k + 1];

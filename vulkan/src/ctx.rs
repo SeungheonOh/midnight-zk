@@ -231,6 +231,10 @@ impl RawBuffer for VulkanBuffer {
         self.0.mapped_ptr()
     }
 
+    fn host_cached(&self) -> bool {
+        self.0.host_cached()
+    }
+
     fn zero_all(&self) -> Result<(), Error> {
         if let Some(p) = self.0.mapped_ptr() {
             acc::host_zero(p, self.0.len());
@@ -704,11 +708,16 @@ impl Backend for Vulkan {
         let mut limit = max_group(info);
         // Qualcomm Adreno (vendor 0x5143): high-register G1 kernels cap at
         // 128 invocations (2 waves of 64) for optimal occupancy and to avoid
-        // register-file residency deadlocks at 256 invocations on barriered kernels.
-        if info.vendor_id == 0x5143
-            && matches!(kernel, "msm_accumulate" | "msm_integrate" | "msm_ones")
-        {
-            limit = limit.min(128);
+        // register-file residency deadlocks at 256 invocations on barriered
+        // kernels; `msm_integrate` caps at 64 (1 wave/WG) paired with
+        // `msm_integrate_groups = 2` so `2 * nwins` workgroups balance cleanly
+        // across Adreno's shader processors with the same 128 runs/window.
+        if info.vendor_id == 0x5143 {
+            if matches!(kernel, "msm_accumulate" | "msm_ones") {
+                limit = limit.min(128);
+            } else if kernel == "msm_integrate" {
+                limit = limit.min(64);
+            }
         }
         Ok(limit)
     }

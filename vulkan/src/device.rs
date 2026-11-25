@@ -1015,6 +1015,7 @@ impl Context {
         let req = unsafe { d.get_buffer_memory_requirements(buffer) };
         let mut memory = Err(Error::OutOfMemory);
         let mut host = false;
+        let mut cached = false;
         for t in self.memory_types(req.memory_type_bits, preferences) {
             let mut flags = vk::MemoryAllocateFlagsInfo::default()
                 .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
@@ -1027,9 +1028,11 @@ impl Context {
                 d.allocate_memory(&alloc, None)
             });
             if !matches!(memory, Err(Error::OutOfMemory)) {
-                host = s.memory.memory_types[t as usize].property_flags.contains(
+                let props = s.memory.memory_types[t as usize].property_flags;
+                host = props.contains(
                     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                 );
+                cached = props.contains(vk::MemoryPropertyFlags::HOST_CACHED);
                 break;
             }
         }
@@ -1049,6 +1052,7 @@ impl Context {
             len,
             size: req.size,
             mapped: None,
+            host_cached: false,
             address: 0,
         };
         // SAFETY: the memory was allocated for this buffer's requirements.
@@ -1061,6 +1065,7 @@ impl Context {
                 d.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
             })?;
             b.mapped = NonNull::new(p.cast());
+            b.host_cached = cached;
         }
         let i = vk::BufferDeviceAddressInfo::default().buffer(buffer);
         // SAFETY: a buffer with SHADER_DEVICE_ADDRESS usage bound to memory
@@ -1333,6 +1338,7 @@ pub struct Buffer {
     /// The bytes of the memory allocation.
     size: u64,
     mapped: Option<NonNull<u8>>,
+    host_cached: bool,
     address: u64,
 }
 
@@ -1362,6 +1368,11 @@ impl Buffer {
     /// The host address of the mapping, at least [`Buffer::len`] bytes.
     pub fn mapped_ptr(&self) -> Option<NonNull<u8>> {
         self.mapped
+    }
+
+    /// Whether the host mapping is CPU-cached (`HOST_CACHED`).
+    pub fn host_cached(&self) -> bool {
+        self.host_cached
     }
 }
 

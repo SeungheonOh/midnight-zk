@@ -478,19 +478,29 @@ void main() {
         if ((lane & (off - 1u)) == 0u) g1_add(acc, down);
     }
     // then each run of 32 into its first invocation, through shared memory
+    // using a parallel log2(32 / ONES_LANES)-step binary tree reduction.
     if (ONES_LANES < 32u) {
         const uint lid = gl_LocalInvocationID.x;
         const uint stride = ONES_PARTS * ONES_LANES;
+        const uint run_slots = 32u / ONES_LANES;
         for (uint base = 0u; base < gl_WorkGroupSize.x; base += stride) {
-            if (lid >= base && lid < base + stride && (lid & (ONES_LANES - 1u)) == 0u) {
-                parts[(lid - base) / ONES_LANES] = acc;
+            const bool active_lane =
+                lid >= base && lid < base + stride && (lid & (ONES_LANES - 1u)) == 0u;
+            const uint slot = (lid - base) / ONES_LANES;
+            const uint sub = (lid & 31u) / ONES_LANES;
+            if (active_lane) {
+                parts[slot] = acc;
             }
+            memoryBarrierShared();
             barrier();
-            if (lid >= base && lid < base + stride && (lid & 31u) == 0u) {
-                const uint slot = (lid - base) / ONES_LANES;
-                for (uint j = 1u; j < 32u / ONES_LANES; j++) g1_add(acc, parts[slot + j]);
+            for (uint step = run_slots >> 1; step > 0u; step >>= 1) {
+                if (active_lane && sub < step) {
+                    g1_add(acc, parts[slot + step]);
+                    if (step > 1u) parts[slot] = acc;
+                }
+                memoryBarrierShared();
+                barrier();
             }
-            barrier();
         }
     }
 

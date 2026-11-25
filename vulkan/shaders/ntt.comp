@@ -47,6 +47,10 @@
 
 #extension GL_GOOGLE_include_directive : require
 
+// Roll the outer loop of `fr_mul` 2x (4 iterations of 2 CIOS steps): cuts
+// register-rotation moves and loop branches in half while keeping code size
+// compact across the few `fr_mul` call sites in `ntt_pass`.
+#define MONT_ROLL_OUTER_2X
 #include "fr.glsl"
 
 #if defined(NTT_PASS)
@@ -123,10 +127,21 @@ void main() {
     const uint xshift = UNIVERSAL_LOG - (lp + d);
     const uint flags = p.pp.flags;
 
+    const bool coset_quarter =
+        (flags & F_COSET) != 0u && d >= 2u && p.pp.n_src <= (1u << (p.pp.log_n - 2u));
+    const bool coset_half = !coset_quarter && (flags & F_COSET) != 0u && d >= 2u
+                            && p.pp.n_src <= (1u << (p.pp.log_n - 1u));
+    const uint coset_t_limit =
+        coset_quarter ? (1u << (d - 2u)) : (coset_half ? (1u << (d - 1u)) : (1u << d));
+
     // load, with the coset distribution and the pass factors
     for (uint l = lid; l < e; l += tpg) {
         const uint g = l & gmask;
         const uint t = l >> lg;
+        if (t >= coset_t_limit) {
+            // Stage s == d reads only t < coset_t_limit from sh[].
+            continue;
+        }
         const uint j = j0 + g;
         const uint idx = j + (t << stride_log);
         Fr v;
@@ -144,9 +159,14 @@ void main() {
         }
         if ((flags & F_TWIDDLE) != 0u) {
             const uint xi = ((j & pmask) * t) << xshift;
-            Fr w = FR_AT(p.hi, xi >> lo_bits);
-            if ((flags & F_TWO_LEVEL) != 0u) w = fr_mul(w, FR_AT(p.lo, xi & lo_mask));
-            v = fr_mul(v, w);
+            const uint hi_i = xi >> lo_bits;
+            if ((flags & F_TWO_LEVEL) != 0u) {
+                Fr w = FR_AT(p.lo, xi & lo_mask);
+                if (hi_i != 0u) w = fr_mul(FR_AT(p.hi, hi_i), w);
+                v = fr_mul(v, w);
+            } else if (hi_i != 0u) {
+                v = fr_mul(v, FR_AT(p.hi, hi_i));
+            }
         }
         sh_store(e, (t << lg) | g, v);
     }
@@ -170,18 +190,35 @@ void main() {
             const uint a1 = ((i0 + q) << lg) | g;
             const uint a2 = ((i0 + 2u * q) << lg) | g;
             const uint a3 = ((i0 + 3u * q) << lg) | g;
-            const Fr x0 = sh_load(e, a0);
-            const Fr x1 = sh_load(e, a1);
-            const Fr x2 = sh_load(e, a2);
-            const Fr x3 = sh_load(e, a3);
-            const Fr t0 = fr_add(x0, x2);
-            const Fr t1 = fr_add(x1, x3);
-            const Fr t2 = fr_sub(x0, x2);
-            const Fr t3 = fr_mul(fr_sub(x1, x3), omega4);
-            Fr y0 = fr_add(t0, t1);
-            Fr y1 = fr_sub(t0, t1);
-            Fr y2 = fr_add(t2, t3);
-            Fr y3 = fr_sub(t2, t3);
+            Fr y0, y1, y2, y3;
+            if (s == d && coset_quarter) {
+                const Fr x0 = sh_load(e, a0);
+                y0 = x0;
+                y1 = x0;
+                y2 = x0;
+                y3 = x0;
+            } else if (s == d && coset_half) {
+                const Fr x0 = sh_load(e, a0);
+                const Fr x1 = sh_load(e, a1);
+                const Fr t3 = fr_mul(x1, omega4);
+                y0 = fr_add(x0, x1);
+                y1 = fr_sub(x0, x1);
+                y2 = fr_add(x0, t3);
+                y3 = fr_sub(x0, t3);
+            } else {
+                const Fr x0 = sh_load(e, a0);
+                const Fr x1 = sh_load(e, a1);
+                const Fr x2 = sh_load(e, a2);
+                const Fr x3 = sh_load(e, a3);
+                const Fr t0 = fr_add(x0, x2);
+                const Fr t1 = fr_add(x1, x3);
+                const Fr t2 = fr_sub(x0, x2);
+                const Fr t3 = fr_mul(fr_sub(x1, x3), omega4);
+                y0 = fr_add(t0, t1);
+                y1 = fr_sub(t0, t1);
+                y2 = fr_add(t2, t3);
+                y3 = fr_sub(t2, t3);
+            }
             if (jj != 0u) {
                 y1 = fr_mul(y1, FR_AT(p.hi, (2u * jj) << tw_shift));
                 y2 = fr_mul(y2, FR_AT(p.hi, jj << tw_shift));

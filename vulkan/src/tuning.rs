@@ -106,14 +106,14 @@ const ADRENO_MSM_WINDOWS: &[(u32, u32, usize)] = &[
 const ADRENO_MSM_SHARES: &[(u32, usize, usize)] = &[
     (13, 30, 30),
     (14, 30, 30),
-    (15, 34, 34),
-    (16, 36, 36),
-    (17, 40, 40),
-    (18, 42, 42),
-    (19, 44, 44),
-    (20, 46, 46),
-    (21, 50, 50),
-    (22, 50, 50),
+    (15, 31, 31),
+    (16, 33, 33),
+    (17, 37, 37),
+    (18, 37, 37),
+    (19, 40, 40),
+    (20, 42, 42),
+    (21, 46, 46),
+    (22, 48, 48),
 ];
 
 /// The constants of Qualcomm Adreno GPUs (vendor 0x5143), measured on
@@ -130,10 +130,14 @@ pub(crate) const ADRENO: Tuning = Tuning {
     },
     msm_windows: ADRENO_MSM_WINDOWS,
     msm_shares: ADRENO_MSM_SHARES,
-    // 1 workgroup per window (128 threads * 17-22 windows = 34-44 waves)
-    // saturates Adreno's shader processors while cutting CPU `collect()` work
-    // and partial-sum readback by 4x compared to 4 groups.
-    msm_integrate_groups: 1,
+    // With masked scalars (`s + r`), bucket 1 of window 0 holds only ~m/2^(w-1)
+    // points; 4 workgroups (512 threads, 16 output records) keep `msm_ones`
+    // sub-millisecond while minimizing CPU `collect()` work.
+    msm_ones_groups: 4,
+    // 2 workgroups of 64 threads per window (`2 * nwins` = 34-44 single-wave
+    // workgroups) balances across Adreno's shader processors while keeping
+    // only 128 runs/window for fast CPU `collect()` and minimal readback.
+    msm_integrate_groups: 2,
     ..TUNING
 };
 
