@@ -132,11 +132,67 @@ pub(crate) const DISCRETE: Tuning = Tuning {
     ..TUNING
 };
 
+/// `(log2 n, wbits, chunks)` of the MSM on Qualcomm Adreno GPUs.
+const ADRENO_MSM_WINDOWS: &[(u32, u32, usize)] = &[
+    (13, 11, 1),
+    (14, 11, 1),
+    (15, 12, 1),
+    (16, 13, 1),
+    (17, 13, 1),
+    (18, 14, 1),
+    (19, 15, 1),
+    (20, 15, 1),
+    (21, 16, 1),
+    (22, 16, 1),
+];
+
+/// The device share of the MSM on Qualcomm Adreno GPUs (in 64ths): paired with
+/// 8 fast mobile Oryon/ARM cores, an even-to-62% GPU split keeps both halves
+/// busy in parallel.
+const ADRENO_MSM_SHARES: &[(u32, usize, usize)] = &[
+    (13, 32, 32),
+    (14, 32, 32),
+    (15, 32, 32),
+    (16, 36, 36),
+    (17, 40, 40),
+    (18, 40, 40),
+    (19, 40, 40),
+    (20, 40, 40),
+    (21, 40, 40),
+    (22, 40, 40),
+];
+
+/// The constants of Qualcomm Adreno GPUs (vendor 0x5143), measured on
+/// Snapdragon SM8850 / Adreno 840.
+pub(crate) const ADRENO: Tuning = Tuning {
+    thresholds: Thresholds {
+        fft: 15,
+        ifft: 15,
+        // below k=15, 8 Snapdragon Oryon CPU cores beat mobile GPU dispatch
+        msm_table: 15,
+        msm_one_shot: None,
+        quotient: 14,
+        explicit: false,
+    },
+    msm_windows: ADRENO_MSM_WINDOWS,
+    msm_shares: ADRENO_MSM_SHARES,
+    // 4 workgroups per window keeps Adreno's shader processors busy in integrate
+    msm_integrate_groups: 4,
+    ..TUNING
+};
+
 /// The constants of `info`'s device class: [`DISCRETE`] for a GPU whose
-/// memory the host does not map, else [`TUNING`] (Apple GPUs through
-/// MoltenVK, integrated GPUs, CPU implementations).
+/// memory the host does not map, [`ADRENO`] for Qualcomm Adreno GPUs, else
+/// [`TUNING`] (Apple GPUs through MoltenVK, integrated GPUs, CPU
+/// implementations).
 pub(crate) fn for_device(info: &crate::device::VulkanInfo) -> &'static Tuning {
-    let base = if info.unified_memory { &TUNING } else { &DISCRETE };
+    let base = if !info.unified_memory {
+        &DISCRETE
+    } else if info.vendor_id == 0x5143 {
+        &ADRENO
+    } else {
+        &TUNING
+    };
     tmp_override(base)
 }
 

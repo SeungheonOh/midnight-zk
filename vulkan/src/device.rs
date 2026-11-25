@@ -439,6 +439,11 @@ impl Submit {
     }
 }
 
+/// Environment variable naming an optional file to persist the driver's
+/// `VkPipelineCache` across process restarts (eliminates repeated cold shader
+/// compilation on drivers such as Qualcomm Adreno).
+pub const PIPELINE_CACHE_ENV: &str = "MIDNIGHT_VULKAN_PIPELINE_CACHE";
+
 /// The pipeline cache key.
 type Key = (&'static str, Variant, PipelineOptions);
 
@@ -447,6 +452,8 @@ pub struct Context {
     shared: Arc<Shared>,
     info: VulkanInfo,
     pipeline_layout: vk::PipelineLayout,
+    pipeline_cache: vk::PipelineCache,
+    pipeline_cache_path: Option<std::path::PathBuf>,
     /// The main command buffer ([`Context::commands`]).
     submit: Mutex<Submit>,
     /// The command buffer of fills and read-backs.
@@ -813,10 +820,29 @@ impl Context {
         })?;
 
         let (submit, aux, pipeline_layout) = p.take();
+        let pipeline_cache_path = std::env::var_os(PIPELINE_CACHE_ENV)
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from);
+        let pipeline_cache = if let Some(ref path) = pipeline_cache_path {
+            let initial = std::fs::read(path).unwrap_or_default();
+            let ci = vk::PipelineCacheCreateInfo::default().initial_data(&initial);
+            // SAFETY: valid device and create info; drivers validate and ignore
+            // incompatible cache blobs per the Vulkan specification.
+            unsafe { shared.device.create_pipeline_cache(&ci, None) }
+                .or_else(|_| {
+                    let empty = vk::PipelineCacheCreateInfo::default();
+                    unsafe { shared.device.create_pipeline_cache(&empty, None) }
+                })
+                .unwrap_or(vk::PipelineCache::null())
+        } else {
+            vk::PipelineCache::null()
+        };
         Ok(Context {
             shared: shared.clone(),
             info: c.info,
             pipeline_layout,
+            pipeline_cache,
+            pipeline_cache_path,
             submit: Mutex::new(submit),
             aux: Mutex::new(aux),
             pipelines: Mutex::new(HashMap::new()),
@@ -890,7 +916,34 @@ impl Context {
         }
         let p = Arc::new(self.create_pipeline(shader, variant, options)?);
         cache.insert(key, p.clone());
+        self.save_pipeline_cache();
         Ok(p)
+    }
+
+    fn save_pipeline_cache(&self) {
+        let Some(ref path) = self.pipeline_cache_path else {
+            return;
+        };
+        if self.pipeline_cache == vk::PipelineCache::null() {
+            return;
+        }
+        // SAFETY: valid device and pipeline cache handle; serialized by `self.pipelines`.
+        let Ok(bytes) = (unsafe { self.shared.device.get_pipeline_cache_data(self.pipeline_cache) })
+        else {
+            return;
+        };
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
     }
 
     fn create_pipeline(
@@ -978,7 +1031,7 @@ impl Context {
         let t0 = Instant::now();
         // SAFETY: valid device, module and layout; the create info outlives
         // the call.
-        let r = unsafe { d.create_compute_pipelines(vk::PipelineCache::null(), &create, None) };
+        let r = unsafe { d.create_compute_pipelines(self.pipeline_cache, &create, None) };
         let creation = t0.elapsed();
         // SAFETY: the module is no longer needed once the pipeline exists.
         unsafe { d.destroy_shader_module(module, None) };
@@ -1311,8 +1364,11 @@ impl Drop for Context {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.submit.get_mut().unwrap_or_else(|e| e.into_inner()).destroy(d);
         self.aux.get_mut().unwrap_or_else(|e| e.into_inner()).destroy(d);
-        // SAFETY: no pipeline uses the layout any more.
-        unsafe { d.destroy_pipeline_layout(self.pipeline_layout, None) };
+        // SAFETY: no pipeline uses the layout or cache any more.
+        unsafe {
+            d.destroy_pipeline_cache(self.pipeline_cache, None);
+            d.destroy_pipeline_layout(self.pipeline_layout, None);
+        }
     }
 }
 

@@ -551,10 +551,11 @@ layout(push_constant) uniform Push {
     AccParams p;
 } pc;
 
-// Fixed upper bound (1024): avoids two spec-constant-sized workgroup arrays
-// overlapping in Qualcomm Adreno's shared-memory layout (see `scan` above).
-shared uint lens[1024];
-shared uint slot[1024];
+// Fixed upper bound (`ACC_GROUP` = 256): avoids two spec-constant-sized
+// workgroup arrays overlapping in Qualcomm Adreno's shared-memory layout
+// (see `scan` above), while keeping shared memory at 2 KiB for high occupancy.
+shared uint lens[256];
+shared uint slot[256];
 
 void main() {
     const uint g = global_index(), tid = gl_LocalInvocationID.x, tpg = gl_WorkGroupSize.x;

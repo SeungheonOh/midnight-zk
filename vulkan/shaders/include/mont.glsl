@@ -118,16 +118,28 @@ MONT_T MONT_FN(_neg)(MONT_T a) {
 }
 
 // a * b: CIOS, no-carry variant, 32-bit limbs.
+// For 12-limb Fp (`MONT_N > 8`), keep the outer loop rolled with register
+// rotation of `b` (no dynamic array indexing): this shrinks `fp_mul` 12x so
+// drivers that ignore SPIR-V `DontInline` (e.g. Qualcomm Adreno) compile
+// straight-line `g1_add`/`g1_madd` without hanging, while reducing instruction
+// footprint and speeding up MoltenVK as well.
 MONT_T MONT_FN(_mul)(MONT_T a, MONT_T b) {
     MONT_T t = MONT_FN(_zero)();
+#if MONT_N > 8
+    [[dont_unroll]] for (int i = 0; i < MONT_N; i++) {
+        uint bi = b.l[0];
+        [[unroll]] for (int k = 0; k < MONT_N - 1; k++) b.l[k] = b.l[k + 1];
+#else
     [[unroll]] for (int i = 0; i < MONT_N; i++) {
+        uint bi = b.l[i];
+#endif
         uint A, C;
-        uint t0 = mad_cc(a.l[0], b.l[i], t.l[0], 0u, A);
+        uint t0 = mad_cc(a.l[0], bi, t.l[0], 0u, A);
         uint m = t0 * MONT_INV;
         // the low word of m * p[0] + t0 is zero
         mad_cc(m, MONT_P[0], t0, 0u, C);
         [[unroll]] for (int j = 1; j < MONT_N; j++) {
-            uint x = mad_cc(a.l[j], b.l[i], t.l[j], A, A);
+            uint x = mad_cc(a.l[j], bi, t.l[j], A, A);
             t.l[j - 1] = mad_cc(m, MONT_P[j], x, C, C);
         }
         t.l[MONT_N - 1] = C + A;

@@ -100,11 +100,6 @@ void g1_cneg(inout G1Xyzz p, bool neg) {
 // p31 += p2 (sppark `xyzz_t::add(const xyzz_t&)`): add-2008-s, doubling
 // dbl-2008-s-1 when the points are equal, infinity when they are opposite.
 // 12M + 2S for an addition.
-//
-// All field multiplications go through a single `g1_mul` call site in a
-// `[[dont_unroll]]` step loop so drivers that ignore SPIR-V `DontInline`
-// (e.g. Qualcomm Adreno) compile one unrolled `fp_mul` per function instead
-// of 23 copies.
 void g1_add(inout G1Xyzz p31, G1Xyzz p2) {
     if (g1_is_inf(p2)) {
         return;
@@ -113,95 +108,53 @@ void g1_add(inout G1Xyzz p31, G1Xyzz p2) {
         return;
     }
 
-    Fp U, S, P, R, PP, PPP, Q;
-    uint step = 0u;
-    [[dont_unroll]] while (step < 23u) {
-        Fp ma, mb;
-        switch (step) {
-        case 0u:  ma = p31.X;   mb = p2.ZZ;   break;
-        case 1u:  ma = p31.Y;   mb = p2.ZZZ;  break;
-        case 2u:  ma = p2.X;    mb = p31.ZZ;  break;
-        case 3u:  ma = p2.Y;    mb = p31.ZZZ; break;
-        // add-2008-s
-        case 4u:  ma = P;       mb = P;       break;
-        case 5u:  ma = P;       mb = PP;      break;
-        case 6u:  ma = p31.ZZ;  mb = PP;      break;
-        case 7u:  ma = p31.ZZZ; mb = PPP;     break;
-        case 8u:  ma = U;       mb = PP;      break;
-        case 9u:  ma = R;       mb = R;       break;
-        case 10u: ma = Q;       mb = R;       break;
-        case 11u: ma = S;       mb = PPP;     break;
-        case 12u: ma = p31.ZZ;  mb = p2.ZZ;   break;
-        case 13u: ma = p31.ZZZ; mb = p2.ZZZ;  break;
-        // dbl-2008-s-1
-        case 14u: ma = U;       mb = U;       break;
-        case 15u: ma = U;       mb = PP;      break;
-        case 16u: ma = p31.X;   mb = PP;      break;
-        case 17u: ma = p31.X;   mb = p31.X;   break;
-        case 18u: ma = Q;       mb = Q;       break;
-        case 19u: ma = p31.Y;   mb = PPP;     break;
-        case 20u: ma = S;       mb = Q;       break;
-        case 21u: ma = p31.ZZ;  mb = PP;      break;
-        default:  ma = p31.ZZZ; mb = PPP;     break;
-        }
-        Fp m = g1_mul(ma, mb);
-        switch (step) {
-        case 0u:  U = m; step = 1u; break;
-        case 1u:  S = m; step = 2u; break;
-        case 2u:  P = fp_sub(m, U); step = 3u; break;
-        case 3u:
-            R = fp_sub(m, S);
-            if (!fp_is_zero(P)) {
-                step = 4u;
-            } else if (fp_is_zero(R)) {
-                U = fp_dbl(p31.Y);
-                step = 14u;
-            } else {
-                p31 = g1_inf();
-                step = 23u;
-            }
-            break;
-        // add-2008-s
-        case 4u:  PP = m;      step = 5u;  break;
-        case 5u:  PPP = m;     step = 6u;  break;
-        case 6u:  p31.ZZ = m;  step = 7u;  break;
-        case 7u:  p31.ZZZ = m; step = 8u;  break;
-        case 8u:  Q = m;       step = 9u;  break;
-        case 9u:
-            p31.X = fp_sub(fp_sub(fp_sub(m, PPP), Q), Q);
-            Q = fp_sub(Q, p31.X);
-            step = 10u;
-            break;
-        case 10u: Q = m; step = 11u; break;
-        case 11u: p31.Y = fp_sub(Q, m); step = 12u; break;
-        case 12u: p31.ZZ = m;  step = 13u; break;
-        case 13u: p31.ZZZ = m; step = 23u; break;
-        // dbl-2008-s-1
-        case 14u: PP = m;  step = 15u; break;
-        case 15u: PPP = m; step = 16u; break;
-        case 16u: S = m;   step = 17u; break;
-        case 17u: Q = fp_add(fp_dbl(m), m); step = 18u; break;
-        case 18u:
-            p31.X = fp_sub(fp_sub(m, S), S);
-            step = 19u;
-            break;
-        case 19u:
-            p31.Y = m;
-            S = fp_sub(S, p31.X);
-            step = 20u;
-            break;
-        case 20u: p31.Y = fp_sub(m, p31.Y); step = 21u; break;
-        case 21u: p31.ZZ = m;  step = 22u; break;
-        default:  p31.ZZZ = m; step = 23u; break;
-        }
+    Fp U = g1_mul(p31.X, p2.ZZ);      // U1 = X1*ZZ2
+    Fp S = g1_mul(p31.Y, p2.ZZZ);     // S1 = Y1*ZZZ2
+    Fp P = g1_mul(p2.X, p31.ZZ);      // U2 = X2*ZZ1
+    Fp R = g1_mul(p2.Y, p31.ZZZ);     // S2 = Y2*ZZZ1
+    P = fp_sub(P, U);                 // P = U2-U1
+    R = fp_sub(R, S);                 // R = S2-S1
+
+    if (!fp_is_zero(P)) {             // X1 != X2: add
+        Fp PP = g1_mul(P, P);         // PP = P^2
+        Fp PPP = g1_mul(P, PP);       // PPP = P*PP
+        p31.ZZ = g1_mul(p31.ZZ, PP);
+        p31.ZZZ = g1_mul(p31.ZZZ, PPP);
+        Fp Q = g1_mul(U, PP);         // Q = U1*PP
+        p31.X = g1_mul(R, R);         // R^2
+        p31.X = fp_sub(p31.X, PPP);
+        p31.X = fp_sub(p31.X, Q);
+        p31.X = fp_sub(p31.X, Q);     // X3 = R^2-PPP-2*Q
+        Q = fp_sub(Q, p31.X);
+        Q = g1_mul(Q, R);             // R*(Q-X3)
+        p31.Y = g1_mul(S, PPP);       // S1*PPP
+        p31.Y = fp_sub(Q, p31.Y);     // Y3 = R*(Q-X3)-S1*PPP
+        p31.ZZ = g1_mul(p31.ZZ, p2.ZZ);       // ZZ3 = ZZ1*ZZ2*PP
+        p31.ZZZ = g1_mul(p31.ZZZ, p2.ZZZ);    // ZZZ3 = ZZZ1*ZZZ2*PPP
+    } else if (fp_is_zero(R)) {       // X1 == X2, Y1 == Y2: double
+        U = fp_dbl(p31.Y);            // U = 2*Y1
+        Fp V = g1_mul(U, U);          // V = U^2
+        Fp W = g1_mul(U, V);          // W = U*V
+        S = g1_mul(p31.X, V);         // S = X1*V
+        Fp M = g1_mul(p31.X, p31.X);
+        M = fp_add(fp_dbl(M), M);     // M = 3*X1^2 (a = 0)
+        p31.X = g1_mul(M, M);
+        p31.X = fp_sub(p31.X, S);
+        p31.X = fp_sub(p31.X, S);     // X3 = M^2-2*S
+        p31.Y = g1_mul(p31.Y, W);     // W*Y1
+        S = fp_sub(S, p31.X);
+        S = g1_mul(S, M);             // M*(S-X3)
+        p31.Y = fp_sub(S, p31.Y);     // Y3 = M*(S-X3)-W*Y1
+        p31.ZZ = g1_mul(p31.ZZ, V);   // ZZ3 = V*ZZ1
+        p31.ZZZ = g1_mul(p31.ZZZ, W); // ZZZ3 = W*ZZZ1
+    } else {                          // X1 == X2, Y1 == -Y2
+        p31 = g1_inf();
     }
 }
 
 // p31 += p2, or p31 -= p2 when `subtract` (sppark `xyzz_t::add(const
 // affine_t&, bool)`): madd-2008-s, doubling mdbl-2008-s-1 when the points
 // are equal, infinity when they are opposite. 8M + 2S for an addition.
-//
-// Single `g1_mul` call site in a `[[dont_unroll]]` loop; see `g1_add`.
 void g1_madd(inout G1Xyzz p31, G1Affine p2, bool subtract) {
     if (g1_is_inf(p2)) {
         return;
@@ -213,79 +166,43 @@ void g1_madd(inout G1Xyzz p31, G1Affine p2, bool subtract) {
         return;
     }
 
-    Fp R, P, PP, PPP, Q;
-    uint step = 0u;
-    [[dont_unroll]] while (step < 17u) {
-        Fp ma, mb;
-        switch (step) {
-        case 0u:  ma = p2.y;    mb = p31.ZZZ; break;
-        case 1u:  ma = p2.x;    mb = p31.ZZ;  break;
-        // madd-2008-s
-        case 2u:  ma = P;       mb = P;       break;
-        case 3u:  ma = P;       mb = PP;      break;
-        case 4u:  ma = p31.ZZ;  mb = PP;      break;
-        case 5u:  ma = p31.ZZZ; mb = PPP;     break;
-        case 6u:  ma = PP;      mb = p31.X;   break;
-        case 7u:  ma = R;       mb = R;       break;
-        case 8u:  ma = Q;       mb = R;       break;
-        case 9u:  ma = p31.Y;   mb = PPP;     break;
-        // mdbl-2008-s-1
-        case 10u: ma = P;       mb = P;       break;
-        case 11u: ma = p31.ZZ;  mb = P;       break;
-        case 12u: ma = p2.x;    mb = p31.ZZ;  break;
-        case 13u: ma = p2.x;    mb = p2.x;    break;
-        case 14u: ma = Q;       mb = Q;       break;
-        case 15u: ma = p31.ZZZ; mb = p2.y;    break;
-        default:  ma = R;       mb = Q;       break;
-        }
-        Fp m = g1_mul(ma, mb);
-        switch (step) {
-        case 0u:
-            R = fp_sub(fp_cneg(m, subtract), p31.Y);
-            step = 1u;
-            break;
-        case 1u:
-            P = fp_sub(m, p31.X);
-            if (!fp_is_zero(P)) {
-                step = 2u;
-            } else if (fp_is_zero(R)) {
-                P = fp_dbl(p2.y);
-                step = 10u;
-            } else {
-                p31 = g1_inf();
-                step = 17u;
-            }
-            break;
-        // madd-2008-s
-        case 2u:  PP = m;      step = 3u; break;
-        case 3u:  PPP = m;     step = 4u; break;
-        case 4u:  p31.ZZ = m;  step = 5u; break;
-        case 5u:  p31.ZZZ = m; step = 6u; break;
-        case 6u:  Q = m;       step = 7u; break;
-        case 7u:
-            p31.X = fp_sub(fp_sub(fp_sub(m, PPP), Q), Q);
-            Q = fp_sub(Q, p31.X);
-            step = 8u;
-            break;
-        case 8u:  Q = m; step = 9u; break;
-        case 9u:  p31.Y = fp_sub(Q, m); step = 17u; break;
-        // mdbl-2008-s-1
-        case 10u: p31.ZZ = m;  step = 11u; break;
-        case 11u: p31.ZZZ = m; step = 12u; break;
-        case 12u: R = m;       step = 13u; break;
-        case 13u: Q = fp_add(fp_dbl(m), m); step = 14u; break;
-        case 14u: p31.X = fp_sub(fp_sub(m, R), R); step = 15u; break;
-        case 15u:
-            p31.Y = m;
-            R = fp_sub(R, p31.X);
-            step = 16u;
-            break;
-        default:
-            p31.Y = fp_sub(m, p31.Y);
-            p31.ZZZ = fp_cneg(p31.ZZZ, subtract);
-            step = 17u;
-            break;
-        }
+    Fp R = g1_mul(p2.y, p31.ZZZ);     // S2 = Y2*ZZZ1
+    R = fp_cneg(R, subtract);
+    R = fp_sub(R, p31.Y);             // R = S2-Y1
+    Fp P = g1_mul(p2.x, p31.ZZ);      // U2 = X2*ZZ1
+    P = fp_sub(P, p31.X);             // P = U2-X1
+
+    if (!fp_is_zero(P)) {             // X1 != X2: add
+        Fp PP = g1_mul(P, P);         // PP = P^2
+        Fp PPP = g1_mul(P, PP);       // PPP = P*PP
+        p31.ZZ = g1_mul(p31.ZZ, PP);          // ZZ3 = ZZ1*PP
+        p31.ZZZ = g1_mul(p31.ZZZ, PPP);       // ZZZ3 = ZZZ1*PPP
+        Fp Q = g1_mul(PP, p31.X);     // Q = X1*PP
+        p31.X = g1_mul(R, R);         // R^2
+        p31.X = fp_sub(p31.X, PPP);
+        p31.X = fp_sub(p31.X, Q);
+        p31.X = fp_sub(p31.X, Q);     // X3 = R^2-PPP-2*Q
+        Q = fp_sub(Q, p31.X);
+        Q = g1_mul(Q, R);             // R*(Q-X3)
+        p31.Y = g1_mul(p31.Y, PPP);           // Y1*PPP
+        p31.Y = fp_sub(Q, p31.Y);     // Y3 = R*(Q-X3)-Y1*PPP
+    } else if (fp_is_zero(R)) {       // X1 == X2, Y1 == +-Y2: double p2
+        Fp U = fp_dbl(p2.y);          // U = 2*Y1
+        p31.ZZ = g1_mul(U, U);        // ZZ3 = V = U^2
+        p31.ZZZ = g1_mul(p31.ZZ, U);          // ZZZ3 = W = U*V
+        Fp S = g1_mul(p2.x, p31.ZZ);          // S = X1*V
+        Fp M = g1_mul(p2.x, p2.x);
+        M = fp_add(fp_dbl(M), M);     // M = 3*X1^2 (a = 0)
+        p31.X = g1_mul(M, M);
+        p31.X = fp_sub(p31.X, S);
+        p31.X = fp_sub(p31.X, S);     // X3 = M^2-2*S
+        p31.Y = g1_mul(p31.ZZZ, p2.y);        // W*Y1
+        S = fp_sub(S, p31.X);
+        S = g1_mul(S, M);             // M*(S-X3)
+        p31.Y = fp_sub(S, p31.Y);     // Y3 = M*(S-X3)-W*Y1
+        p31.ZZZ = fp_cneg(p31.ZZZ, subtract);
+    } else {                          // X1 == X2, Y1 == -+Y2
+        p31 = g1_inf();
     }
 }
 
