@@ -369,6 +369,27 @@ impl Submit {
 /// compilation on drivers such as Qualcomm Adreno).
 pub const PIPELINE_CACHE_ENV: &str = "MIDNIGHT_VULKAN_PIPELINE_CACHE";
 
+/// Emits diagnostic pipeline compiler events to Android logcat.
+#[cfg(target_os = "android")]
+fn trace_pipeline(message: fmt::Arguments<'_>) {
+    if option_env!("MIDNIGHT_VULKAN_TRACE_PIPELINES") != Some("1") {
+        return;
+    }
+    #[link(name = "log")]
+    unsafe extern "C" {
+        fn __android_log_write(
+            priority: std::ffi::c_int,
+            tag: *const c_char,
+            message: *const c_char,
+        ) -> std::ffi::c_int;
+    }
+    if let Ok(message) = std::ffi::CString::new(message.to_string()) {
+        const ANDROID_LOG_INFO: std::ffi::c_int = 4;
+        // SAFETY: tag and message are live NUL-terminated strings.
+        unsafe { __android_log_write(ANDROID_LOG_INFO, c"MidnightVk".as_ptr(), message.as_ptr()) };
+    }
+}
+
 /// The pipeline cache key.
 type Key = (&'static str, Variant, PipelineOptions);
 
@@ -1068,11 +1089,23 @@ impl Context {
         let create = [vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(self.pipeline_layout)];
+        #[cfg(target_os = "android")]
+        trace_pipeline(format_args!(
+            "compile start kernel={} variant={variant:?} options={options:?}",
+            shader.name,
+        ));
         let t0 = Instant::now();
         // SAFETY: valid device, module and layout; the create info outlives
         // the call.
         let r = unsafe { d.create_compute_pipelines(self.pipeline_cache, &create, None) };
         let creation = t0.elapsed();
+        #[cfg(target_os = "android")]
+        trace_pipeline(format_args!(
+            "compile finish kernel={} variant={variant:?} options={options:?} result={:?} elapsed_ms={:.3}",
+            shader.name,
+            r.as_ref().map_or_else(|(_, error)| *error, |_| vk::Result::SUCCESS),
+            creation.as_secs_f64() * 1e3,
+        ));
         // SAFETY: the module is no longer needed once the pipeline exists.
         unsafe { d.destroy_shader_module(module, None) };
         let pipeline = s.check("vkCreateComputePipelines", r.map_err(|(_, e)| e))?[0];

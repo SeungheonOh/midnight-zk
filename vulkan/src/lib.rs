@@ -96,7 +96,9 @@
 //!   run that path on an integrated GPU.
 //!
 //! Build time: `MIDNIGHT_VULKAN_GLSL`, `MIDNIGHT_VULKAN_SPIRV_OPT` and
-//! `MIDNIGHT_VULKAN_REQUIRE_SPIRV` (see `build.rs`).
+//! `MIDNIGHT_VULKAN_REQUIRE_SPIRV` (see `build.rs`). On Android, set
+//! `MIDNIGHT_VULKAN_TRACE_PIPELINES=1` at build time to log pipeline compiler
+//! inputs, results and timing to logcat under the `MidnightVk` tag.
 
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
