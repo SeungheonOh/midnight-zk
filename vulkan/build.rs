@@ -210,6 +210,13 @@ fn main() {
     }
     println!("cargo:rustc-check-cfg=cfg(midnight_vulkan_spirv)");
 
+    // Android can use the Vulkan 1.1 extension path. Targeting SPIR-V 1.3
+    // also emits WorkgroupSize specialization instead of LocalSizeId.
+    let target = if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        "vulkan1.1"
+    } else {
+        "vulkan1.3"
+    };
     let test_support = env::var_os("CARGO_FEATURE_TEST_SUPPORT").is_some();
     let kernels: Vec<&Kernel> = KERNELS.iter().filter(|k| test_support || !k.test).collect();
     let mut rs = String::from("pub(crate) static SHADERS: &[Shader] = &[\n");
@@ -223,8 +230,7 @@ fn main() {
                 for _ in 0..workers() {
                     s.spawn(|| {
                         while let Some(&(k, v)) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            if let Err(e) = compile(k, v, &frontend, &opt, &shaders, &include, &out)
-                            {
+                            if let Err(e) = compile(k, v, &frontend, &opt, &shaders, &out, target) {
                                 errors.lock().unwrap().push(e);
                             }
                         }
@@ -352,8 +358,8 @@ fn compile(
     frontend: &Frontend,
     opt: &Path,
     shaders: &Path,
-    include: &Path,
     out: &Path,
+    target: &str,
 ) -> Result<(), String> {
     let what = format!("{} ({suffix})", k.name);
     let src = shaders.join(k.source);
@@ -364,16 +370,16 @@ fn compile(
     let mut cmd = match frontend {
         Frontend::Glslang(p) => {
             let mut c = Command::new(p);
-            c.args(["-V", "--target-env", "vulkan1.3", "--quiet", "-S", "comp"]);
+            c.args(["-V", "--target-env", target, "--quiet", "-S", "comp"]);
             c
         }
         Frontend::Glslc(p) => {
             let mut c = Command::new(p);
-            c.args(["--target-env=vulkan1.3", "-O0", "-fshader-stage=compute"]);
+            c.arg(format!("--target-env={target}")).args(["-O0", "-fshader-stage=compute"]);
             c
         }
     };
-    cmd.arg(format!("-I{}", include.display()))
+    cmd.arg(format!("-I{}", shaders.join("include").display()))
         .args(&defines)
         .arg("-o")
         .arg(&raw)
@@ -386,7 +392,7 @@ fn compile(
     run(
         Command::new(opt)
             .args(PASSES.iter().map(|p| format!("--{p}")))
-            .arg("--target-env=vulkan1.3")
+            .arg(format!("--target-env={target}"))
             .arg(&raw)
             .arg("-o")
             .arg(&dst),
