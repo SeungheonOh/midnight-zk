@@ -404,7 +404,7 @@ pub struct Context {
     submit: Mutex<Submit>,
     /// The command buffer of fills and read-backs.
     aux: Mutex<Submit>,
-    pipelines: Mutex<HashMap<Key, Arc<Pipeline>>>,
+    pipelines: Mutex<HashMap<Key, Result<Arc<Pipeline>>>>,
 }
 
 impl fmt::Debug for Context {
@@ -953,7 +953,7 @@ impl Context {
     /// The pipelines created so far, in no particular order.
     pub fn pipelines(&self) -> Vec<Arc<Pipeline>> {
         let cache = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-        cache.values().cloned().collect()
+        cache.values().filter_map(|p| p.as_ref().ok().cloned()).collect()
     }
 
     /// The compute pipeline of `kernel` in `variant`, created at first use.
@@ -971,12 +971,44 @@ impl Context {
         let key = (shader.name, variant, options);
         let mut cache = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = cache.get(&key) {
-            return Ok(p.clone());
+            return p.clone();
         }
-        let p = Arc::new(self.create_pipeline(shader, variant, options)?);
-        cache.insert(key, p.clone());
-        self.save_pipeline_cache();
-        Ok(p)
+        let result = self.create_pipeline(shader, variant, options).map(Arc::new);
+        if result.is_ok() || self.should_memoize_pipeline_error(key, &result) {
+            cache.insert(key, result.clone());
+        }
+        if result.is_ok() {
+            self.save_pipeline_cache();
+        }
+        result
+    }
+
+    /// Retain the linker failure reproduced on the Adreno 660 stock Android
+    /// driver. The caller still gets the same error and can fall back to CPU.
+    fn should_memoize_pipeline_error(&self, key: Key, result: &Result<Arc<Pipeline>>) -> bool {
+        cfg!(target_os = "android")
+            && self.info.vendor_id == 0x5143
+            && self.info.device_id == 0x0606_0001
+            && matches!(self.info.api_version, (1, 1, _))
+            && matches!(
+                key,
+                (
+                    "msm_ones",
+                    Variant::Int32,
+                    PipelineOptions {
+                        workgroup: 128,
+                        subgroup: Some(64),
+                        spec: [1, 0, 0]
+                    },
+                )
+            )
+            && matches!(
+                result,
+                Err(Error::Vulkan {
+                    call: "vkCreateComputePipelines",
+                    result: vk::Result::ERROR_UNKNOWN,
+                })
+            )
     }
 
     fn save_pipeline_cache(&self) {
